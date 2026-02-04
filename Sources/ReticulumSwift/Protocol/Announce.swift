@@ -1,0 +1,241 @@
+//
+//  Announce.swift
+//  ReticulumSwift
+//
+//  Reticulum announce packet construction.
+//  Announces broadcast a destination's identity to the network.
+//
+//  Matches Python RNS Packet.py announce format for byte-perfect interoperability.
+//
+
+import Foundation
+
+// MARK: - Announce Constants
+
+/// Random hash length in announce packets (10 bytes)
+public let ANNOUNCE_RANDOM_HASH_LENGTH = 10
+
+/// Ed25519 signature length (64 bytes)
+public let SIGNATURE_LENGTH = 64
+
+/// Public keys length (64 bytes: 32 encryption + 32 signing)
+public let PUBLIC_KEYS_LENGTH = 64
+
+// MARK: - Announce Errors
+
+/// Errors during announce construction
+public enum AnnounceError: Error, Sendable, Equatable {
+    /// PLAIN destinations cannot announce (no identity to sign)
+    case plainCannotAnnounce
+
+    /// Destination has no identity
+    case missingIdentity
+
+    /// Signature generation failed
+    case signatureFailed
+}
+
+// MARK: - Announce
+
+/// Reticulum announce packet construction.
+///
+/// Announces broadcast a destination's identity to the network, allowing
+/// other nodes to discover and communicate with the destination.
+///
+/// Announce payload structure:
+/// ```
+/// [public_keys 64B][name_hash 16*N B][random_hash 10B][signature 64B][app_data optional]
+/// ```
+/// where N = number of aspects (app_name + aspects.count)
+///
+/// For PLAIN destinations (no identity):
+/// ```
+/// [name_hash 16*N B][random_hash 10B][app_data optional]
+/// ```
+///
+/// Signature covers (in order):
+/// ```
+/// destination_hash || public_keys || name_hash || random_hash [|| app_data]
+/// ```
+public struct Announce: Sendable {
+
+    // MARK: - Properties
+
+    /// The destination being announced
+    public let destination: Destination
+
+    /// Application data to include in the announce (overrides destination.appData)
+    public let appData: Data?
+
+    /// Random hash for uniqueness (10 bytes)
+    /// Can be set explicitly for testing, otherwise random
+    public let randomHash: Data
+
+    // MARK: - Initialization
+
+    /// Create an announce for a destination.
+    ///
+    /// - Parameters:
+    ///   - destination: The destination to announce
+    ///   - appData: Optional application data (overrides destination.appData)
+    ///   - randomHash: Optional random hash for testing (10 bytes, defaults to random)
+    public init(
+        destination: Destination,
+        appData: Data? = nil,
+        randomHash: Data? = nil
+    ) {
+        self.destination = destination
+        self.appData = appData
+        self.randomHash = randomHash ?? Announce.generateRandomHash()
+    }
+
+    // MARK: - Building
+
+    /// Build the announce payload data.
+    ///
+    /// This constructs the announce data (NOT the complete packet with header).
+    ///
+    /// For SINGLE/GROUP destinations with identity:
+    /// ```
+    /// public_keys || name_hash || random_hash || signature [|| app_data]
+    /// ```
+    ///
+    /// For PLAIN destinations:
+    /// ```
+    /// name_hash || random_hash [|| app_data]
+    /// ```
+    ///
+    /// - Returns: Announce payload data
+    /// - Throws: `AnnounceError` if construction fails
+    public func build() throws -> Data {
+        // PLAIN destinations have a simpler announce format (no signature)
+        if destination.destinationType == .plain {
+            return buildPlainAnnounce()
+        }
+
+        // SINGLE/GROUP/LINK require identity for signature
+        guard let identity = destination.identity else {
+            throw AnnounceError.missingIdentity
+        }
+
+        let publicKeys = identity.publicKeys
+        let nameHash = destination.nameHash  // 10 bytes = full_hash(full_name)[:10]
+        let effectiveAppData = appData ?? destination.appData ?? Data()
+
+        // Build signed data: dest_hash || public_keys || name_hash || random_hash [|| app_data]
+        var signedData = Data()
+        signedData.append(destination.hash)
+        signedData.append(publicKeys)
+        signedData.append(nameHash)
+        signedData.append(randomHash)
+        if !effectiveAppData.isEmpty {
+            signedData.append(effectiveAppData)
+        }
+
+        // Generate signature
+        let signature: Data
+        do {
+            signature = try identity.sign(signedData)
+        } catch {
+            throw AnnounceError.signatureFailed
+        }
+
+        // Build announce payload: public_keys || name_hash || random_hash || signature [|| app_data]
+        var payload = Data()
+        payload.append(publicKeys)
+        payload.append(nameHash)
+        payload.append(randomHash)
+        payload.append(signature)
+        if !effectiveAppData.isEmpty {
+            payload.append(effectiveAppData)
+        }
+
+        return payload
+    }
+
+    /// Build a complete announce Packet with header.
+    ///
+    /// Creates a Packet ready to be sent over the network.
+    ///
+    /// Header configuration for announces:
+    /// - headerType: .header1 (single address)
+    /// - hasContext: false (no ratchet)
+    /// - hasIFAC: false
+    /// - transportType: .broadcast
+    /// - destinationType: from destination
+    /// - packetType: .announce
+    /// - hopCount: 0
+    ///
+    /// - Returns: Complete Packet with announce data
+    /// - Throws: `AnnounceError` if construction fails
+    public func buildPacket() throws -> Packet {
+        let payload = try build()
+
+        // Map DestType to DestinationType
+        let headerDestType: DestinationType
+        switch destination.destinationType {
+        case .single:
+            headerDestType = .single
+        case .group:
+            headerDestType = .group
+        case .plain:
+            headerDestType = .plain
+        case .link:
+            headerDestType = .link
+        }
+
+        let header = PacketHeader(
+            headerType: .header1,
+            hasContext: false,
+            hasIFAC: false,
+            transportType: .broadcast,
+            destinationType: headerDestType,
+            packetType: .announce,
+            hopCount: 0
+        )
+
+        return Packet(
+            header: header,
+            destination: destination.hash,
+            transportAddress: nil,
+            context: 0x00,
+            data: payload
+        )
+    }
+
+    // MARK: - Private Helpers
+
+    /// Build announce for PLAIN destinations (no signature).
+    private func buildPlainAnnounce() -> Data {
+        let nameHash = destination.nameHash  // 10 bytes = full_hash(full_name)[:10]
+        let effectiveAppData = appData ?? destination.appData ?? Data()
+
+        // PLAIN announce: name_hash(10) || random_hash(10) [|| app_data]
+        var payload = Data()
+        payload.append(nameHash)
+        payload.append(randomHash)
+        if !effectiveAppData.isEmpty {
+            payload.append(effectiveAppData)
+        }
+
+        return payload
+    }
+
+    /// Generate random hash for announce uniqueness.
+    private static func generateRandomHash() -> Data {
+        var bytes = [UInt8](repeating: 0, count: ANNOUNCE_RANDOM_HASH_LENGTH)
+        for i in 0..<ANNOUNCE_RANDOM_HASH_LENGTH {
+            bytes[i] = UInt8.random(in: 0...255)
+        }
+        return Data(bytes)
+    }
+}
+
+// MARK: - CustomStringConvertible
+
+extension Announce: CustomStringConvertible {
+    public var description: String {
+        let hasAppData = (appData ?? destination.appData) != nil
+        return "Announce<\(destination.destinationType), appData:\(hasAppData)>"
+    }
+}
