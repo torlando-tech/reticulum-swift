@@ -15,6 +15,7 @@
 
 import Foundation
 import OSLog
+import Security
 
 // MARK: - Interface Protocol
 
@@ -48,6 +49,26 @@ public protocol NetworkInterface: AnyObject, Sendable {
 }
 
 // MARK: - ReticuLumTransport Actor
+
+// MARK: - Link Debug Logging
+
+/// Write link debug messages to file for troubleshooting link establishment
+private func linkDebug(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    let path = "/tmp/columba_link_trace.log"
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+}
 
 /// Central transport actor for Reticulum packet routing.
 ///
@@ -317,16 +338,20 @@ public actor ReticuLumTransport {
         print("[LINK_OUTBOUND] linkId (short): \(actualHex)")
         print("[LINK_OUTBOUND] linkId (full):  \(actualFullHex)")
         print("[LINK_OUTBOUND] pendingLinks before: \(pendingLinks.count)")
+        linkDebug("[LINK_REG] REGISTERING: linkId=\(actualFullHex), pendingLinks.before=\(pendingLinks.count)")
         pendingLinks[linkId] = link
         let afterKeys = pendingLinks.keys.map { $0.map { String(format: "%02x", $0) }.joined() }
         print("[LINK_OUTBOUND] pendingLinks after: \(pendingLinks.count), keys=\(afterKeys)")
+        linkDebug("[LINK_REG] REGISTERED: pendingLinks.after=\(pendingLinks.count), keys=\(afterKeys)")
 
         await link.markRequestSent()
         let linkState = await link.state
         print("[LINK_OUTBOUND] Link marked as sent, state=\(linkState)")
         print("[LINK_OUTBOUND] Sending LINKREQUEST packet...")
+        linkDebug("[LINK_REG] Sending LINKREQUEST packet")
         try await send(packet: packet)
         print("[LINK_OUTBOUND] LINKREQUEST sent successfully, waiting for PROOF")
+        linkDebug("[LINK_REG] LINKREQUEST sent, awaiting PROOF")
 
         return link
     }
@@ -458,28 +483,87 @@ public actor ReticuLumTransport {
             throw TransportError.noInterfacesAvailable
         }
 
+        let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("[SEND_DEBUG] ===== PACKET SEND =====")
+        print("[SEND_DEBUG] dest=\(destHex), packetType=\(packet.header.packetType), transportType=\(packet.header.transportType)")
+
         // Determine dispatch strategy based on header type
         switch packet.header.transportType {
         case .broadcast:
             // HEADER_1: Check if we need to convert to HEADER_2 for multi-hop routing
             // This applies to LINKREQUEST and other packets going to remote destinations
-            if let pathEntry = await pathTable.lookup(destinationHash: packet.destination),
-               pathEntry.hopCount > 0,
-               let nextHop = pathEntry.nextHop {
-                // Convert to HEADER_2 for routed delivery
+            let pathEntry = await pathTable.lookup(destinationHash: packet.destination)
+            if let entry = pathEntry {
+                let nextHopStatus = entry.nextHop != nil ? entry.nextHop!.prefix(8).map { String(format: "%02x", $0) }.joined() : "nil"
+                print("[SEND_DEBUG] PathEntry found: hopCount=\(entry.hopCount), nextHop=\(nextHopStatus), interfaceId='\(entry.interfaceId)'")
+            } else {
+                print("[SEND_DEBUG] PathEntry NOT found for dest=\(destHex)")
+            }
+
+            // Python converts to HEADER_2 only if hops > 1 (Transport.py line ~500)
+            // hops == 1 means destination is one hop away, send HEADER_1 directly
+            // hops > 1 means destination needs multi-hop routing via transport node
+            if let entry = pathEntry,
+               entry.hopCount > 1,
+               let nextHop = entry.nextHop {
+                // Convert to HEADER_2 for routed delivery (multi-hop)
                 let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
-                let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
                 let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("[TRANSPORT] Converting HEADER_1 to HEADER_2 for dest=\(destHex), nextHop=\(nextHopHex), hops=\(pathEntry.hopCount)")
+                print("[SEND_DEBUG] *** CONVERTING to HEADER_2 *** dest=\(destHex), nextHop=\(nextHopHex), hops=\(entry.hopCount)")
                 try await sendToAllInterfaces(routedPacket)
             } else {
-                // Direct delivery (no multi-hop) - send as HEADER_1
+                // Direct delivery (single hop or no path) - send as HEADER_1
+                // The relay/transport will handle any further routing
+                if let entry = pathEntry {
+                    if entry.hopCount > 1 && entry.nextHop == nil {
+                        print("[SEND_DEBUG] WARNING: hopCount=\(entry.hopCount) but nextHop is nil! Sending as HEADER_1 (relay will route)")
+                    } else if entry.hopCount == 1 {
+                        print("[SEND_DEBUG] Single hop (hops=1): sending as HEADER_1")
+                    }
+                }
+                print("[SEND_DEBUG] Sending as HEADER_1 (direct broadcast)")
                 try await sendToAllInterfaces(packet)
             }
 
         case .transport:
             // HEADER_2: Route via path table
             try await sendViaPath(packet)
+        }
+    }
+
+    /// Send link data packet with explicit destination hash for routing lookup.
+    ///
+    /// Link DATA packets have linkId as their destination, but we need to look up
+    /// the path using the peer's destination hash (not the linkId) to determine
+    /// if multi-hop routing is needed.
+    ///
+    /// - Parameters:
+    ///   - packet: Link DATA packet (destination = linkId)
+    ///   - destinationHash: The peer's destination hash for path lookup
+    /// - Throws: TransportError if no interfaces available or send fails
+    public func sendLinkData(packet: Packet, destinationHash: Data) async throws {
+        guard !interfaces.isEmpty else {
+            throw TransportError.noInterfacesAvailable
+        }
+
+        // Look up path using the DESTINATION hash (not the linkId)
+        if let pathEntry = await pathTable.lookup(destinationHash: destinationHash),
+           pathEntry.hopCount > 0,
+           let nextHop = pathEntry.nextHop {
+            // Convert to HEADER_2 for routed delivery
+            let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
+            let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+            let linkIdHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+            let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
+            print("[TRANSPORT] Link DATA: converting to HEADER_2, linkId=\(linkIdHex), destHash=\(destHex), nextHop=\(nextHopHex), hops=\(pathEntry.hopCount)")
+            linkDebug("[LINK_DATA] HEADER_2: linkId=\(linkIdHex), destHash=\(destHex), nextHop=\(nextHopHex)")
+            try await sendToAllInterfaces(routedPacket)
+        } else {
+            // Direct delivery (no multi-hop) - send as HEADER_1
+            let linkIdHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+            print("[TRANSPORT] Link DATA: sending as HEADER_1, linkId=\(linkIdHex)")
+            linkDebug("[LINK_DATA] HEADER_1: linkId=\(linkIdHex)")
+            try await sendToAllInterfaces(packet)
         }
     }
 
@@ -534,8 +618,18 @@ public actor ReticuLumTransport {
     private func sendToAllInterfaces(_ packet: Packet) async throws {
         let encoded = packet.encode()
         let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
-        let contextStr = packet.header.hasContext ? String(format: "0x%02x", packet.context) : "none"
-        print("[TRANSPORT] sendToAllInterfaces: \(encoded.count) bytes, dest=\(destHex), context=\(contextStr), interfaces=\(interfaces.count)")
+        let contextStr = String(format: "0x%02x", packet.context)
+        let headerHex = encoded.prefix(2).map { String(format: "%02x", $0) }.joined()
+        let fullHex = encoded.prefix(40).map { String(format: "%02x", $0) }.joined()
+
+        print("[SEND_BYTES] ===== ACTUAL BYTES BEING SENT =====")
+        print("[SEND_BYTES] Total size: \(encoded.count) bytes")
+        print("[SEND_BYTES] Header bytes: \(headerHex)")
+        print("[SEND_BYTES] dest=\(destHex), context=\(contextStr)")
+        print("[SEND_BYTES] headerType=\(packet.header.headerType), transportType=\(packet.header.transportType)")
+        print("[SEND_BYTES] destType=\(packet.header.destinationType), packetType=\(packet.header.packetType)")
+        print("[SEND_BYTES] First 40 bytes: \(fullHex)")
+        print("[SEND_BYTES] interfaces=\(interfaces.count)")
         var successCount = 0
         var lastError: Error?
 
@@ -589,7 +683,7 @@ public actor ReticuLumTransport {
             // No path available - queue packet and request path
             print("[SENDPATH] No path to \(destHex)..., queuing packet")
             queuePendingPacket(packet, for: destHash)
-            await requestPath(for: destHash)
+            try? await requestPath(for: destHash)
             return  // Don't throw - packet is queued for later delivery
         }
 
@@ -676,40 +770,51 @@ public actor ReticuLumTransport {
             let proofDestHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             let proofFullHex = destHash.map { String(format: "%02x", $0) }.joined()
             let pendingKeysHex = pendingLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
+            let pendingFullKeysHex = pendingLinks.keys.map { $0.map { String(format: "%02x", $0) }.joined() }
             print("[PROOF_RECV] ===== PROOF PACKET RECEIVED =====")
             print("[PROOF_RECV] dest=\(proofDestHex), full=\(proofFullHex)")
             print("[PROOF_RECV] pendingLinks count=\(pendingLinks.count), keys=\(pendingKeysHex)")
             print("[PROOF_RECV] context=0x\(String(format: "%02x", packet.context)), dataLen=\(packet.data.count)")
+            linkDebug("[PROOF_RECV] PROOF packet: dest=\(proofFullHex), pendingLinks=\(pendingLinks.count), keys=\(pendingFullKeysHex)")
 
             if let link = pendingLinks[destHash] {
                 print("[PROOF_RECV] MATCH! Found pending link for PROOF, processing...")
+                linkDebug("[PROOF_RECV] MATCH! Processing link PROOF")
                 await handleLinkProof(packet, link: link)
             } else {
                 // Try to find if there's a link ID mismatch by checking all pending links
                 print("[PROOF_RECV] No exact match found. Checking for partial matches...")
+                linkDebug("[PROOF_RECV] NO MATCH! dest=\(proofFullHex), pendingKeys=\(pendingFullKeysHex)")
                 for (linkId, _) in pendingLinks {
                     let linkIdHex = linkId.map { String(format: "%02x", $0) }.joined()
                     print("[PROOF_RECV] Comparing: pendingLinkId=\(linkIdHex)")
                     print("[PROOF_RECV]        vs: proofDest    =\(proofFullHex)")
+                    linkDebug("[PROOF_RECV] Compare: pending=\(linkIdHex) vs proof=\(proofFullHex)")
                     if linkIdHex == proofFullHex {
                         print("[PROOF_RECV] EXACT STRING MATCH but Data lookup failed!")
+                        linkDebug("[PROOF_RECV] STRING MATCH BUT DATA MISMATCH!")
                     }
                 }
                 // Announce PROOF or path request response - existing handling
                 print("[PROOF_RECV] Treating as announce PROOF")
+                linkDebug("[PROOF_RECV] Treating as announce PROOF")
                 await handleAnnounceProof(packet, from: interfaceId)
             }
 
         case .data:
             let dataDestHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+            let dataFullHex = destHash.map { String(format: "%02x", $0) }.joined()
             print("[LXMF_INBOUND] DATA packet received: destType=\(packet.header.destinationType), dest=\(dataDestHex), dataLen=\(packet.data.count)")
+            linkDebug("[DATA_RECV] destType=\(packet.header.destinationType), dest=\(dataFullHex), dataLen=\(packet.data.count)")
             if packet.header.destinationType == .link {
                 // Link DATA packet - route to link
                 print("[LXMF_INBOUND] Routing to handleLinkData()")
+                linkDebug("[DATA_RECV] Routing to handleLinkData()")
                 await handleLinkData(packet)
             } else {
                 // Regular data - deliver to local destination
                 print("[LXMF_INBOUND] Routing to handleRegularData()")
+                linkDebug("[DATA_RECV] Routing to handleRegularData()")
                 await handleRegularData(packet, from: interfaceId)
             }
         }
@@ -1082,20 +1187,24 @@ public actor ReticuLumTransport {
     private func handleRegularData(_ packet: Packet, from interfaceId: String) async {
         let destHash = packet.destination
         let hexPrefix = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let hexFull = destHash.map { String(format: "%02x", $0) }.joined()
 
         // Debug: list all registered destinations
         let registeredDests = destinations.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
         print("[LXMF_INBOUND] handleRegularData: destHash=\(hexPrefix), registeredDests=\(registeredDests), destType=\(packet.header.destinationType)")
+        linkDebug("[REGULAR_DATA] destHash=\(hexFull), registeredDests=\(registeredDests)")
 
         // Check if destination is local
         guard let destination = destinations[destHash] else {
             // Destination not local - could forward in gateway mode
             print("[LXMF_INBOUND] Destination \(hexPrefix) NOT registered locally, dropping packet")
+            linkDebug("[REGULAR_DATA] NOT LOCAL - dropping")
             logger.debug("Received packet for non-local destination \(hexPrefix, privacy: .public)...")
             return
         }
 
         print("[LXMF_INBOUND] Destination \(hexPrefix) IS local, proceeding to decrypt")
+        linkDebug("[REGULAR_DATA] IS LOCAL - decrypting")
         logger.info("Delivering packet to local destination \(hexPrefix, privacy: .public)...")
 
         // Determine data to deliver - decrypt if needed
@@ -1119,11 +1228,14 @@ public actor ReticuLumTransport {
                 // NOT the destination hash. This matches Python RNS Identity.get_salt().
                 let identityHash = identity.hash
                 print("[LXMF_INBOUND] Attempting decrypt, identityHash=\(identityHash.prefix(8).map { String(format: "%02x", $0) }.joined()), ciphertext len=\(packet.data.count)")
+                linkDebug("[REGULAR_DATA] Decrypting: ciphertext=\(packet.data.count) bytes")
                 deliveryData = try identity.decrypt(packet.data, identityHash: identityHash)
                 let dataHex = deliveryData.prefix(16).map { String(format: "%02x", $0) }.joined()
                 print("[LXMF_INBOUND] Decrypted SINGLE packet: \(deliveryData.count) bytes, data[0:16]=\(dataHex)")
+                linkDebug("[REGULAR_DATA] Decrypted OK: \(deliveryData.count) bytes")
             } catch {
                 print("[LXMF_INBOUND] Decryption FAILED: \(error)")
+                linkDebug("[REGULAR_DATA] DECRYPT FAILED: \(error)")
                 logger.warning("Failed to decrypt SINGLE packet for \(hexPrefix, privacy: .public)...: \(error.localizedDescription, privacy: .public)")
                 return
             }
@@ -1267,6 +1379,11 @@ public actor ReticuLumTransport {
     /// When nodes receive the path request, they will respond with an announce
     /// if they have path information for the destination.
     ///
+    /// Path requests are sent to the PLAIN destination "Transport.path.request"
+    /// with payload: destination_hash (16 bytes) + request_tag (16 bytes)
+    ///
+    /// Reference: Python RNS Transport.request_path() lines 2541-2588
+    ///
     /// - Parameter destinationHash: 16-byte destination hash to request path for
     public func requestPath(for destinationHash: Data) async {
         // Check throttling
@@ -1283,24 +1400,38 @@ public actor ReticuLumTransport {
         let staleThreshold = Date().addingTimeInterval(-pathRequestCooldown * 10)
         pathRequestTimestamps = pathRequestTimestamps.filter { $0.value > staleThreshold }
 
-        // Build path request packet
-        // Per RNS docs: path requests use PROOF packet type with broadcast transport
+        let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("[TRANSPORT] Requesting path to \(destHex)...")
+        linkDebug("[PATH_REQUEST] Requesting path to \(destHex)")
+
+        // Generate random request tag (16 bytes)
+        var requestTag = Data(count: 16)
+        _ = requestTag.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
+
+        // Path request data: destination_hash (16 bytes) + request_tag (16 bytes)
+        var requestData = destinationHash
+        requestData.append(requestTag)
+
+        // Compute destination hash for "Transport.path.request" (PLAIN destination)
+        let pathRequestDestHash = Destination.plainHash(appName: "Transport", aspects: ["path", "request"])
+
+        // Build path request packet (DATA packet, BROADCAST transport, HEADER_1)
         let header = PacketHeader(
             headerType: .header1,
             hasContext: false,
             hasIFAC: false,
             transportType: .broadcast,
             destinationType: .plain,
-            packetType: .proof,  // Path requests use PROOF type
+            packetType: .data,
             hopCount: 0
         )
 
         let packet = Packet(
             header: header,
-            destination: destinationHash,
+            destination: pathRequestDestHash,
             transportAddress: nil,
             context: 0x00,
-            data: Data()  // Empty payload for path request
+            data: requestData
         )
 
         // Broadcast to all interfaces
@@ -1319,8 +1450,8 @@ public actor ReticuLumTransport {
             }
         }
 
-        let hexPrefix = destinationHash.prefix(4).map { String(format: "%02x", $0) }.joined()
-        logger.info("Path requested for \(hexPrefix, privacy: .public)... (sent to \(sentCount, privacy: .public) interface(s))")
+        print("[TRANSPORT] Path request sent for \(destHex) to \(sentCount) interface(s)")
+        linkDebug("[PATH_REQUEST] Sent request for \(destHex) to \(sentCount) interface(s)")
     }
 
     /// Queue a packet waiting for path discovery.
@@ -1402,13 +1533,16 @@ extension ReticuLumTransport {
         do {
             let packet = try Packet(from: data)
             let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+            let destFullHex = packet.destination.map { String(format: "%02x", $0) }.joined()
             let contextStr = packet.header.hasContext ? String(format: "0x%02x", packet.context) : "none"
             print("[PACKET_RECV] Parsed: type=\(packet.header.packetType), destType=\(packet.header.destinationType)")
             print("[PACKET_RECV] dest=\(destHex), context=\(contextStr), dataLen=\(packet.data.count)")
 
             // Log pending links status for every packet
             let pendingKeysHex = pendingLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
+            let pendingFullKeysHex = pendingLinks.keys.map { $0.map { String(format: "%02x", $0) }.joined() }
             print("[PACKET_RECV] Current pendingLinks: \(pendingLinks.count), keys=\(pendingKeysHex)")
+            linkDebug("[PKT_RECV] type=\(packet.header.packetType), dest=\(destFullHex), pendingLinks=\(pendingLinks.count), keys=\(pendingFullKeysHex)")
 
             Task {
                 await self.receive(packet: packet, from: interfaceId)

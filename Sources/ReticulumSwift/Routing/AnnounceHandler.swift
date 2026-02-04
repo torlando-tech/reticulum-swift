@@ -164,12 +164,34 @@ public actor AnnounceHandler {
         // For PLAIN destinations, we need to handle missing public keys
         let publicKeys = parsed.publicKeys ?? Data(repeating: 0, count: 64)
 
-        // Extract nextHop from HEADER_2 announces (routed through transport node)
-        // HEADER_2 packets have a transportAddress field indicating the transport node
-        let nextHop: Data? = (packet.header.headerType == .header2) ? packet.transportAddress : nil
+        // Extract nextHop from announces
+        // - HEADER_2 packets: use transportAddress (the transport node that relayed)
+        // - HEADER_1 packets with hops > 0: use destination hash (mirrors Python's received_from = destination_hash)
+        //   This enables HEADER_2 conversion for multi-hop routing even when transport node is unknown
+        let nextHop: Data?
+        if packet.header.headerType == .header2, let transportAddr = packet.transportAddress {
+            nextHop = transportAddr
+        } else if packet.header.hopCount > 0 {
+            // Python behavior: for HEADER_1 announces, received_from = destination_hash
+            // This allows HEADER_2 routing to work - the relay will forward appropriately
+            nextHop = parsed.destinationHash
+        } else {
+            nextHop = nil
+        }
+
+        // Debug: Log announce header type and nextHop extraction
+        let destHex = parsed.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("[ANNOUNCE_DEBUG] ===== ANNOUNCE PROCESSING =====")
+        print("[ANNOUNCE_DEBUG] dest=\(destHex), headerType=\(packet.header.headerType), hopCount=\(packet.header.hopCount)")
         if let nh = nextHop {
             let nhHex = nh.prefix(8).map { String(format: "%02x", $0) }.joined()
-            print("[ANNOUNCE] HEADER_2 announce: extracting nextHop=\(nhHex)")
+            if packet.header.headerType == .header2 {
+                print("[ANNOUNCE_DEBUG] HEADER_2 announce: nextHop=\(nhHex) (from transportAddress)")
+            } else {
+                print("[ANNOUNCE_DEBUG] HEADER_1 announce with hops>0: nextHop=\(nhHex) (set to destHash for relay forwarding)")
+            }
+        } else {
+            print("[ANNOUNCE_DEBUG] Direct announce (hops=0): no nextHop needed")
         }
 
         let pathRecorded = await pathTable.record(
