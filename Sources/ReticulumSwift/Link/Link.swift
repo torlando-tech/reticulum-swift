@@ -45,6 +45,11 @@ public actor Link {
     /// Target destination for this link (remote for initiator, local for responder)
     public let destination: Destination
 
+    /// Hash of the target destination (for routing lookups)
+    public var destinationHash: Data {
+        return destination.hash
+    }
+
     /// Whether this side initiated the link
     public let initiator: Bool
 
