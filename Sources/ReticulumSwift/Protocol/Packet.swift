@@ -139,6 +139,51 @@ public struct Packet: Sendable, Equatable {
         return result
     }
 
+    // MARK: - Packet Hash
+
+    /// Get the hashable part of the packet for hash computation.
+    ///
+    /// For HEADER_1: (raw[0] & 0x0F) + raw[2:]
+    /// For HEADER_2: (raw[0] & 0x0F) + raw[2:]
+    ///
+    /// The first byte is masked to lower 4 bits, and the hop count byte is skipped.
+    /// This matches Python RNS Packet.get_hashable_part().
+    ///
+    /// - Returns: Hashable part of the packet
+    public func getHashablePart() -> Data {
+        let raw = encode()
+        guard raw.count >= 2 else { return Data() }
+
+        var hashable = Data()
+        hashable.append(raw[0] & 0x0F)  // Lower 4 bits of first header byte
+        if raw.count > 2 {
+            hashable.append(contentsOf: raw[2...])  // Skip hop count byte
+        }
+        return hashable
+    }
+
+    /// Compute the packet hash (full 32-byte SHA256).
+    ///
+    /// The packet hash uniquely identifies this packet and is used for:
+    /// - Proof destination calculation
+    /// - Signature verification
+    /// - Deduplication
+    ///
+    /// - Returns: 32-byte SHA256 hash of hashable part
+    public func getFullHash() -> Data {
+        let hashable = getHashablePart()
+        return Hashing.fullHash(hashable)
+    }
+
+    /// Compute the truncated packet hash (16 bytes).
+    ///
+    /// Used as the proof destination for routing proofs back to sender.
+    ///
+    /// - Returns: 16-byte truncated hash
+    public func getTruncatedHash() -> Data {
+        return getFullHash().prefix(TRUNCATED_HASH_LENGTH)
+    }
+
     // MARK: - Computed Properties
 
     /// Total packet size in bytes
