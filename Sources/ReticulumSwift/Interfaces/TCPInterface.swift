@@ -76,6 +76,9 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
     /// Total bytes received through this interface
     public private(set) var bytesReceived: UInt64 = 0
 
+    /// Description of the last connection error (for UI display).
+    public private(set) var lastErrorDescription: String?
+
     // MARK: - Delegate
 
     /// Weak reference wrapper for delegate to work within actor
@@ -218,9 +221,12 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
         case .connected:
             // Successfully connected!
             reconnectAttempt = 0
+            lastErrorDescription = nil
             await transitionState(to: .connected)
 
         case .failed(let error):
+            // Capture error description for UI display
+            lastErrorDescription = error.localizedDescription
             // Connection failed - notify delegate and start reconnection
             notifyError(error)
             await startReconnectLoop()

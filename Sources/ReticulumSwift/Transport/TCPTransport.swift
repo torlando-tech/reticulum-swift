@@ -32,6 +32,12 @@ public final class TCPTransport: Transport {
     /// Current connection state.
     public private(set) var state: TransportState = .disconnected
 
+    /// Connection timeout work item (cancelled on success or disconnect).
+    private var connectionTimeoutWork: DispatchWorkItem?
+
+    /// Connection timeout in seconds.
+    private let connectionTimeout: TimeInterval = 15.0
+
     /// Callback invoked when connection state changes.
     public var onStateChange: ((TransportState) -> Void)?
 
@@ -87,6 +93,31 @@ public final class TCPTransport: Transport {
         }
 
         connection?.start(queue: connectionQueue)
+
+        // Start connection timeout
+        startConnectionTimeout()
+    }
+
+    /// Start a timeout that fires if connection isn't established in time.
+    private func startConnectionTimeout() {
+        connectionTimeoutWork?.cancel()
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            guard self.state == .connecting else { return }
+
+            self.logger.error("Connection timed out after \(self.connectionTimeout)s to \(self.host, privacy: .public):\(self.port, privacy: .public)")
+            self.connection?.cancel()
+            self.connection = nil
+            let error = TransportError.connectionTimedOut(host: self.host, port: self.port)
+            self.updateState(.failed(error))
+        }
+
+        connectionTimeoutWork = work
+        connectionQueue.asyncAfter(
+            deadline: .now() + connectionTimeout,
+            execute: work
+        )
     }
 
     /// Send data to the server.
@@ -115,6 +146,8 @@ public final class TCPTransport: Transport {
     /// Disconnect and clean up the connection.
     public func disconnect() {
         logger.info("Disconnecting TCP connection")
+        connectionTimeoutWork?.cancel()
+        connectionTimeoutWork = nil
         connection?.cancel()
         connection = nil
         updateState(.disconnected)
@@ -128,19 +161,34 @@ public final class TCPTransport: Transport {
         switch nwState {
         case .ready:
             logger.info("TCP connection ready to \(self.host, privacy: .public):\(self.port, privacy: .public)")
+            connectionTimeoutWork?.cancel()
+            connectionTimeoutWork = nil
             updateState(.connected)
             startReceiving()
 
         case .waiting(let error):
-            logger.info("TCP connection waiting: \(error.localizedDescription, privacy: .public)")
-            // NWConnection will automatically retry when network becomes available
+            // Surface this as a failure so the UI gets feedback.
+            // TCPInterface's reconnect loop will retry automatically.
+            logger.warning("TCP connection waiting (unreachable): \(error.localizedDescription, privacy: .public)")
+            connectionTimeoutWork?.cancel()
+            connectionTimeoutWork = nil
+            connection?.cancel()
+            connection = nil
+            let wrappedError = TransportError.connectionWaiting(
+                host: host, port: port, reason: error.localizedDescription
+            )
+            updateState(.failed(wrappedError))
 
         case .failed(let error):
             logger.error("TCP connection failed: \(error.localizedDescription, privacy: .public)")
+            connectionTimeoutWork?.cancel()
+            connectionTimeoutWork = nil
             updateState(.failed(error))
 
         case .cancelled:
             logger.info("TCP connection cancelled")
+            connectionTimeoutWork?.cancel()
+            connectionTimeoutWork = nil
             updateState(.disconnected)
 
         case .preparing:

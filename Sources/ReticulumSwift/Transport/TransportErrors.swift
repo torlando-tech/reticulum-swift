@@ -56,6 +56,17 @@ public enum TransportError: Error, Sendable, Equatable {
     /// The reason describes what is wrong with the packet.
     case invalidPacket(reason: String)
 
+    /// TCP connection timed out before establishing.
+    ///
+    /// The remote host did not respond within the timeout period.
+    case connectionTimedOut(host: String, port: UInt16)
+
+    /// TCP connection entered waiting state (destination unreachable).
+    ///
+    /// NWConnection reported the destination is currently unreachable.
+    /// Common causes: no route to host, connection refused, DNS failure.
+    case connectionWaiting(host: String, port: UInt16, reason: String)
+
     // MARK: - Equatable
 
     public static func == (lhs: TransportError, rhs: TransportError) -> Bool {
@@ -74,6 +85,10 @@ public enum TransportError: Error, Sendable, Equatable {
             return lhsId == rhsId && lhsErr == rhsErr
         case (.invalidPacket(let lhsReason), .invalidPacket(let rhsReason)):
             return lhsReason == rhsReason
+        case (.connectionTimedOut(let lhsHost, let lhsPort), .connectionTimedOut(let rhsHost, let rhsPort)):
+            return lhsHost == rhsHost && lhsPort == rhsPort
+        case (.connectionWaiting(let lhsHost, let lhsPort, let lhsReason), .connectionWaiting(let rhsHost, let rhsPort, let rhsReason)):
+            return lhsHost == rhsHost && lhsPort == rhsPort && lhsReason == rhsReason
         default:
             return false
         }
@@ -101,6 +116,10 @@ extension TransportError: LocalizedError {
             return "Send failed on interface \(interfaceId): \(underlying)"
         case .invalidPacket(let reason):
             return "Invalid packet: \(reason)"
+        case .connectionTimedOut(let host, let port):
+            return "Connection timed out to \(host):\(port)"
+        case .connectionWaiting(let host, let port, let reason):
+            return "Cannot reach \(host):\(port) — \(reason)"
         }
     }
 }
