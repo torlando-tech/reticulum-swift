@@ -70,6 +70,22 @@ private func linkDebug(_ message: String) {
     }
 }
 
+private func appendTransportDebug(_ message: String) {
+    let line = "[\(Date())] \(message)\n"
+    let path = "/tmp/columba_transport_debug.log"
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+}
+
 /// Central transport actor for Reticulum packet routing.
 ///
 /// ReticuLumTransport is the core routing engine that:
@@ -126,6 +142,13 @@ public actor ReticuLumTransport {
 
     /// Pending link requests awaiting PROOF (indexed by link ID)
     private var pendingLinks: [Data: Link] = [:]
+
+    // MARK: - Packet Proof Properties
+
+    /// Pending packet proof callbacks (key = full 32-byte packet hash).
+    /// When a link DATA packet proof arrives, the continuation is resumed with `true`.
+    /// On timeout, resumed with `false`.
+    private var pendingPacketProofs: [Data: CheckedContinuation<Bool, Never>] = [:]
 
     // MARK: - Path Request Properties
 
@@ -392,6 +415,76 @@ public actor ReticuLumTransport {
     /// Number of pending links.
     public var pendingLinkCount: Int {
         pendingLinks.count
+    }
+
+    // MARK: - Packet Proof Handling
+
+    /// Wait for a proof that a link DATA packet was delivered.
+    ///
+    /// Registers the packet's full hash and suspends until either:
+    /// - A matching proof arrives (returns `true`)
+    /// - The timeout expires (returns `false`)
+    ///
+    /// Used by propagation send to confirm the propagation node accepted the message.
+    ///
+    /// - Parameters:
+    ///   - packetHash: Full 32-byte SHA256 hash of the sent packet
+    ///   - timeout: Maximum time to wait for proof (seconds)
+    /// - Returns: `true` if proof received, `false` on timeout
+    public func waitForPacketProof(packetHash: Data, timeout: TimeInterval = 15) async -> Bool {
+        return await withCheckedContinuation { continuation in
+            pendingPacketProofs[packetHash] = continuation
+
+            // Start timeout task
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(timeout))
+                guard let self = self else { return }
+                if let cont = await self.removePacketProof(for: packetHash) {
+                    cont.resume(returning: false)
+                }
+            }
+        }
+    }
+
+    /// Remove and return a pending packet proof continuation (actor-isolated helper).
+    private func removePacketProof(for hash: Data) -> CheckedContinuation<Bool, Never>? {
+        return pendingPacketProofs.removeValue(forKey: hash)
+    }
+
+    /// Handle a DATA packet proof on an active link.
+    ///
+    /// The proof data contains (NOT encrypted — Python Packet.pack() special-cases
+    /// PROOF+LINK to skip encryption):
+    /// - packet_hash (32 bytes): Full SHA256 hash of the original packet
+    /// - signature (64 bytes): Link.sign(packet_hash) — validates delivery
+    ///
+    /// We match the packet_hash against pending proof registrations.
+    ///
+    /// - Parameters:
+    ///   - packet: PROOF packet received
+    ///   - link: Active link the proof was received on
+    private func handleDataProof(_ packet: Packet, link: Link) async {
+        // Link PROOF packets are NOT encrypted (Python Packet.py line 198-199:
+        // elif packet_type == PROOF and destination.type == LINK: ciphertext = data)
+        // proof_data = packet_hash(32) + link.sign(packet_hash)(64) = 96 bytes
+        let proofData = packet.data
+        guard proofData.count >= 32 else {
+            print("[PROOF_DATA] Proof payload too short: \(proofData.count) bytes")
+            return
+        }
+
+        let proofHash = Data(proofData.prefix(32))
+        let proofHex = proofHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("[PROOF_DATA] Received DATA proof, packetHash=\(proofHex)..., totalLen=\(proofData.count)")
+
+        // Check against pending packet proofs
+        if let continuation = pendingPacketProofs.removeValue(forKey: proofHash) {
+            print("[PROOF_DATA] MATCH! Proof confirmed delivery")
+            continuation.resume(returning: true)
+        } else {
+            let pendingHashes = pendingPacketProofs.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
+            print("[PROOF_DATA] No pending proof match. Pending hashes: \(pendingHashes)")
+        }
     }
 
     /// Send raw packet bytes to all connected interfaces.
@@ -770,34 +863,28 @@ public actor ReticuLumTransport {
             let proofDestHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             let proofFullHex = destHash.map { String(format: "%02x", $0) }.joined()
             let pendingKeysHex = pendingLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
-            let pendingFullKeysHex = pendingLinks.keys.map { $0.map { String(format: "%02x", $0) }.joined() }
+            let activeKeysHex = activeLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
             print("[PROOF_RECV] ===== PROOF PACKET RECEIVED =====")
             print("[PROOF_RECV] dest=\(proofDestHex), full=\(proofFullHex)")
             print("[PROOF_RECV] pendingLinks count=\(pendingLinks.count), keys=\(pendingKeysHex)")
+            print("[PROOF_RECV] activeLinks count=\(activeLinks.count), keys=\(activeKeysHex)")
             print("[PROOF_RECV] context=0x\(String(format: "%02x", packet.context)), dataLen=\(packet.data.count)")
-            linkDebug("[PROOF_RECV] PROOF packet: dest=\(proofFullHex), pendingLinks=\(pendingLinks.count), keys=\(pendingFullKeysHex)")
+            // File-based debug for proof routing (always visible)
+            appendTransportDebug("[PROOF] dest=\(proofDestHex) pendingLinks=\(pendingKeysHex) activeLinks=\(activeKeysHex) ctx=0x\(String(format: "%02x", packet.context)) dataLen=\(packet.data.count)")
 
             if let link = pendingLinks[destHash] {
                 print("[PROOF_RECV] MATCH! Found pending link for PROOF, processing...")
-                linkDebug("[PROOF_RECV] MATCH! Processing link PROOF")
+                appendTransportDebug("[PROOF] MATCH pendingLink → handleLinkProof")
                 await handleLinkProof(packet, link: link)
+            } else if let link = activeLinks[destHash] {
+                // DATA packet proof on an active link (e.g., propagation node confirming delivery)
+                print("[PROOF_RECV] DATA proof on active link \(proofDestHex)")
+                appendTransportDebug("[PROOF] MATCH activeLink → handleDataProof")
+                await handleDataProof(packet, link: link)
             } else {
-                // Try to find if there's a link ID mismatch by checking all pending links
-                print("[PROOF_RECV] No exact match found. Checking for partial matches...")
-                linkDebug("[PROOF_RECV] NO MATCH! dest=\(proofFullHex), pendingKeys=\(pendingFullKeysHex)")
-                for (linkId, _) in pendingLinks {
-                    let linkIdHex = linkId.map { String(format: "%02x", $0) }.joined()
-                    print("[PROOF_RECV] Comparing: pendingLinkId=\(linkIdHex)")
-                    print("[PROOF_RECV]        vs: proofDest    =\(proofFullHex)")
-                    linkDebug("[PROOF_RECV] Compare: pending=\(linkIdHex) vs proof=\(proofFullHex)")
-                    if linkIdHex == proofFullHex {
-                        print("[PROOF_RECV] EXACT STRING MATCH but Data lookup failed!")
-                        linkDebug("[PROOF_RECV] STRING MATCH BUT DATA MISMATCH!")
-                    }
-                }
                 // Announce PROOF or path request response - existing handling
-                print("[PROOF_RECV] Treating as announce PROOF")
-                linkDebug("[PROOF_RECV] Treating as announce PROOF")
+                print("[PROOF_RECV] No link match, treating as announce PROOF")
+                appendTransportDebug("[PROOF] NO MATCH → handleAnnounceProof")
                 await handleAnnounceProof(packet, from: interfaceId)
             }
 
@@ -1537,6 +1624,10 @@ extension ReticuLumTransport {
             let contextStr = packet.header.hasContext ? String(format: "0x%02x", packet.context) : "none"
             print("[PACKET_RECV] Parsed: type=\(packet.header.packetType), destType=\(packet.header.destinationType)")
             print("[PACKET_RECV] dest=\(destHex), context=\(contextStr), dataLen=\(packet.data.count)")
+            // Log ALL incoming packets to file for debugging proof delivery
+            if !pendingPacketProofs.isEmpty {
+                appendTransportDebug("[RECV] type=\(packet.header.packetType) destType=\(packet.header.destinationType) dest=\(destHex) ctx=0x\(String(format: "%02x", packet.context)) dataLen=\(packet.data.count) flags=0x\(String(format: "%02x", data[data.startIndex]))")
+            }
 
             // Log pending links status for every packet
             let pendingKeysHex = pendingLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }

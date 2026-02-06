@@ -144,9 +144,10 @@ public struct Packet: Sendable, Equatable {
     /// Get the hashable part of the packet for hash computation.
     ///
     /// For HEADER_1: (raw[0] & 0x0F) + raw[2:]
-    /// For HEADER_2: (raw[0] & 0x0F) + raw[2:]
+    /// For HEADER_2: (raw[0] & 0x0F) + raw[TRUNCATED_HASH_LENGTH+2:]
     ///
-    /// The first byte is masked to lower 4 bits, and the hop count byte is skipped.
+    /// The first byte is masked to lower 4 bits, the hop count byte is skipped,
+    /// and for HEADER_2 the transport address is also skipped.
     /// This matches Python RNS Packet.get_hashable_part().
     ///
     /// - Returns: Hashable part of the packet
@@ -156,8 +157,18 @@ public struct Packet: Sendable, Equatable {
 
         var hashable = Data()
         hashable.append(raw[0] & 0x0F)  // Lower 4 bits of first header byte
-        if raw.count > 2 {
-            hashable.append(contentsOf: raw[2...])  // Skip hop count byte
+
+        if header.headerType == .header2 {
+            // HEADER_2: skip hop byte (1) and transport address (16)
+            let skipTo = TRUNCATED_HASH_LENGTH + 2  // 16 + 2 = 18
+            if raw.count > skipTo {
+                hashable.append(contentsOf: raw[skipTo...])
+            }
+        } else {
+            // HEADER_1: skip hop byte only
+            if raw.count > 2 {
+                hashable.append(contentsOf: raw[2...])
+            }
         }
         return hashable
     }
