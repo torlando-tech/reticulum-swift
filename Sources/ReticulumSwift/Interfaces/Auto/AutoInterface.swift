@@ -132,6 +132,10 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
     private var ucastReceiveTasks: [String: Task<Void, Never>] = [:]
     private var dataReceiveTasks: [String: Task<Void, Never>] = [:]
 
+    /// Dedicated queue for blocking socket I/O (poll/recvfrom).
+    /// Keeps blocking calls off the actor's cooperative executor.
+    private let socketQueue = DispatchQueue(label: "net.reticulum.autointerface.sockets", attributes: .concurrent)
+
     private let logger = Logger(subsystem: "net.reticulum", category: "AutoInterface")
 
     // MARK: - Initialization
@@ -358,6 +362,9 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
     // MARK: - Receive Loops
 
     /// Start receive loops for all socket types on all interfaces.
+    ///
+    /// Runs blocking poll()/recvfrom() on a dedicated DispatchQueue to avoid
+    /// starving the actor's cooperative executor.
     private func startReceiveLoops() {
         for (ifname, _) in adoptedInterfaces {
             // Multicast discovery receive
@@ -388,35 +395,37 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
 
     /// Generic receive loop for a single socket.
     ///
-    /// Uses poll() to wait for data with a timeout, avoiding busy-spin on
-    /// non-blocking sockets.
+    /// Runs blocking poll()/recvfrom() on a DispatchQueue, then hops to the
+    /// actor only for processing received data. This prevents the blocking
+    /// POSIX calls from starving the actor's cooperative executor.
     private func receiveLoop(socket fd: Int32, ifname: String, isDiscovery: Bool) async {
         while !Task.isCancelled {
-            // Use poll() with a 500ms timeout to avoid busy-spinning
-            var pollFd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-            let pollResult = poll(&pollFd, 1, 500) // 500ms timeout
+            // Run blocking poll+recv on a dedicated queue, not the actor
+            let result: (Data, String)? = await withCheckedContinuation { continuation in
+                socketQueue.async {
+                    var pollFd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                    let pollResult = poll(&pollFd, 1, 500) // 500ms timeout
 
-            if pollResult <= 0 {
-                // Timeout or error — yield and retry
-                await Task.yield()
-                continue
+                    guard pollResult > 0 else {
+                        continuation.resume(returning: nil)
+                        return
+                    }
+
+                    do {
+                        let (data, sourceAddr, _) = try UDPSocketHelper.receiveFrom(fd)
+                        continuation.resume(returning: (data, sourceAddr))
+                    } catch {
+                        continuation.resume(returning: nil)
+                    }
+                }
             }
 
-            do {
-                let (data, sourceAddr, _) = try UDPSocketHelper.receiveFrom(fd)
-
+            // Process on the actor
+            if let (data, sourceAddr) = result {
                 if isDiscovery {
                     handleDiscoveryPacket(data: data, sourceAddress: sourceAddr, ifname: ifname)
                 } else {
                     handleDataPacket(data: data, sourceAddress: sourceAddr, ifname: ifname)
-                }
-            } catch {
-                // EAGAIN/EWOULDBLOCK is normal for non-blocking sockets
-                if errno == EAGAIN || errno == EWOULDBLOCK {
-                    continue
-                }
-                if !Task.isCancelled {
-                    logger.debug("Receive error on \(ifname, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
             }
         }
