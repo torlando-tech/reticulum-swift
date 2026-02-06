@@ -296,6 +296,32 @@ public actor ReticuLumTransport {
         public let peerAddress: String?
     }
 
+    /// Resolve an interface ID to a human-readable name.
+    ///
+    /// Returns the interface config name (e.g. "Relay Server", "Auto Discovery")
+    /// or a formatted type name if the interface is no longer registered.
+    /// For AutoInterface peers, includes the peer address.
+    public func getInterfaceName(for interfaceId: String) async -> String? {
+        if let iface = interfaces[interfaceId] {
+            if let peer = iface as? AutoInterfacePeer {
+                let addr = await peer.peerAddress
+                return "AutoInterface [\(addr)]"
+            }
+            let config = iface.config
+            return "\(config.name) (\(config.type.rawValue.uppercased()))"
+        }
+        // Interface might have been removed — try to infer from ID pattern
+        if interfaceId.hasPrefix("auto-") {
+            // AutoInterface peer: "auto-auto0-fe80::..."
+            let parts = interfaceId.split(separator: "-", maxSplits: 2)
+            if parts.count >= 3 {
+                return "AutoInterface [\(parts[2])]"
+            }
+            return "AutoInterface"
+        }
+        return nil
+    }
+
     /// Get a snapshot of all registered interfaces and their states.
     public func getInterfaceSnapshots() async -> [InterfaceSnapshot] {
         var snapshots: [InterfaceSnapshot] = []
