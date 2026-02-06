@@ -702,39 +702,47 @@ public actor ReticuLumTransport {
         // Determine dispatch strategy based on header type
         switch packet.header.transportType {
         case .broadcast:
-            // HEADER_1: Check if we need to convert to HEADER_2 for multi-hop routing
-            // This applies to LINKREQUEST and other packets going to remote destinations
-            let pathEntry = await pathTable.lookup(destinationHash: packet.destination)
-            if let entry = pathEntry {
-                let nextHopStatus = entry.nextHop != nil ? entry.nextHop!.prefix(8).map { String(format: "%02x", $0) }.joined() : "nil"
-                print("[SEND_DEBUG] PathEntry found: hopCount=\(entry.hopCount), nextHop=\(nextHopStatus), interfaceId='\(entry.interfaceId)'")
-            } else {
-                print("[SEND_DEBUG] PathEntry NOT found for dest=\(destHex)")
-            }
-
-            // Python converts to HEADER_2 only if hops > 1 (Transport.py line ~500)
-            // hops == 1 means destination is one hop away, send HEADER_1 directly
-            // hops > 1 means destination needs multi-hop routing via transport node
-            if let entry = pathEntry,
-               entry.hopCount > 1,
-               let nextHop = entry.nextHop {
-                // Convert to HEADER_2 for routed delivery (multi-hop)
-                let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
-                let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("[SEND_DEBUG] *** CONVERTING to HEADER_2 *** dest=\(destHex), nextHop=\(nextHopHex), hops=\(entry.hopCount)")
-                try await sendToAllInterfaces(routedPacket)
-            } else {
-                // Direct delivery (single hop or no path) - send as HEADER_1
-                // The relay/transport will handle any further routing
-                if let entry = pathEntry {
-                    if entry.hopCount > 1 && entry.nextHop == nil {
-                        print("[SEND_DEBUG] WARNING: hopCount=\(entry.hopCount) but nextHop is nil! Sending as HEADER_1 (relay will route)")
-                    } else if entry.hopCount == 1 {
-                        print("[SEND_DEBUG] Single hop (hops=1): sending as HEADER_1")
-                    }
-                }
-                print("[SEND_DEBUG] Sending as HEADER_1 (direct broadcast)")
+            // ANNOUNCE packets must ALWAYS be sent as HEADER_1/BROADCAST by the originator.
+            // Only relay/transport nodes convert announces to HEADER_2 when re-broadcasting.
+            // Converting our own announce to HEADER_2 causes the relay to mishandle it.
+            if packet.header.packetType == .announce {
+                print("[SEND_DEBUG] ANNOUNCE: sending as HEADER_1 (never convert announces to HEADER_2)")
                 try await sendToAllInterfaces(packet)
+            } else {
+                // HEADER_1: Check if we need to convert to HEADER_2 for multi-hop routing
+                // This applies to LINKREQUEST and other packets going to remote destinations
+                let pathEntry = await pathTable.lookup(destinationHash: packet.destination)
+                if let entry = pathEntry {
+                    let nextHopStatus = entry.nextHop != nil ? entry.nextHop!.prefix(8).map { String(format: "%02x", $0) }.joined() : "nil"
+                    print("[SEND_DEBUG] PathEntry found: hopCount=\(entry.hopCount), nextHop=\(nextHopStatus), interfaceId='\(entry.interfaceId)'")
+                } else {
+                    print("[SEND_DEBUG] PathEntry NOT found for dest=\(destHex)")
+                }
+
+                // Python converts to HEADER_2 only if hops > 1 (Transport.py line ~500)
+                // hops == 1 means destination is one hop away, send HEADER_1 directly
+                // hops > 1 means destination needs multi-hop routing via transport node
+                if let entry = pathEntry,
+                   entry.hopCount > 1,
+                   let nextHop = entry.nextHop {
+                    // Convert to HEADER_2 for routed delivery (multi-hop)
+                    let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
+                    let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("[SEND_DEBUG] *** CONVERTING to HEADER_2 *** dest=\(destHex), nextHop=\(nextHopHex), hops=\(entry.hopCount)")
+                    try await sendToAllInterfaces(routedPacket)
+                } else {
+                    // Direct delivery (single hop or no path) - send as HEADER_1
+                    // The relay/transport will handle any further routing
+                    if let entry = pathEntry {
+                        if entry.hopCount > 1 && entry.nextHop == nil {
+                            print("[SEND_DEBUG] WARNING: hopCount=\(entry.hopCount) but nextHop is nil! Sending as HEADER_1 (relay will route)")
+                        } else if entry.hopCount == 1 {
+                            print("[SEND_DEBUG] Single hop (hops=1): sending as HEADER_1")
+                        }
+                    }
+                    print("[SEND_DEBUG] Sending as HEADER_1 (direct broadcast)")
+                    try await sendToAllInterfaces(packet)
+                }
             }
 
         case .transport:
@@ -834,6 +842,16 @@ public actor ReticuLumTransport {
         let headerHex = encoded.prefix(2).map { String(format: "%02x", $0) }.joined()
         let fullHex = encoded.prefix(40).map { String(format: "%02x", $0) }.joined()
 
+        let typeStr: String
+        switch packet.header.packetType {
+        case .data: typeStr = "DATA"
+        case .announce: typeStr = "ANNOUNCE"
+        case .linkRequest: typeStr = "LINKREQUEST"
+        case .proof: typeStr = "PROOF"
+        }
+        let sendLog = "[SEND] type=\(typeStr) dest=\(destHex) context=\(contextStr) size=\(encoded.count) interfaces=\(interfaces.count)\n"
+        appendTransportDebug(sendLog)
+
         print("[SEND_BYTES] ===== ACTUAL BYTES BEING SENT =====")
         print("[SEND_BYTES] Total size: \(encoded.count) bytes")
         print("[SEND_BYTES] Header bytes: \(headerHex)")
@@ -849,6 +867,7 @@ public actor ReticuLumTransport {
             // Skip disconnected interfaces
             guard interface.state == .connected else {
                 print("[TRANSPORT] Skipping disconnected interface '\(id)'")
+                appendTransportDebug("[SEND] Skipping disconnected interface '\(id)'\n")
                 logger.debug("Skipping disconnected interface: \(id, privacy: .public)")
                 continue
             }
@@ -857,10 +876,12 @@ public actor ReticuLumTransport {
                 try await interface.send(encoded)
                 successCount += 1
                 print("[TRANSPORT] Broadcast sent \(encoded.count) bytes via '\(id)'")
+                appendTransportDebug("[SEND] OK via '\(id)' (\(encoded.count) bytes)\n")
                 logger.debug("Broadcast sent via interface: \(id, privacy: .public)")
             } catch {
                 lastError = error
                 print("[TRANSPORT] Broadcast failed on '\(id)': \(error)")
+                appendTransportDebug("[SEND] FAILED on '\(id)': \(error)\n")
                 logger.warning("Broadcast failed on interface \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         }
@@ -868,6 +889,7 @@ public actor ReticuLumTransport {
         // If no interfaces succeeded, throw error
         if successCount == 0 {
             print("[TRANSPORT] sendToAllInterfaces FAILED: no interfaces succeeded")
+            appendTransportDebug("[SEND] FAILED: no interfaces succeeded\n")
             if let error = lastError {
                 throw TransportError.sendFailed(interfaceId: "all", underlying: error.localizedDescription)
             } else {
@@ -875,6 +897,7 @@ public actor ReticuLumTransport {
             }
         }
 
+        appendTransportDebug("[SEND] Broadcast complete: \(successCount)/\(interfaces.count) interface(s)\n")
         print("[TRANSPORT] Broadcast complete: \(successCount) interface(s)")
         logger.info("Broadcast packet sent to \(successCount, privacy: .public) interface(s)")
     }
