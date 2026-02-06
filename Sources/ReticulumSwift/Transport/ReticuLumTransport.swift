@@ -852,6 +852,12 @@ public actor ReticuLumTransport {
         let sendLog = "[SEND] type=\(typeStr) dest=\(destHex) context=\(contextStr) size=\(encoded.count) interfaces=\(interfaces.count)\n"
         appendTransportDebug(sendLog)
 
+        // For ANNOUNCE packets, log the FULL hex for offline validation
+        if packet.header.packetType == .announce {
+            let allHex = encoded.map { String(format: "%02x", $0) }.joined()
+            appendTransportDebug("[SEND] ANNOUNCE_FULL_HEX(\(encoded.count)B): \(allHex)\n")
+        }
+
         print("[SEND_BYTES] ===== ACTUAL BYTES BEING SENT =====")
         print("[SEND_BYTES] Total size: \(encoded.count) bytes")
         print("[SEND_BYTES] Header bytes: \(headerHex)")

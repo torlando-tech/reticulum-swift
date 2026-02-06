@@ -222,11 +222,33 @@ public struct Announce: Sendable {
     }
 
     /// Generate random hash for announce uniqueness.
+    ///
+    /// Python reference: RNS/Destination.py line 282
+    ///   `random_hash = RNS.Identity.get_random_hash()[0:5] + int(time.time()).to_bytes(5, "big")`
+    ///
+    /// Format: [5 random bytes][5-byte big-endian Unix timestamp]
+    ///
+    /// The timestamp in bytes [5:10] is critical for relay announce ordering.
+    /// Transport.announce_emitted() extracts it to determine if an announce
+    /// is newer than a previously seen one. Without a proper timestamp, the
+    /// relay's deduplication logic will reject our announces.
     private static func generateRandomHash() -> Data {
         var bytes = [UInt8](repeating: 0, count: ANNOUNCE_RANDOM_HASH_LENGTH)
-        for i in 0..<ANNOUNCE_RANDOM_HASH_LENGTH {
+
+        // First 5 bytes: random
+        for i in 0..<5 {
             bytes[i] = UInt8.random(in: 0...255)
         }
+
+        // Last 5 bytes: big-endian Unix timestamp
+        // Matches Python's int(time.time()).to_bytes(5, "big")
+        let timestamp = UInt64(Date().timeIntervalSince1970)
+        bytes[5] = UInt8((timestamp >> 32) & 0xFF)
+        bytes[6] = UInt8((timestamp >> 24) & 0xFF)
+        bytes[7] = UInt8((timestamp >> 16) & 0xFF)
+        bytes[8] = UInt8((timestamp >> 8) & 0xFF)
+        bytes[9] = UInt8(timestamp & 0xFF)
+
         return Data(bytes)
     }
 }
