@@ -294,6 +294,8 @@ public actor ReticuLumTransport {
         public let isAutoInterfacePeer: Bool
         /// For AutoInterfacePeers, the peer's IPv6 link-local address
         public let peerAddress: String?
+        /// Last error description (if interface failed to connect)
+        public let lastErrorDescription: String?
     }
 
     /// Resolve an interface ID to a human-readable name.
@@ -328,6 +330,13 @@ public actor ReticuLumTransport {
         for (_, iface) in interfaces {
             let state = await iface.state
             let config = iface.config
+            // Get error description from TCPInterface if available
+            let errorDesc: String?
+            if let tcp = iface as? TCPInterface {
+                errorDesc = await tcp.lastErrorDescription
+            } else {
+                errorDesc = nil
+            }
             if let peer = iface as? AutoInterfacePeer {
                 let addr = await peer.peerAddress
                 snapshots.append(InterfaceSnapshot(
@@ -336,7 +345,8 @@ public actor ReticuLumTransport {
                     type: config.type,
                     state: state,
                     isAutoInterfacePeer: true,
-                    peerAddress: addr
+                    peerAddress: addr,
+                    lastErrorDescription: errorDesc
                 ))
             } else {
                 snapshots.append(InterfaceSnapshot(
@@ -345,7 +355,8 @@ public actor ReticuLumTransport {
                     type: config.type,
                     state: state,
                     isAutoInterfacePeer: false,
-                    peerAddress: nil
+                    peerAddress: nil,
+                    lastErrorDescription: errorDesc
                 ))
             }
         }
