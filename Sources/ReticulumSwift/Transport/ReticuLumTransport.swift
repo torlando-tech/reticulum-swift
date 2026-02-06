@@ -226,6 +226,46 @@ public actor ReticuLumTransport {
         delegateWrappers.removeValue(forKey: id)
     }
 
+    /// Add an AutoInterface with peer lifecycle management.
+    ///
+    /// AutoInterface spawns sub-interfaces for each discovered peer.
+    /// This method registers the parent for state tracking and wires up
+    /// callbacks so discovered peers are automatically added to / removed
+    /// from this transport.
+    ///
+    /// - Parameter autoInterface: The AutoInterface to add
+    /// - Throws: InterfaceError if connection fails
+    public func addAutoInterface(_ autoInterface: AutoInterface) async throws {
+        let parentId = autoInterface.id
+        logger.info("Adding AutoInterface: \(parentId, privacy: .public)")
+
+        // Register parent for state tracking
+        interfaces[parentId] = autoInterface
+        let wrapper = TransportDelegateWrapper(transport: self)
+        delegateWrappers[parentId] = wrapper
+        await autoInterface.setDelegate(wrapper)
+
+        // Wire peer lifecycle callbacks
+        await autoInterface.setPeerCallbacks(
+            onPeerAdded: { [weak self] peer in
+                guard let self = self else { return }
+                Task {
+                    try? await self.addInterface(peer)
+                }
+            },
+            onPeerRemoved: { [weak self] peerId in
+                guard let self = self else { return }
+                Task {
+                    await self.removeInterface(id: peerId)
+                }
+            }
+        )
+
+        // Start the interface (discovery begins)
+        try await autoInterface.connect()
+        logger.info("AutoInterface \(parentId, privacy: .public) connected")
+    }
+
     /// Get an interface by ID.
     ///
     /// - Parameter id: Interface ID
@@ -242,6 +282,48 @@ public actor ReticuLumTransport {
     /// All interface IDs.
     public var interfaceIds: [String] {
         Array(interfaces.keys)
+    }
+
+    /// Snapshot of a registered interface's key properties.
+    public struct InterfaceSnapshot: Sendable {
+        public let id: String
+        public let name: String
+        public let type: InterfaceType
+        public let state: InterfaceState
+        /// True if this is an AutoInterfacePeer (spawned sub-interface)
+        public let isAutoInterfacePeer: Bool
+        /// For AutoInterfacePeers, the peer's IPv6 link-local address
+        public let peerAddress: String?
+    }
+
+    /// Get a snapshot of all registered interfaces and their states.
+    public func getInterfaceSnapshots() async -> [InterfaceSnapshot] {
+        var snapshots: [InterfaceSnapshot] = []
+        for (_, iface) in interfaces {
+            let state = await iface.state
+            let config = iface.config
+            if let peer = iface as? AutoInterfacePeer {
+                let addr = await peer.peerAddress
+                snapshots.append(InterfaceSnapshot(
+                    id: iface.id,
+                    name: config.name,
+                    type: config.type,
+                    state: state,
+                    isAutoInterfacePeer: true,
+                    peerAddress: addr
+                ))
+            } else {
+                snapshots.append(InterfaceSnapshot(
+                    id: iface.id,
+                    name: config.name,
+                    type: config.type,
+                    state: state,
+                    isAutoInterfacePeer: false,
+                    peerAddress: nil
+                ))
+            }
+        }
+        return snapshots.sorted { $0.id < $1.id }
     }
 
     // MARK: - Destination Registration

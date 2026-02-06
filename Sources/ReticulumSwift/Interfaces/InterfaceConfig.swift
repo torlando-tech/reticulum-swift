@@ -20,6 +20,7 @@ public enum InterfaceType: String, Codable, Sendable, Equatable {
     case tcp
     case udp
     case i2p
+    case autoInterface
 }
 
 // MARK: - Interface Configuration
