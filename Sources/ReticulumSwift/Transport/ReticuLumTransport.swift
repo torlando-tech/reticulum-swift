@@ -230,6 +230,46 @@ public actor ReticuLumTransport {
         logger.info("AutoInterface \(parentId, privacy: .public) connected")
     }
 
+    /// Add a BLEInterface with peer lifecycle management.
+    ///
+    /// BLEInterface spawns sub-interfaces for each connected BLE mesh peer.
+    /// This method registers the parent for state tracking and wires up
+    /// callbacks so discovered peers are automatically added to / removed
+    /// from this transport.
+    ///
+    /// - Parameter bleInterface: The BLEInterface to add
+    /// - Throws: InterfaceError if connection fails
+    public func addBLEInterface(_ bleInterface: BLEInterface) async throws {
+        let parentId = bleInterface.id
+        logger.info("Adding BLEInterface: \(parentId, privacy: .public)")
+
+        // Register parent for state tracking
+        interfaces[parentId] = bleInterface
+        let wrapper = TransportDelegateWrapper(transport: self)
+        delegateWrappers[parentId] = wrapper
+        await bleInterface.setDelegate(wrapper)
+
+        // Wire peer lifecycle callbacks
+        await bleInterface.setPeerCallbacks(
+            onPeerAdded: { [weak self] peer in
+                guard let self = self else { return }
+                Task {
+                    try? await self.addInterface(peer)
+                }
+            },
+            onPeerRemoved: { [weak self] peerId in
+                guard let self = self else { return }
+                Task {
+                    await self.removeInterface(id: peerId)
+                }
+            }
+        )
+
+        // Start the interface (advertising + scanning begins)
+        try await bleInterface.connect()
+        logger.info("BLEInterface \(parentId, privacy: .public) connected")
+    }
+
     /// Get an interface by ID.
     ///
     /// - Parameter id: Interface ID
@@ -256,7 +296,10 @@ public actor ReticuLumTransport {
         public let state: InterfaceState
         /// True if this is an AutoInterfacePeer (spawned sub-interface)
         public let isAutoInterfacePeer: Bool
-        /// For AutoInterfacePeers, the peer's IPv6 link-local address
+        /// True if this is a BLEPeerInterface (spawned BLE mesh sub-interface)
+        public let isBLEPeerInterface: Bool
+        /// For AutoInterfacePeers, the peer's IPv6 link-local address.
+        /// For BLEPeerInterfaces, the peer's identity hex.
         public let peerAddress: String?
         /// Last error description (if interface failed to connect)
         public let lastErrorDescription: String?
@@ -273,6 +316,10 @@ public actor ReticuLumTransport {
                 let addr = await peer.peerAddress
                 return "AutoInterface [\(addr)]"
             }
+            if let blePeer = iface as? BLEPeerInterface {
+                let identityHex = await blePeer.peerIdentityHex
+                return "BLE [\(identityHex.prefix(8))]"
+            }
             let config = iface.config
             return "\(config.name) (\(config.type.rawValue.uppercased()))"
         }
@@ -284,6 +331,13 @@ public actor ReticuLumTransport {
                 return "AutoInterface [\(parts[2])]"
             }
             return "AutoInterface"
+        }
+        if interfaceId.hasPrefix("ble-") {
+            let parts = interfaceId.split(separator: "-", maxSplits: 2)
+            if parts.count >= 3 {
+                return "BLE [\(parts[2])]"
+            }
+            return "BLE Mesh"
         }
         return nil
     }
@@ -309,7 +363,20 @@ public actor ReticuLumTransport {
                     type: config.type,
                     state: state,
                     isAutoInterfacePeer: true,
+                    isBLEPeerInterface: false,
                     peerAddress: addr,
+                    lastErrorDescription: errorDesc
+                ))
+            } else if let blePeer = iface as? BLEPeerInterface {
+                let identityHex = await blePeer.peerIdentityHex
+                snapshots.append(InterfaceSnapshot(
+                    id: iface.id,
+                    name: config.name,
+                    type: config.type,
+                    state: state,
+                    isAutoInterfacePeer: false,
+                    isBLEPeerInterface: true,
+                    peerAddress: identityHex,
                     lastErrorDescription: errorDesc
                 ))
             } else {
@@ -319,6 +386,7 @@ public actor ReticuLumTransport {
                     type: config.type,
                     state: state,
                     isAutoInterfacePeer: false,
+                    isBLEPeerInterface: false,
                     peerAddress: nil,
                     lastErrorDescription: errorDesc
                 ))
