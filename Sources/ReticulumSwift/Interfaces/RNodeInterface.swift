@@ -228,7 +228,8 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
 
     /// Disconnect from the RNode device.
     ///
-    /// Stops any ongoing reconnection attempts and disconnects the transport.
+    /// Stops any ongoing reconnection attempts, sends RNode shutdown commands,
+    /// and disconnects the transport. Matches Python detach() (lines 1189-1202).
     /// State transitions to disconnected.
     public func disconnect() async {
         autoReconnect = false
@@ -238,9 +239,33 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         reconnectTask = nil
         reconnectAttempt = 0
 
+        // If online, send radio OFF and LEAVE commands
+        if online {
+            do {
+                try await setRadioState(RNodeConstants.RADIO_STATE_OFF)
+            } catch {
+                // Don't fail disconnect if RNode is already gone
+                print("[RNodeInterface] Failed to turn radio off during disconnect: \(error.localizedDescription)")
+            }
+            do {
+                try await sendKISSCommand(RNodeConstants.CMD_LEAVE, payload: Data([0xFF]))
+            } catch {
+                // Don't fail disconnect if RNode is already gone
+                print("[RNodeInterface] Failed to send LEAVE command during disconnect: \(error.localizedDescription)")
+            }
+        }
+
         // Disconnect transport
         transport?.disconnect()
         transport = nil
+
+        // Reset all state
+        online = false
+        detected = false
+        firmwareOk = false
+        interfaceReady = false
+        packetQueue.removeAll()
+        resetRadioState()
 
         state = .disconnected
         notifyStateChange()
@@ -251,15 +276,45 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// - Parameter data: Raw packet data to send (will be KISS framed)
     /// - Throws: InterfaceError.notConnected if not in connected state
     /// - Throws: InterfaceError.sendFailed if transmission fails
+    /// - Throws: RNodeError.interfaceQueueFull if queue is full
     public func send(_ data: Data) async throws {
-        // Stub for now - Plan 03 fills in flow control logic
-        guard state == .connected else {
+        guard online else {
             throw InterfaceError.notConnected
         }
-        throw InterfaceError.sendFailed(underlying: "Flow control not yet implemented (Plan 03)")
+
+        if interfaceReady {
+            // Lock flow control
+            interfaceReady = false
+
+            // KISS-frame and send through transport
+            try await sendViaTransport(data)
+            bytesSent += UInt64(data.count)
+        } else {
+            // Queue if not ready
+            guard packetQueue.count < maxQueueDepth else {
+                throw RNodeError.interfaceQueueFull
+            }
+            packetQueue.append(data)
+        }
     }
 
     // MARK: - Private Methods - Transport Setup
+
+    /// Send data via transport layer (KISS-framed).
+    private func sendViaTransport(_ data: Data) async throws {
+        guard let transport = transport else {
+            throw InterfaceError.notConnected
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            transport.send(data) { error in
+                if let error = error {
+                    continuation.resume(throwing: InterfaceError.sendFailed(underlying: error.localizedDescription))
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
 
     /// Set up the KISS-framed BLE transport and wire callbacks.
     private func setupTransport() async {
@@ -300,8 +355,10 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     private func handleTransportStateChange(_ transportState: TransportState) async {
         switch transportState {
         case .disconnected:
-            // Transport disconnected - trigger reconnection if we were connected
+            // Transport disconnected - reset online/ready and trigger reconnection if we were connected
             if state == .connected || state == .connecting {
+                online = false
+                interfaceReady = false
                 await startReconnectLoop()
             }
 
@@ -860,9 +917,26 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         }
     }
 
-    /// Stub for flow control - Plan 03 implements this.
+    /// Process packet queue when CMD_READY received.
+    ///
+    /// Drains one packet from queue and re-sends it.
+    /// If queue is empty, unlocks interfaceReady.
     private func processQueue() {
-        // Plan 03: process packet queue when CMD_READY received
+        if !packetQueue.isEmpty {
+            let data = packetQueue.removeFirst()
+            interfaceReady = true
+            // Re-enter send path for queued packet
+            Task { [weak self] in
+                do {
+                    try await self?.send(data)
+                } catch {
+                    // Log send failure for queued packet
+                    print("[RNodeInterface] Failed to send queued packet: \(error.localizedDescription)")
+                }
+            }
+        } else {
+            interfaceReady = true
+        }
     }
 
     // MARK: - Reconnection Logic
