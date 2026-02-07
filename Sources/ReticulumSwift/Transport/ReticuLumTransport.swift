@@ -50,42 +50,6 @@ public protocol NetworkInterface: AnyObject, Sendable {
 
 // MARK: - ReticuLumTransport Actor
 
-// MARK: - Link Debug Logging
-
-/// Write link debug messages to file for troubleshooting link establishment
-private func linkDebug(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let line = "[\(timestamp)] \(message)\n"
-    let path = "/tmp/columba_link_trace.log"
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: path) {
-            if let handle = FileHandle(forWritingAtPath: path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            try? data.write(to: URL(fileURLWithPath: path))
-        }
-    }
-}
-
-private func appendTransportDebug(_ message: String) {
-    let line = "[\(Date())] \(message)\n"
-    let path = "/tmp/columba_transport_debug.log"
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: path) {
-            if let handle = FileHandle(forWritingAtPath: path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            try? data.write(to: URL(fileURLWithPath: path))
-        }
-    }
-}
-
 /// Central transport actor for Reticulum packet routing.
 ///
 /// ReticuLumTransport is the core routing engine that:
@@ -480,20 +444,16 @@ public actor ReticuLumTransport {
         print("[LINK_OUTBOUND] linkId (short): \(actualHex)")
         print("[LINK_OUTBOUND] linkId (full):  \(actualFullHex)")
         print("[LINK_OUTBOUND] pendingLinks before: \(pendingLinks.count)")
-        linkDebug("[LINK_REG] REGISTERING: linkId=\(actualFullHex), pendingLinks.before=\(pendingLinks.count)")
         pendingLinks[linkId] = link
         let afterKeys = pendingLinks.keys.map { $0.map { String(format: "%02x", $0) }.joined() }
         print("[LINK_OUTBOUND] pendingLinks after: \(pendingLinks.count), keys=\(afterKeys)")
-        linkDebug("[LINK_REG] REGISTERED: pendingLinks.after=\(pendingLinks.count), keys=\(afterKeys)")
 
         await link.markRequestSent()
         let linkState = await link.state
         print("[LINK_OUTBOUND] Link marked as sent, state=\(linkState)")
         print("[LINK_OUTBOUND] Sending LINKREQUEST packet...")
-        linkDebug("[LINK_REG] Sending LINKREQUEST packet")
         try await send(packet: packet)
         print("[LINK_OUTBOUND] LINKREQUEST sent successfully, waiting for PROOF")
-        linkDebug("[LINK_REG] LINKREQUEST sent, awaiting PROOF")
 
         return link
     }
@@ -776,13 +736,11 @@ public actor ReticuLumTransport {
             let linkIdHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
             let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
             print("[TRANSPORT] Link DATA: converting to HEADER_2, linkId=\(linkIdHex), destHash=\(destHex), nextHop=\(nextHopHex), hops=\(pathEntry.hopCount)")
-            linkDebug("[LINK_DATA] HEADER_2: linkId=\(linkIdHex), destHash=\(destHex), nextHop=\(nextHopHex)")
             try await sendToAllInterfaces(routedPacket)
         } else {
             // Direct delivery (no multi-hop) - send as HEADER_1
             let linkIdHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
             print("[TRANSPORT] Link DATA: sending as HEADER_1, linkId=\(linkIdHex)")
-            linkDebug("[LINK_DATA] HEADER_1: linkId=\(linkIdHex)")
             try await sendToAllInterfaces(packet)
         }
     }
@@ -850,12 +808,10 @@ public actor ReticuLumTransport {
         case .proof: typeStr = "PROOF"
         }
         let sendLog = "[SEND] type=\(typeStr) dest=\(destHex) context=\(contextStr) size=\(encoded.count) interfaces=\(interfaces.count)\n"
-        appendTransportDebug(sendLog)
 
         // For ANNOUNCE packets, log the FULL hex for offline validation
         if packet.header.packetType == .announce {
             let allHex = encoded.map { String(format: "%02x", $0) }.joined()
-            appendTransportDebug("[SEND] ANNOUNCE_FULL_HEX(\(encoded.count)B): \(allHex)\n")
         }
 
         print("[SEND_BYTES] ===== ACTUAL BYTES BEING SENT =====")
@@ -873,7 +829,6 @@ public actor ReticuLumTransport {
             // Skip disconnected interfaces
             guard interface.state == .connected else {
                 print("[TRANSPORT] Skipping disconnected interface '\(id)'")
-                appendTransportDebug("[SEND] Skipping disconnected interface '\(id)'\n")
                 logger.debug("Skipping disconnected interface: \(id, privacy: .public)")
                 continue
             }
@@ -882,12 +837,10 @@ public actor ReticuLumTransport {
                 try await interface.send(encoded)
                 successCount += 1
                 print("[TRANSPORT] Broadcast sent \(encoded.count) bytes via '\(id)'")
-                appendTransportDebug("[SEND] OK via '\(id)' (\(encoded.count) bytes)\n")
                 logger.debug("Broadcast sent via interface: \(id, privacy: .public)")
             } catch {
                 lastError = error
                 print("[TRANSPORT] Broadcast failed on '\(id)': \(error)")
-                appendTransportDebug("[SEND] FAILED on '\(id)': \(error)\n")
                 logger.warning("Broadcast failed on interface \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         }
@@ -895,7 +848,6 @@ public actor ReticuLumTransport {
         // If no interfaces succeeded, throw error
         if successCount == 0 {
             print("[TRANSPORT] sendToAllInterfaces FAILED: no interfaces succeeded")
-            appendTransportDebug("[SEND] FAILED: no interfaces succeeded\n")
             if let error = lastError {
                 throw TransportError.sendFailed(interfaceId: "all", underlying: error.localizedDescription)
             } else {
@@ -903,7 +855,6 @@ public actor ReticuLumTransport {
             }
         }
 
-        appendTransportDebug("[SEND] Broadcast complete: \(successCount)/\(interfaces.count) interface(s)\n")
         print("[TRANSPORT] Broadcast complete: \(successCount) interface(s)")
         logger.info("Broadcast packet sent to \(successCount, privacy: .public) interface(s)")
     }
@@ -1017,22 +968,17 @@ public actor ReticuLumTransport {
             print("[PROOF_RECV] pendingLinks count=\(pendingLinks.count), keys=\(pendingKeysHex)")
             print("[PROOF_RECV] activeLinks count=\(activeLinks.count), keys=\(activeKeysHex)")
             print("[PROOF_RECV] context=0x\(String(format: "%02x", packet.context)), dataLen=\(packet.data.count)")
-            // File-based debug for proof routing (always visible)
-            appendTransportDebug("[PROOF] dest=\(proofDestHex) pendingLinks=\(pendingKeysHex) activeLinks=\(activeKeysHex) ctx=0x\(String(format: "%02x", packet.context)) dataLen=\(packet.data.count)")
 
             if let link = pendingLinks[destHash] {
                 print("[PROOF_RECV] MATCH! Found pending link for PROOF, processing...")
-                appendTransportDebug("[PROOF] MATCH pendingLink → handleLinkProof")
                 await handleLinkProof(packet, link: link)
             } else if let link = activeLinks[destHash] {
                 // DATA packet proof on an active link (e.g., propagation node confirming delivery)
                 print("[PROOF_RECV] DATA proof on active link \(proofDestHex)")
-                appendTransportDebug("[PROOF] MATCH activeLink → handleDataProof")
                 await handleDataProof(packet, link: link)
             } else {
                 // Announce PROOF or path request response - existing handling
                 print("[PROOF_RECV] No link match, treating as announce PROOF")
-                appendTransportDebug("[PROOF] NO MATCH → handleAnnounceProof")
                 await handleAnnounceProof(packet, from: interfaceId)
             }
 
@@ -1040,16 +986,13 @@ public actor ReticuLumTransport {
             let dataDestHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             let dataFullHex = destHash.map { String(format: "%02x", $0) }.joined()
             print("[LXMF_INBOUND] DATA packet received: destType=\(packet.header.destinationType), dest=\(dataDestHex), dataLen=\(packet.data.count)")
-            linkDebug("[DATA_RECV] destType=\(packet.header.destinationType), dest=\(dataFullHex), dataLen=\(packet.data.count)")
             if packet.header.destinationType == .link {
                 // Link DATA packet - route to link
                 print("[LXMF_INBOUND] Routing to handleLinkData()")
-                linkDebug("[DATA_RECV] Routing to handleLinkData()")
                 await handleLinkData(packet)
             } else {
                 // Regular data - deliver to local destination
                 print("[LXMF_INBOUND] Routing to handleRegularData()")
-                linkDebug("[DATA_RECV] Routing to handleRegularData()")
                 await handleRegularData(packet, from: interfaceId)
             }
         }
@@ -1427,19 +1370,16 @@ public actor ReticuLumTransport {
         // Debug: list all registered destinations
         let registeredDests = destinations.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
         print("[LXMF_INBOUND] handleRegularData: destHash=\(hexPrefix), registeredDests=\(registeredDests), destType=\(packet.header.destinationType)")
-        linkDebug("[REGULAR_DATA] destHash=\(hexFull), registeredDests=\(registeredDests)")
 
         // Check if destination is local
         guard let destination = destinations[destHash] else {
             // Destination not local - could forward in gateway mode
             print("[LXMF_INBOUND] Destination \(hexPrefix) NOT registered locally, dropping packet")
-            linkDebug("[REGULAR_DATA] NOT LOCAL - dropping")
             logger.debug("Received packet for non-local destination \(hexPrefix, privacy: .public)...")
             return
         }
 
         print("[LXMF_INBOUND] Destination \(hexPrefix) IS local, proceeding to decrypt")
-        linkDebug("[REGULAR_DATA] IS LOCAL - decrypting")
         logger.info("Delivering packet to local destination \(hexPrefix, privacy: .public)...")
 
         // Determine data to deliver - decrypt if needed
@@ -1463,14 +1403,11 @@ public actor ReticuLumTransport {
                 // NOT the destination hash. This matches Python RNS Identity.get_salt().
                 let identityHash = identity.hash
                 print("[LXMF_INBOUND] Attempting decrypt, identityHash=\(identityHash.prefix(8).map { String(format: "%02x", $0) }.joined()), ciphertext len=\(packet.data.count)")
-                linkDebug("[REGULAR_DATA] Decrypting: ciphertext=\(packet.data.count) bytes")
                 deliveryData = try identity.decrypt(packet.data, identityHash: identityHash)
                 let dataHex = deliveryData.prefix(16).map { String(format: "%02x", $0) }.joined()
                 print("[LXMF_INBOUND] Decrypted SINGLE packet: \(deliveryData.count) bytes, data[0:16]=\(dataHex)")
-                linkDebug("[REGULAR_DATA] Decrypted OK: \(deliveryData.count) bytes")
             } catch {
                 print("[LXMF_INBOUND] Decryption FAILED: \(error)")
-                linkDebug("[REGULAR_DATA] DECRYPT FAILED: \(error)")
                 logger.warning("Failed to decrypt SINGLE packet for \(hexPrefix, privacy: .public)...: \(error.localizedDescription, privacy: .public)")
                 return
             }
@@ -1637,7 +1574,6 @@ public actor ReticuLumTransport {
 
         let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         print("[TRANSPORT] Requesting path to \(destHex)...")
-        linkDebug("[PATH_REQUEST] Requesting path to \(destHex)")
 
         // Generate random request tag (16 bytes)
         var requestTag = Data(count: 16)
@@ -1686,7 +1622,6 @@ public actor ReticuLumTransport {
         }
 
         print("[TRANSPORT] Path request sent for \(destHex) to \(sentCount) interface(s)")
-        linkDebug("[PATH_REQUEST] Sent request for \(destHex) to \(sentCount) interface(s)")
     }
 
     /// Queue a packet waiting for path discovery.
@@ -1772,16 +1707,11 @@ extension ReticuLumTransport {
             let contextStr = packet.header.hasContext ? String(format: "0x%02x", packet.context) : "none"
             print("[PACKET_RECV] Parsed: type=\(packet.header.packetType), destType=\(packet.header.destinationType)")
             print("[PACKET_RECV] dest=\(destHex), context=\(contextStr), dataLen=\(packet.data.count)")
-            // Log ALL incoming packets to file for debugging proof delivery
-            if !pendingPacketProofs.isEmpty {
-                appendTransportDebug("[RECV] type=\(packet.header.packetType) destType=\(packet.header.destinationType) dest=\(destHex) ctx=0x\(String(format: "%02x", packet.context)) dataLen=\(packet.data.count) flags=0x\(String(format: "%02x", data[data.startIndex]))")
-            }
 
             // Log pending links status for every packet
             let pendingKeysHex = pendingLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
             let pendingFullKeysHex = pendingLinks.keys.map { $0.map { String(format: "%02x", $0) }.joined() }
             print("[PACKET_RECV] Current pendingLinks: \(pendingLinks.count), keys=\(pendingKeysHex)")
-            linkDebug("[PKT_RECV] type=\(packet.header.packetType), dest=\(destFullHex), pendingLinks=\(pendingLinks.count), keys=\(pendingFullKeysHex)")
 
             Task {
                 await self.receive(packet: packet, from: interfaceId)

@@ -128,39 +128,19 @@ public final class TCPTransport: Transport {
         guard state == .connected else {
             let error = TransportError.notConnected
             logger.error("Send failed: not connected")
-            let debugLine = "[TCPTRANSPORT] SEND FAILED: not connected (\(data.count) bytes)\n"
-            Self.appendDebugLog(debugLine)
             completion?(error)
             return
         }
 
-        let hexDump = data.prefix(40).map { String(format: "%02x", $0) }.joined()
-        let debugLine = "[TCPTRANSPORT] Sending \(data.count) bytes: \(hexDump)\n"
-        Self.appendDebugLog(debugLine)
-
         connection?.send(content: data, completion: .contentProcessed { [weak self] error in
             if let error = error {
                 self?.logger.error("Send failed: \(error.localizedDescription, privacy: .public)")
-                let errLine = "[TCPTRANSPORT] SEND ERROR: \(error.localizedDescription)\n"
-                Self.appendDebugLog(errLine)
                 completion?(error)
             } else {
                 self?.logger.debug("Sent \(data.count, privacy: .public) bytes")
                 completion?(nil)
             }
         })
-    }
-
-    /// Append a debug line to the TCP debug log file.
-    private static func appendDebugLog(_ line: String) {
-        let path = "/tmp/columba_tcp_debug.log"
-        if let fileHandle = FileHandle(forWritingAtPath: path) {
-            fileHandle.seekToEndOfFile()
-            fileHandle.write(line.data(using: .utf8)!)
-            fileHandle.closeFile()
-        } else {
-            FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8), attributes: nil)
-        }
     }
 
     /// Disconnect and clean up the connection.
@@ -237,32 +217,7 @@ public final class TCPTransport: Transport {
 
             if let data = data, !data.isEmpty {
                 self.logger.debug("Received \(data.count, privacy: .public) bytes")
-                // Debug: Write to file for GUI apps
-                let hexDump = data.prefix(40).map { String(format: "%02x", $0) }.joined()
-                var debugLine = "[TCPTRANSPORT] Received \(data.count) bytes: \(hexDump)\n"
-
-                // Check if callback exists
-                if let callback = self.onDataReceived {
-                    debugLine += "[TCPTRANSPORT] Calling onDataReceived callback\n"
-                    // Append to log file
-                    if let fileHandle = FileHandle(forWritingAtPath: "/tmp/columba_tcp_debug.log") {
-                        fileHandle.seekToEndOfFile()
-                        fileHandle.write(debugLine.data(using: .utf8)!)
-                        fileHandle.closeFile()
-                    } else {
-                        FileManager.default.createFile(atPath: "/tmp/columba_tcp_debug.log", contents: debugLine.data(using: .utf8), attributes: nil)
-                    }
-                    callback(data)
-                } else {
-                    debugLine += "[TCPTRANSPORT] ERROR: onDataReceived callback is nil!\n"
-                    if let fileHandle = FileHandle(forWritingAtPath: "/tmp/columba_tcp_debug.log") {
-                        fileHandle.seekToEndOfFile()
-                        fileHandle.write(debugLine.data(using: .utf8)!)
-                        fileHandle.closeFile()
-                    } else {
-                        FileManager.default.createFile(atPath: "/tmp/columba_tcp_debug.log", contents: debugLine.data(using: .utf8), attributes: nil)
-                    }
-                }
+                self.onDataReceived?(data)
             }
 
             if let error = error {

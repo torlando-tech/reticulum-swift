@@ -63,25 +63,7 @@ public class FramedTransport: Transport {
 
         // Hook into underlying transport's data callback
         underlying.onDataReceived = { [weak self] data in
-            if let strongSelf = self {
-                strongSelf.handleReceivedData(data)
-            } else {
-                // Debug: Log if self is nil (FramedTransport was deallocated)
-                let debugLine = "[FRAMEDTRANSPORT] ERROR: self is nil in onDataReceived callback!\n"
-                FileManager.default.createFile(atPath: "/tmp/columba_framed_nil.log", contents: debugLine.data(using: .utf8), attributes: nil)
-            }
-        }
-    }
-
-    deinit {
-        // Debug: Log when FramedTransport is deallocated
-        let debugLine = "[FRAMEDTRANSPORT] deinit called - FramedTransport deallocated!\n"
-        if let fileHandle = FileHandle(forWritingAtPath: "/tmp/columba_framed_deinit.log") {
-            fileHandle.seekToEndOfFile()
-            fileHandle.write(debugLine.data(using: .utf8)!)
-            fileHandle.closeFile()
-        } else {
-            FileManager.default.createFile(atPath: "/tmp/columba_framed_deinit.log", contents: debugLine.data(using: .utf8), attributes: nil)
+            self?.handleReceivedData(data)
         }
     }
 
@@ -133,9 +115,6 @@ public class FramedTransport: Transport {
         let hexDump = data.prefix(40).map { String(format: "%02x", $0) }.joined()
         print("[FRAMEDTRANSPORT] Raw TCP data: \(data.count) bytes: \(hexDump)")
 
-        // Debug write to file for GUI apps
-        var debugLog = "[FRAMEDTRANSPORT] Raw TCP data: \(data.count) bytes: \(hexDump)\n"
-
         bufferLock.lock()
         receiveBuffer.append(data)
 
@@ -143,31 +122,13 @@ public class FramedTransport: Transport {
         let frames = HDLC.extractFrames(from: &receiveBuffer)
         bufferLock.unlock()
 
-        debugLog += "[FRAMEDTRANSPORT] Extracted \(frames.count) frame(s), buffer remaining: \(receiveBuffer.count) bytes\n"
         print("[FRAMEDTRANSPORT] Extracted \(frames.count) frame(s), buffer remaining: \(receiveBuffer.count) bytes")
 
         // Deliver each frame to callback
         for frame in frames {
             let frameHex = frame.prefix(20).map { String(format: "%02x", $0) }.joined()
             print("[FRAMEDTRANSPORT] Delivering frame: \(frame.count) bytes: \(frameHex)")
-            debugLog += "[FRAMEDTRANSPORT] Delivering frame: \(frame.count) bytes: \(frameHex)\n"
-
-            if let callback = onDataReceived {
-                debugLog += "[FRAMEDTRANSPORT] Calling onDataReceived callback\n"
-                callback(frame)
-                debugLog += "[FRAMEDTRANSPORT] Callback returned\n"
-            } else {
-                debugLog += "[FRAMEDTRANSPORT] ERROR: onDataReceived is nil!\n"
-            }
-        }
-
-        // Write debug log to file
-        if let fileHandle = FileHandle(forWritingAtPath: "/tmp/columba_framed_debug.log") {
-            fileHandle.seekToEndOfFile()
-            fileHandle.write(debugLog.data(using: .utf8)!)
-            fileHandle.closeFile()
-        } else {
-            FileManager.default.createFile(atPath: "/tmp/columba_framed_debug.log", contents: debugLog.data(using: .utf8), attributes: nil)
+            onDataReceived?(frame)
         }
     }
 }

@@ -238,16 +238,6 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
         let hexDump = data.prefix(20).map { String(format: "%02x", $0) }.joined()
         print("[TCPINTERFACE] handleDataReceived: \(data.count) bytes: \(hexDump)")
 
-        // Debug: Write to file for GUI apps
-        let debugLine = "[TCPINTERFACE] handleDataReceived: \(data.count) bytes: \(hexDump)\n"
-        if let fileHandle = FileHandle(forWritingAtPath: "/tmp/columba_interface_debug.log") {
-            fileHandle.seekToEndOfFile()
-            fileHandle.write(debugLine.data(using: .utf8)!)
-            fileHandle.closeFile()
-        } else {
-            FileManager.default.createFile(atPath: "/tmp/columba_interface_debug.log", contents: debugLine.data(using: .utf8), attributes: nil)
-        }
-
         bytesReceived += UInt64(data.count)
         notifyPacketReceived(data)
     }
@@ -357,29 +347,7 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
     /// Notify delegate of received packet.
     private func notifyPacketReceived(_ data: Data) {
         let interfaceId = id
-        let hexDump = data.prefix(20).map { String(format: "%02x", $0) }.joined()
-
-        guard let delegate = delegateRef?.delegate else {
-            let debugLine = "[TCPINTERFACE] notifyPacketReceived: NO DELEGATE! \(data.count) bytes: \(hexDump)\n"
-            if let fileHandle = FileHandle(forWritingAtPath: "/tmp/columba_interface_debug.log") {
-                fileHandle.seekToEndOfFile()
-                fileHandle.write(debugLine.data(using: .utf8)!)
-                fileHandle.closeFile()
-            } else {
-                FileManager.default.createFile(atPath: "/tmp/columba_interface_debug.log", contents: debugLine.data(using: .utf8), attributes: nil)
-            }
-            return
-        }
-
-        let debugLine = "[TCPINTERFACE] notifyPacketReceived: has delegate, calling interface(id:didReceivePacket:)\n"
-        if let fileHandle = FileHandle(forWritingAtPath: "/tmp/columba_interface_debug.log") {
-            fileHandle.seekToEndOfFile()
-            fileHandle.write(debugLine.data(using: .utf8)!)
-            fileHandle.closeFile()
-        } else {
-            FileManager.default.createFile(atPath: "/tmp/columba_interface_debug.log", contents: debugLine.data(using: .utf8), attributes: nil)
-        }
-
+        guard let delegate = delegateRef?.delegate else { return }
         delegate.interface(id: interfaceId, didReceivePacket: data)
     }
 
