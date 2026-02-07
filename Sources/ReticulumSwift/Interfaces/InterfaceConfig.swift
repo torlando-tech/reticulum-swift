@@ -16,11 +16,13 @@ import Foundation
 /// - `tcp`: TCP socket connection (Phase 4 focus)
 /// - `udp`: UDP datagram interface (future)
 /// - `i2p`: I2P anonymous network interface (future)
+/// - `rnode`: RNode BLE interface (Phase 11)
 public enum InterfaceType: String, Codable, Sendable, Equatable {
     case tcp
     case udp
     case i2p
     case autoInterface
+    case rnode
 }
 
 // MARK: - Interface Configuration
