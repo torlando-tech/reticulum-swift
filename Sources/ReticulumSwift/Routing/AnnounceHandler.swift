@@ -85,7 +85,7 @@ public actor AnnounceHandler {
     private var seenAnnounces: Set<Data> = []
 
     /// Maximum hop count allowed (Reticulum standard is 128).
-    public let maxHops: UInt8 = 128
+    public let maxHops: UInt8 = TransportConstants.PATHFINDER_M
 
     /// Maximum size of seenAnnounces set before pruning.
     public let seenAnnouncesMaxSize: Int = 10000

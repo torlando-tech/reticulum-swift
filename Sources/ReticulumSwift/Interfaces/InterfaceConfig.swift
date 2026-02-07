@@ -76,6 +76,19 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
     /// Optional Interface Access Code for authentication
     public let ifac: Data?
 
+    /// Optional announce rate target: minimum interval (seconds) between announces
+    /// from the same destination. nil = no rate limiting.
+    /// Reference: Python Interface.announce_rate_target
+    public var announceRateTarget: TimeInterval?
+
+    /// Number of rate violations allowed before blocking (default 0).
+    /// Reference: Python Interface.announce_rate_grace
+    public var announceRateGrace: Int
+
+    /// Penalty time (seconds) added when rate limit is exceeded (default 0).
+    /// Reference: Python Interface.announce_rate_penalty
+    public var announceRatePenalty: TimeInterval
+
     // MARK: - Initialization
 
     /// Create a new interface configuration.
@@ -89,6 +102,9 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
     ///   - host: Host address
     ///   - port: Port number
     ///   - ifac: Optional Interface Access Code
+    ///   - announceRateTarget: Optional minimum interval between announces
+    ///   - announceRateGrace: Rate violations before blocking
+    ///   - announceRatePenalty: Penalty time on rate limit
     public init(
         id: String,
         name: String,
@@ -97,7 +113,10 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         mode: InterfaceMode,
         host: String,
         port: UInt16,
-        ifac: Data? = nil
+        ifac: Data? = nil,
+        announceRateTarget: TimeInterval? = nil,
+        announceRateGrace: Int = 0,
+        announceRatePenalty: TimeInterval = 0
     ) {
         self.id = id
         self.name = name
@@ -107,6 +126,32 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         self.host = host
         self.port = port
         self.ifac = ifac
+        self.announceRateTarget = announceRateTarget
+        self.announceRateGrace = announceRateGrace
+        self.announceRatePenalty = announceRatePenalty
+    }
+
+    // MARK: - Codable backward compatibility
+
+    /// Custom decoder handles missing rate-limit keys from old plists.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        type = try container.decode(InterfaceType.self, forKey: .type)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        mode = try container.decode(InterfaceMode.self, forKey: .mode)
+        host = try container.decode(String.self, forKey: .host)
+        port = try container.decode(UInt16.self, forKey: .port)
+        ifac = try container.decodeIfPresent(Data.self, forKey: .ifac)
+        announceRateTarget = try container.decodeIfPresent(TimeInterval.self, forKey: .announceRateTarget)
+        announceRateGrace = try container.decodeIfPresent(Int.self, forKey: .announceRateGrace) ?? 0
+        announceRatePenalty = try container.decodeIfPresent(TimeInterval.self, forKey: .announceRatePenalty) ?? 0
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, type, enabled, mode, host, port, ifac
+        case announceRateTarget, announceRateGrace, announceRatePenalty
     }
 
     // MARK: - Persistence

@@ -87,6 +87,23 @@ public actor ReticuLumTransport {
     /// Announce handler for processing received announces
     private let announceHandler: AnnounceHandler
 
+    /// Announce table for scheduled retransmissions (Python Transport.announce_table)
+    private let announceTable = AnnounceTable()
+
+    /// Whether this node acts as a transport/relay node.
+    /// When enabled, all valid announces are rebroadcast.
+    /// When disabled, only announces for local destinations are rebroadcast.
+    /// Reference: Python Transport.py:1741 (RNS.Reticulum.transport_enabled())
+    public var transportEnabled: Bool = false
+
+    /// Local transport identity hash (16 bytes).
+    /// Used as transport_id in HEADER_2 retransmissions.
+    /// Set when transport mode is enabled.
+    public var transportIdentityHash: Data?
+
+    /// Task handle for periodic announce retransmission
+    private var retransmissionTask: Task<Void, Never>?
+
     /// Registered interfaces by ID
     private var interfaces: [String: any NetworkInterface] = [:]
 
@@ -1493,12 +1510,33 @@ public actor ReticuLumTransport {
 
     /// Process an announce packet via the announce handler.
     ///
+    /// Implements Python Transport.py announce processing with:
+    /// - Local rebroadcast detection via AnnounceTable
+    /// - AnnounceFilter for per-interface mode filtering
+    /// - Queued retransmission instead of immediate rebroadcast
+    /// - Rate limiting via interface config
+    /// - Transport enabled check before rebroadcast
+    ///
     /// - Parameters:
     ///   - packet: Announce packet to process
     ///   - interfaceId: ID of interface that received the announce
     private func processAnnounce(packet: Packet, from interfaceId: String) async {
         // Get interface mode
         let mode = getInterfaceMode(for: interfaceId)
+
+        // Local rebroadcast detection (Transport.py:1581-1597)
+        // For HEADER_2 announces, check if this is our own rebroadcast heard back
+        if packet.header.headerType == .header2, packet.transportAddress != nil {
+            let destHash = packet.destination
+            let detected = await announceTable.recordLocalRebroadcast(
+                destinationHash: destHash,
+                incomingHops: packet.header.hopCount
+            )
+            if detected {
+                let hexPrefix = destHash.prefix(4).map { String(format: "%02x", $0) }.joined()
+                logger.debug("Local rebroadcast detected for \(hexPrefix, privacy: .public)...")
+            }
+        }
 
         // Process via announce handler
         let result = await announceHandler.process(
@@ -1516,43 +1554,139 @@ public actor ReticuLumTransport {
         case .recorded(let destHash):
             let hexPrefix = destHash.prefix(4).map { String(format: "%02x", $0) }.joined()
             logger.info("Path recorded for destination \(hexPrefix, privacy: .public)...")
-            // Process any pending packets for this destination
             await processPendingPackets(for: destHash)
 
         case .recordedAndRebroadcast(let destHash, let rebroadcastPacket):
             let hexPrefix = destHash.prefix(4).map { String(format: "%02x", $0) }.joined()
-            logger.info("Path recorded for \(hexPrefix, privacy: .public)..., rebroadcasting")
-            await rebroadcastAnnounce(rebroadcastPacket, excluding: interfaceId)
-            // Process any pending packets for this destination
+            let isLocal = isLocalDestination(destHash)
+
+            // Transport.py:1741: Only rebroadcast if transport_enabled or local destination
+            if transportEnabled || isLocal {
+                // Rate limiting check (Transport.py:1691-1720)
+                let sourceInterface = interfaces[interfaceId]
+                if let rateTarget = sourceInterface?.config.announceRateTarget {
+                    let blocked = await announceTable.isRateBlocked(
+                        destinationHash: destHash,
+                        rateTarget: rateTarget,
+                        rateGrace: sourceInterface?.config.announceRateGrace ?? 0,
+                        ratePenalty: sourceInterface?.config.announceRatePenalty ?? 0
+                    )
+                    if blocked {
+                        logger.info("Announce for \(hexPrefix, privacy: .public)... rate-blocked")
+                        await processPendingPackets(for: destHash)
+                        return
+                    }
+                }
+
+                // Queue for retransmission via AnnounceTable instead of immediate send
+                let receivedFrom: Data
+                if let transportId = rebroadcastPacket.transportAddress {
+                    receivedFrom = transportId
+                } else {
+                    receivedFrom = destHash
+                }
+
+                await announceTable.insert(
+                    destinationHash: destHash,
+                    packet: rebroadcastPacket,
+                    hops: rebroadcastPacket.header.hopCount,
+                    receivedFrom: receivedFrom
+                )
+                logger.info("Announce for \(hexPrefix, privacy: .public)... queued for retransmission")
+            } else {
+                logger.debug("Transport disabled, not rebroadcasting \(hexPrefix, privacy: .public)...")
+            }
+
             await processPendingPackets(for: destHash)
         }
     }
 
-    /// Rebroadcast an announce packet to all interfaces except the source.
+    /// Retransmit announces from the announce table as HEADER_2 packets.
     ///
-    /// - Parameters:
-    ///   - packet: Announce packet to rebroadcast
-    ///   - interfaceId: ID of interface to exclude (the source)
-    private func rebroadcastAnnounce(_ packet: Packet, excluding interfaceId: String) async {
-        let encoded = packet.encode()
+    /// Called periodically (~1s) to process queued announce retransmissions.
+    /// Packets are rebroadcast as HEADER_2 with the local transport identity hash.
+    /// Per-interface AnnounceFilter is applied before sending.
+    ///
+    /// Reference: Python Transport.py:518-579
+    private func processAnnounceRetransmissions() async {
+        let actions = await announceTable.processRetransmissions()
+        guard !actions.isEmpty else { return }
 
-        for (id, interface) in interfaces {
-            // Skip the interface that sent us this announce
-            guard id != interfaceId else { continue }
+        for action in actions {
+            // Build HEADER_2 retransmission packet
+            let transportId = transportIdentityHash ?? Data(repeating: 0, count: 16)
 
-            // Skip disconnected interfaces
-            guard interface.state == .connected else {
-                logger.debug("Skipping disconnected interface for rebroadcast: \(id, privacy: .public)")
-                continue
-            }
+            let newHeader = PacketHeader(
+                headerType: .header2,
+                hasContext: action.blockRebroadcasts,
+                hasIFAC: false,
+                transportType: .transport,
+                destinationType: action.packet.header.destinationType,
+                packetType: .announce,
+                hopCount: action.hops
+            )
 
-            do {
-                try await interface.send(encoded)
-                logger.debug("Announce rebroadcast to interface: \(id, privacy: .public)")
-            } catch {
-                logger.warning("Failed to rebroadcast announce to \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            let retransmitPacket = Packet(
+                header: newHeader,
+                destination: action.packet.destination,
+                transportAddress: transportId,
+                context: action.blockRebroadcasts ? 0x01 : 0x00, // PATH_RESPONSE context
+                data: action.packet.data
+            )
+
+            let encoded = retransmitPacket.encode()
+            let destHex = action.destinationHash.prefix(4).map { String(format: "%02x", $0) }.joined()
+
+            // Determine source interface mode for filtering
+            // Use the interface the announce was originally received on
+            let sourceMode: InterfaceMode? = nil // Source mode not tracked in current entry
+
+            for (id, interface) in interfaces {
+                // Skip disconnected interfaces
+                guard interface.state == .connected else { continue }
+
+                // Skip specific interface override
+                if let attachedId = action.attachedInterfaceId, id != attachedId { continue }
+
+                // Apply AnnounceFilter per-outgoing-interface
+                let outgoingMode = interface.config.mode
+                let isLocal = isLocalDestination(action.destinationHash)
+                guard AnnounceFilter.shouldForward(
+                    outgoingMode: outgoingMode,
+                    sourceMode: sourceMode,
+                    isLocalDestination: isLocal
+                ) else {
+                    continue
+                }
+
+                do {
+                    try await interface.send(encoded)
+                    logger.debug("Retransmitted announce for \(destHex, privacy: .public)... via \(id, privacy: .public)")
+                } catch {
+                    logger.warning("Failed to retransmit announce to \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
             }
         }
+    }
+
+    /// Start the periodic announce retransmission task.
+    ///
+    /// Called when transport is set up. Runs every ~1 second.
+    public func startRetransmissionLoop() {
+        guard retransmissionTask == nil else { return }
+        retransmissionTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self = self else { break }
+                await self.processAnnounceRetransmissions()
+            }
+        }
+    }
+
+    /// Stop the periodic announce retransmission task.
+    public func stopRetransmissionLoop() {
+        retransmissionTask?.cancel()
+        retransmissionTask = nil
     }
 
     /// Get the interface mode for a given interface ID.

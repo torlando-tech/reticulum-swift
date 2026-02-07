@@ -57,13 +57,13 @@ public enum InterfaceMode: String, Codable, Sendable, Equatable {
     public var pathExpiration: TimeInterval {
         switch self {
         case .full, .gateway, .boundary:
-            return 7 * 24 * 60 * 60 // 7 days in seconds (604800)
+            return TransportConstants.PATHFINDER_E
         case .roaming:
-            return 6 * 60 * 60 // 6 hours in seconds (21600) - matches ROAMING_PATH_TIME
+            return TransportConstants.ROAMING_PATH_TIME
         case .accessPoint:
-            return 24 * 60 * 60 // 1 day in seconds (86400) - matches AP_PATH_TIME
+            return TransportConstants.AP_PATH_TIME
         case .pointToPoint:
-            return 24 * 60 * 60 // 24 hours in seconds (86400)
+            return TransportConstants.AP_PATH_TIME
         }
     }
 

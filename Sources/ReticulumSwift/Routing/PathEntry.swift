@@ -46,8 +46,21 @@ public struct PathEntry: Codable, Sendable, Equatable {
     /// When this path should be considered stale
     public let expires: Date
 
-    /// 10-byte random blob from announce, for replay detection
-    public let randomBlob: Data
+    /// List of seen random blobs for this destination (replay detection).
+    /// Each blob is 10 bytes. Capped at MAX_RANDOM_BLOBS.
+    /// The most recent blob is last in the array.
+    public var randomBlobs: [Data]
+
+    /// Backward-compatible accessor: returns the most recent random blob.
+    public var randomBlob: Data {
+        randomBlobs.last ?? Data()
+    }
+
+    /// Path responsiveness state (matches Python Transport.path_states).
+    /// - PATH_STATE_UNKNOWN (0x00): Default
+    /// - PATH_STATE_UNRESPONSIVE (0x01): Failed communication attempt
+    /// - PATH_STATE_RESPONSIVE (0x02): Confirmed responsive
+    public var pathState: Int
 
     /// Optional 32-byte ratchet public key for forward secrecy.
     /// When present, messages should be encrypted using this key instead of
@@ -111,6 +124,28 @@ public struct PathEntry: Codable, Sendable, Equatable {
     /// Time remaining until expiration (can be negative if expired)
     public var timeRemaining: TimeInterval {
         expires.timeIntervalSinceNow
+    }
+
+    /// Extract emission timestamp from a random blob (bytes[5:10] as big-endian UInt64).
+    /// Matches Python Transport.timebase_from_random_blob().
+    public static func emissionTimestamp(from blob: Data) -> UInt64 {
+        guard blob.count >= 10 else { return 0 }
+        var value: UInt64 = 0
+        for i in 5..<10 {
+            value = (value << 8) | UInt64(blob[blob.startIndex + i])
+        }
+        return value
+    }
+
+    /// Latest emission timestamp across all seen random blobs.
+    /// Matches Python Transport.timebase_from_random_blobs().
+    public var latestEmissionTimestamp: UInt64 {
+        var maxTimestamp: UInt64 = 0
+        for blob in randomBlobs {
+            let ts = PathEntry.emissionTimestamp(from: blob)
+            if ts > maxTimestamp { maxTimestamp = ts }
+        }
+        return maxTimestamp
     }
 
     /// Display name extracted from appData.
@@ -215,6 +250,8 @@ public struct PathEntry: Codable, Sendable, Equatable {
     ///   - timestamp: When the path was learned (defaults to now)
     ///   - expires: When the path expires
     ///   - randomBlob: 10-byte random blob from announce
+    ///   - randomBlobs: List of all seen random blobs (overrides randomBlob if provided)
+    ///   - pathState: Path responsiveness state (defaults to unknown)
     ///   - ratchet: Optional 32-byte ratchet public key for forward secrecy
     ///   - appData: Optional application data from announce
     ///   - nextHop: Optional 16-byte next hop transport node hash for routing
@@ -226,6 +263,8 @@ public struct PathEntry: Codable, Sendable, Equatable {
         timestamp: Date = Date(),
         expires: Date,
         randomBlob: Data,
+        randomBlobs: [Data]? = nil,
+        pathState: Int = TransportConstants.PATH_STATE_UNKNOWN,
         ratchet: Data? = nil,
         appData: Data? = nil,
         nextHop: Data? = nil
@@ -236,7 +275,8 @@ public struct PathEntry: Codable, Sendable, Equatable {
         self.hopCount = hopCount
         self.timestamp = timestamp
         self.expires = expires
-        self.randomBlob = randomBlob
+        self.randomBlobs = randomBlobs ?? [randomBlob]
+        self.pathState = pathState
         self.ratchet = ratchet
         self.appData = appData
         self.nextHop = nextHop
@@ -251,6 +291,8 @@ public struct PathEntry: Codable, Sendable, Equatable {
     ///   - hopCount: Number of hops to destination
     ///   - expiration: Time interval until expiration (defaults to standard 7 days)
     ///   - randomBlob: 10-byte random blob from announce
+    ///   - randomBlobs: List of all seen random blobs (overrides randomBlob if provided)
+    ///   - pathState: Path responsiveness state (defaults to unknown)
     ///   - ratchet: Optional 32-byte ratchet public key for forward secrecy
     ///   - appData: Optional application data from announce
     ///   - nextHop: Optional 16-byte next hop transport node hash for routing
@@ -261,6 +303,8 @@ public struct PathEntry: Codable, Sendable, Equatable {
         hopCount: UInt8,
         expiration: TimeInterval = PathEntry.standardExpiration,
         randomBlob: Data,
+        randomBlobs: [Data]? = nil,
+        pathState: Int = TransportConstants.PATH_STATE_UNKNOWN,
         ratchet: Data? = nil,
         appData: Data? = nil,
         nextHop: Data? = nil
@@ -272,7 +316,8 @@ public struct PathEntry: Codable, Sendable, Equatable {
         self.hopCount = hopCount
         self.timestamp = now
         self.expires = now.addingTimeInterval(expiration)
-        self.randomBlob = randomBlob
+        self.randomBlobs = randomBlobs ?? [randomBlob]
+        self.pathState = pathState
         self.ratchet = ratchet
         self.appData = appData
         self.nextHop = nextHop

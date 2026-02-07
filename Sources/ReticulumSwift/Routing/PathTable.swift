@@ -96,7 +96,7 @@ public actor PathTable {
                 throw PathTableError.databaseError("Failed to open database: \(error)")
             }
 
-            // Create table if needed
+            // Create table with random_blobs column (JSON-encoded [Data])
             let createSQL = """
                 CREATE TABLE IF NOT EXISTS paths (
                     destination_hash BLOB PRIMARY KEY,
@@ -105,7 +105,7 @@ public actor PathTable {
                     hop_count INTEGER NOT NULL,
                     timestamp REAL NOT NULL,
                     expires REAL NOT NULL,
-                    random_blob BLOB NOT NULL,
+                    random_blobs TEXT NOT NULL,
                     ratchet BLOB,
                     app_data BLOB,
                     next_hop BLOB
@@ -115,6 +115,9 @@ public actor PathTable {
                 let error = String(cString: sqlite3_errmsg(db))
                 throw PathTableError.databaseError("Failed to create table: \(error)")
             }
+
+            // Migrate old schema: rename random_blob → random_blobs if needed
+            migrateRandomBlobColumn()
 
             // Load existing paths into memory
             loadFromDatabase()
@@ -134,62 +137,293 @@ public actor PathTable {
         self.db = nil
     }
 
-    // MARK: - Record
+    // MARK: - Path State Management
 
-    /// Record a path entry.
+    /// Path states indexed by destination hash.
+    /// Separate from PathEntry to match Python's Transport.path_states dict.
+    private var pathStates: [Data: Int] = [:]
+
+    /// Mark a path as unresponsive (failed communication attempt).
+    public func markPathUnresponsive(_ destinationHash: Data) {
+        guard paths[destinationHash] != nil else { return }
+        pathStates[destinationHash] = TransportConstants.PATH_STATE_UNRESPONSIVE
+    }
+
+    /// Reset a path to unknown state (e.g., when a new announce is accepted).
+    public func markPathUnknownState(_ destinationHash: Data) {
+        guard paths[destinationHash] != nil else { return }
+        pathStates[destinationHash] = TransportConstants.PATH_STATE_UNKNOWN
+    }
+
+    /// Check if a path is marked unresponsive.
+    public func isPathUnresponsive(_ destinationHash: Data) -> Bool {
+        return pathStates[destinationHash] == TransportConstants.PATH_STATE_UNRESPONSIVE
+    }
+
+    // MARK: - Record (Python 5-path decision tree)
+
+    /// Record a path entry using Python-compatible acceptance logic.
     ///
-    /// The path is stored if:
-    /// - No existing path for this destination
-    /// - OR the new path has a better (lower) hop count
+    /// Implements the 5-path decision tree from Python Transport.py:1614-1686:
     ///
-    /// The path is ignored if:
-    /// - Same randomBlob (replay attack detection)
-    /// - Existing path has equal or better hop count
+    /// 1. **Unknown destination** → accept
+    /// 2. **Equal/better hops + new blob + fresher timestamp** → accept
+    /// 3. **Worse hops + expired path + new blob** → accept
+    /// 4. **Worse hops + not expired + fresher emission + new blob** → accept
+    /// 5. **Same emission + unresponsive path** → accept
+    ///
+    /// On accept: merges blob lists (cap at MAX_RANDOM_BLOBS), resets path state.
     ///
     /// - Parameter entry: Path entry to record
-    /// - Returns: true if path was recorded, false if ignored
+    /// - Returns: true if path was recorded, false if rejected
     @discardableResult
     public func record(entry: PathEntry) -> Bool {
         let key = entry.destinationHash
         let keyHex = key.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let newBlob = entry.randomBlob
+        let announceEmitted = PathEntry.emissionTimestamp(from: newBlob)
 
-        // Check for existing entry
-        if let existing = paths[key] {
-            // Replay detection: same random blob means duplicate announce
-            if existing.randomBlob == entry.randomBlob {
-                print("[PATHTABLE] Ignored \(keyHex): duplicate random blob")
-                return false
-            }
-
-            // Only accept better (lower hop count) paths
-            if entry.hopCount >= existing.hopCount {
-                print("[PATHTABLE] Ignored \(keyHex): existing path has equal/better hop count")
-                return false
-            }
+        guard let existing = paths[key] else {
+            // Path 1: Unknown destination → accept
+            paths[key] = entry
+            pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
+            saveToDatabase(entry)
+            let nextHopStr = entry.nextHop?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
+            print("[PATHTABLE] Recorded NEW path to \(keyHex), hops=\(entry.hopCount), nextHop=\(nextHopStr)")
+            pathUpdateContinuation?.yield(entry)
+            return true
         }
 
-        // Store the new entry
-        paths[key] = entry
+        let existingBlobs = existing.randomBlobs
+        let isNewBlob = !existingBlobs.contains(newBlob)
+        let pathTimebase = existing.latestEmissionTimestamp
 
-        // Persist to database if available
-        saveToDatabase(entry)
+        if entry.hopCount <= existing.hopCount {
+            // Path 2: Equal or better hops + new blob + fresher timestamp
+            if isNewBlob && announceEmitted > pathTimebase {
+                markPathUnknownState(key)
+                let merged = mergeBlobs(existing: existingBlobs, new: newBlob)
+                var updated = entry
+                updated.randomBlobs = merged
+                updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+                paths[key] = updated
+                saveToDatabase(updated)
+                print("[PATHTABLE] Updated \(keyHex): equal/better hops (\(entry.hopCount) <= \(existing.hopCount)), fresh emit")
+                pathUpdateContinuation?.yield(updated)
+                return true
+            }
+            print("[PATHTABLE] Ignored \(keyHex): equal/better hops but duplicate blob or stale emit")
+            return false
+        }
 
-        let nextHopStr = entry.nextHop?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
-        print("[PATHTABLE] Recorded path to \(keyHex), hops=\(entry.hopCount), nextHop=\(nextHopStr), total paths=\(paths.count)")
+        // Worse hops (entry.hopCount > existing.hopCount)
+        let now = Date()
 
-        // Emit event for real-time UI updates
-        pathUpdateContinuation?.yield(entry)
+        // Path 3: Expired path + new blob
+        if now >= existing.expires {
+            if isNewBlob {
+                markPathUnknownState(key)
+                let merged = mergeBlobs(existing: existingBlobs, new: newBlob)
+                var updated = entry
+                updated.randomBlobs = merged
+                updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+                paths[key] = updated
+                saveToDatabase(updated)
+                print("[PATHTABLE] Updated \(keyHex): expired path replaced, hops=\(entry.hopCount)")
+                pathUpdateContinuation?.yield(updated)
+                return true
+            }
+            print("[PATHTABLE] Ignored \(keyHex): expired path but duplicate blob")
+            return false
+        }
 
-        return true
+        // Path 4: Not expired + fresher emission + new blob
+        if announceEmitted > pathTimebase {
+            if isNewBlob {
+                markPathUnknownState(key)
+                let merged = mergeBlobs(existing: existingBlobs, new: newBlob)
+                var updated = entry
+                updated.randomBlobs = merged
+                updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+                paths[key] = updated
+                saveToDatabase(updated)
+                print("[PATHTABLE] Updated \(keyHex): fresher emission with worse hops (\(entry.hopCount) > \(existing.hopCount))")
+                pathUpdateContinuation?.yield(updated)
+                return true
+            }
+            print("[PATHTABLE] Ignored \(keyHex): fresher emission but duplicate blob")
+            return false
+        }
+
+        // Path 5: Same emission + unresponsive path
+        if announceEmitted == pathTimebase && isPathUnresponsive(key) {
+            var updated = entry
+            updated.randomBlobs = mergeBlobs(existing: existingBlobs, new: newBlob)
+            updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+            paths[key] = updated
+            pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
+            saveToDatabase(updated)
+            print("[PATHTABLE] Updated \(keyHex): same emission but path was unresponsive")
+            pathUpdateContinuation?.yield(updated)
+            return true
+        }
+
+        print("[PATHTABLE] Ignored \(keyHex): worse hops, not expired, not fresher, not unresponsive")
+        return false
+    }
+
+    /// Merge a new blob into existing blobs list, capped at MAX_RANDOM_BLOBS.
+    private func mergeBlobs(existing: [Data], new: Data) -> [Data] {
+        var merged = existing
+        if !merged.contains(new) {
+            merged.append(new)
+        }
+        // Keep only the most recent MAX_RANDOM_BLOBS
+        if merged.count > TransportConstants.MAX_RANDOM_BLOBS {
+            merged = Array(merged.suffix(TransportConstants.MAX_RANDOM_BLOBS))
+        }
+        return merged
+    }
+
+    // MARK: - Database Migration
+
+    /// Migrate old random_blob BLOB column to random_blobs TEXT (JSON-encoded).
+    private func migrateRandomBlobColumn() {
+        guard let db = db else { return }
+
+        // Check if old column exists by querying table info
+        var hasOldColumn = false
+        var hasNewColumn = false
+        var infoStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "PRAGMA table_info(paths)", -1, &infoStmt, nil) == SQLITE_OK {
+            while sqlite3_step(infoStmt) == SQLITE_ROW {
+                if let namePtr = sqlite3_column_text(infoStmt, 1) {
+                    let name = String(cString: namePtr)
+                    if name == "random_blob" { hasOldColumn = true }
+                    if name == "random_blobs" { hasNewColumn = true }
+                }
+            }
+            sqlite3_finalize(infoStmt)
+        }
+
+        guard hasOldColumn && !hasNewColumn else { return }
+
+        // Old schema detected: add new column, migrate data, then recreate table
+        print("[PATHTABLE] Migrating random_blob → random_blobs")
+
+        // Read old data
+        struct OldRow {
+            var destHash: Data; var pubKeys: Data; var interfaceId: String
+            var hopCount: Int32; var timestamp: Double; var expires: Double
+            var randomBlob: Data; var ratchet: Data?; var appData: Data?; var nextHop: Data?
+        }
+        var oldRows: [OldRow] = []
+        var selectStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT destination_hash, public_keys, interface_id, hop_count, timestamp, expires, random_blob, ratchet, app_data, next_hop FROM paths", -1, &selectStmt, nil) == SQLITE_OK {
+            while sqlite3_step(selectStmt) == SQLITE_ROW {
+                guard let dhPtr = sqlite3_column_blob(selectStmt, 0) else { continue }
+                let dh = Data(bytes: dhPtr, count: Int(sqlite3_column_bytes(selectStmt, 0)))
+                guard let pkPtr = sqlite3_column_blob(selectStmt, 1) else { continue }
+                let pk = Data(bytes: pkPtr, count: Int(sqlite3_column_bytes(selectStmt, 1)))
+                guard let iiCStr = sqlite3_column_text(selectStmt, 2) else { continue }
+                let ii = String(cString: iiCStr)
+                let hc = sqlite3_column_int(selectStmt, 3)
+                let ts = sqlite3_column_double(selectStmt, 4)
+                let ex = sqlite3_column_double(selectStmt, 5)
+                guard let rbPtr = sqlite3_column_blob(selectStmt, 6) else { continue }
+                let rb = Data(bytes: rbPtr, count: Int(sqlite3_column_bytes(selectStmt, 6)))
+                var ra: Data? = nil
+                if let raPtr = sqlite3_column_blob(selectStmt, 7) {
+                    ra = Data(bytes: raPtr, count: Int(sqlite3_column_bytes(selectStmt, 7)))
+                }
+                var ad: Data? = nil
+                if let adPtr = sqlite3_column_blob(selectStmt, 8) {
+                    ad = Data(bytes: adPtr, count: Int(sqlite3_column_bytes(selectStmt, 8)))
+                }
+                var nh: Data? = nil
+                if let nhPtr = sqlite3_column_blob(selectStmt, 9) {
+                    nh = Data(bytes: nhPtr, count: Int(sqlite3_column_bytes(selectStmt, 9)))
+                }
+                oldRows.append(OldRow(destHash: dh, pubKeys: pk, interfaceId: ii, hopCount: hc, timestamp: ts, expires: ex, randomBlob: rb, ratchet: ra, appData: ad, nextHop: nh))
+            }
+            sqlite3_finalize(selectStmt)
+        }
+
+        // Drop and recreate with new schema
+        sqlite3_exec(db, "DROP TABLE paths", nil, nil, nil)
+        let createSQL = """
+            CREATE TABLE paths (
+                destination_hash BLOB PRIMARY KEY,
+                public_keys BLOB NOT NULL,
+                interface_id TEXT NOT NULL,
+                hop_count INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                expires REAL NOT NULL,
+                random_blobs TEXT NOT NULL,
+                ratchet BLOB,
+                app_data BLOB,
+                next_hop BLOB
+            )
+            """
+        sqlite3_exec(db, createSQL, nil, nil, nil)
+
+        // Re-insert with wrapped blobs
+        for row in oldRows {
+            let blobsJson = Self.encodeRandomBlobs([row.randomBlob])
+            let entry = PathEntry(
+                destinationHash: row.destHash,
+                publicKeys: row.pubKeys,
+                interfaceId: row.interfaceId,
+                hopCount: UInt8(row.hopCount),
+                timestamp: Date(timeIntervalSince1970: row.timestamp),
+                expires: Date(timeIntervalSince1970: row.expires),
+                randomBlob: row.randomBlob,
+                ratchet: row.ratchet,
+                appData: row.appData,
+                nextHop: row.nextHop
+            )
+            saveToDatabase(entry)
+        }
+        print("[PATHTABLE] Migration complete, \(oldRows.count) rows migrated")
     }
 
     // MARK: - Database Persistence
+
+    /// Encode random blobs array as JSON string for storage.
+    private static func encodeRandomBlobs(_ blobs: [Data]) -> String {
+        let hexArray = blobs.map { $0.map { String(format: "%02x", $0) }.joined() }
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: hexArray),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            return "[]"
+        }
+        return jsonString
+    }
+
+    /// Decode random blobs array from JSON string.
+    private static func decodeRandomBlobs(_ json: String) -> [Data] {
+        guard let jsonData = json.data(using: .utf8),
+              let array = try? JSONSerialization.jsonObject(with: jsonData) as? [String] else {
+            return []
+        }
+        return array.compactMap { hex in
+            var data = Data()
+            var index = hex.startIndex
+            while index < hex.endIndex {
+                let nextIndex = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
+                if let byte = UInt8(hex[index..<nextIndex], radix: 16) {
+                    data.append(byte)
+                }
+                index = nextIndex
+            }
+            return data.isEmpty ? nil : data
+        }
+    }
 
     /// Load all paths from database into memory cache.
     private func loadFromDatabase() {
         guard let db = db else { return }
 
-        let selectSQL = "SELECT destination_hash, public_keys, interface_id, hop_count, timestamp, expires, random_blob, ratchet, app_data, next_hop FROM paths"
+        let selectSQL = "SELECT destination_hash, public_keys, interface_id, hop_count, timestamp, expires, random_blobs, ratchet, app_data, next_hop FROM paths"
         var stmt: OpaquePointer?
 
         guard sqlite3_prepare_v2(db, selectSQL, -1, &stmt, nil) == SQLITE_OK else {
@@ -214,9 +448,10 @@ public actor PathTable {
             let timestamp = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
             let expires = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5))
 
-            guard let randomBlobPtr = sqlite3_column_blob(stmt, 6) else { continue }
-            let randomBlobLen = sqlite3_column_bytes(stmt, 6)
-            let randomBlob = Data(bytes: randomBlobPtr, count: Int(randomBlobLen))
+            // random_blobs is JSON text
+            guard let blobsTextPtr = sqlite3_column_text(stmt, 6) else { continue }
+            let blobsJson = String(cString: blobsTextPtr)
+            let randomBlobs = Self.decodeRandomBlobs(blobsJson)
 
             var ratchet: Data? = nil
             if let ratchetPtr = sqlite3_column_blob(stmt, 7) {
@@ -236,6 +471,7 @@ public actor PathTable {
                 nextHop = Data(bytes: nextHopPtr, count: Int(nextHopLen))
             }
 
+            let firstBlob = randomBlobs.first ?? Data()
             let entry = PathEntry(
                 destinationHash: destinationHash,
                 publicKeys: publicKeys,
@@ -243,7 +479,8 @@ public actor PathTable {
                 hopCount: hopCount,
                 timestamp: timestamp,
                 expires: expires,
-                randomBlob: randomBlob,
+                randomBlob: firstBlob,
+                randomBlobs: randomBlobs,
                 ratchet: ratchet,
                 appData: appData,
                 nextHop: nextHop
@@ -261,7 +498,7 @@ public actor PathTable {
         guard let db = db else { return }
 
         let upsertSQL = """
-            INSERT OR REPLACE INTO paths (destination_hash, public_keys, interface_id, hop_count, timestamp, expires, random_blob, ratchet, app_data, next_hop)
+            INSERT OR REPLACE INTO paths (destination_hash, public_keys, interface_id, hop_count, timestamp, expires, random_blobs, ratchet, app_data, next_hop)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
         var stmt: OpaquePointer?
@@ -282,9 +519,10 @@ public actor PathTable {
         sqlite3_bind_int(stmt, 4, Int32(entry.hopCount))
         sqlite3_bind_double(stmt, 5, entry.timestamp.timeIntervalSince1970)
         sqlite3_bind_double(stmt, 6, entry.expires.timeIntervalSince1970)
-        entry.randomBlob.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 7, ptr.baseAddress, Int32(entry.randomBlob.count), nil)
-        }
+
+        // random_blobs as JSON text
+        let blobsJson = Self.encodeRandomBlobs(entry.randomBlobs)
+        sqlite3_bind_text(stmt, 7, blobsJson, -1, nil)
 
         if let ratchet = entry.ratchet {
             ratchet.withUnsafeBytes { ptr in
