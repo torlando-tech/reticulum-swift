@@ -135,3 +135,7 @@ public struct RadioConfig: Sendable, Equatable {
         }
     }
 }
+
+// MARK: - Codable
+
+extension RadioConfig: Codable {}
