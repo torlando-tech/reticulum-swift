@@ -72,6 +72,26 @@ public struct RadioConfig: Sendable, Equatable {
     /// Optional; if nil, no long-term limit is enforced.
     public var ltAlock: Float?
 
+    // MARK: - Initialization
+
+    public init(
+        frequency: UInt32,
+        bandwidth: UInt32,
+        txPower: UInt8,
+        spreadingFactor: UInt8,
+        codingRate: UInt8,
+        stAlock: Float? = nil,
+        ltAlock: Float? = nil
+    ) {
+        self.frequency = frequency
+        self.bandwidth = bandwidth
+        self.txPower = txPower
+        self.spreadingFactor = spreadingFactor
+        self.codingRate = codingRate
+        self.stAlock = stAlock
+        self.ltAlock = ltAlock
+    }
+
     // MARK: - Validation
 
     /// Valid bandwidth values in Hz.
