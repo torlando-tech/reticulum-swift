@@ -97,6 +97,60 @@ public struct PathEntry: Codable, Sendable, Equatable {
         expires < Date()
     }
 
+    /// Whether this destination matches any LXMF aspect (delivery or propagation).
+    ///
+    /// Recomputes the expected destination hash for `lxmf.delivery` and
+    /// `lxmf.propagation` using the stored public keys and compares with
+    /// the actual destination hash. Non-LXMF destinations (NomadNet nodes,
+    /// transport nodes, etc.) will not match.
+    public var isLXMFDestination: Bool {
+        guard publicKeys.count >= 64 else { return false }
+        let identityHash = Hashing.truncatedHash(publicKeys)
+        for aspect in [["delivery"], ["propagation"]] {
+            let nameHash = Hashing.destinationNameHash(appName: "lxmf", aspects: aspect)
+            var combined = nameHash
+            combined.append(identityHash)
+            if Hashing.truncatedHash(combined) == destinationHash {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Whether this destination is specifically an LXMF propagation node (relay).
+    public var isLXMFPropagationNode: Bool {
+        guard publicKeys.count >= 64 else { return false }
+        let identityHash = Hashing.truncatedHash(publicKeys)
+        let nameHash = Hashing.destinationNameHash(appName: "lxmf", aspects: ["propagation"])
+        var combined = nameHash
+        combined.append(identityHash)
+        return Hashing.truncatedHash(combined) == destinationHash
+    }
+
+    /// Detected aspect name for this destination.
+    ///
+    /// Tries known Reticulum aspects against the stored public keys and
+    /// destination hash to determine the application type.
+    public var detectedAspect: String? {
+        guard publicKeys.count >= 64 else { return nil }
+        let identityHash = Hashing.truncatedHash(publicKeys)
+        let knownAspects: [(String, [String])] = [
+            ("lxmf", ["delivery"]),
+            ("lxmf", ["propagation"]),
+            ("nomadnetwork", ["node"]),
+        ]
+        for (appName, aspects) in knownAspects {
+            let nameHash = Hashing.destinationNameHash(appName: appName, aspects: aspects)
+            var combined = nameHash
+            combined.append(identityHash)
+            let expectedDestHash = Hashing.truncatedHash(combined)
+            if expectedDestHash == destinationHash {
+                return appName + "." + aspects.joined(separator: ".")
+            }
+        }
+        return nil
+    }
+
     /// First 32 bytes of publicKeys (X25519 base encryption key)
     public var encryptionPublicKey: Data {
         guard publicKeys.count >= 32 else { return Data() }
