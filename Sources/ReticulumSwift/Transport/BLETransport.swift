@@ -77,6 +77,10 @@ public final class BLETransport: Transport {
     /// Current reconnection attempt number (reset to 0 on successful connect).
     private var reconnectAttempt: Int = 0
 
+    /// True when connect() was called before Bluetooth was ready.
+    /// Deferred until centralManagerDidUpdateState(.poweredOn).
+    private var pendingConnect: Bool = false
+
     /// Delegate wrapper for CoreBluetooth callbacks.
     private lazy var delegateWrapper = BLEDelegateWrapper(transport: self)
 
@@ -130,8 +134,10 @@ public final class BLETransport: Transport {
 
             // Check if Bluetooth is ready
             guard let manager = self.centralManager, manager.state == .poweredOn else {
-                self.logger.error("Bluetooth not ready (state: \(String(describing: self.centralManager?.state), privacy: .public))")
-                self.updateState(.failed(BLEError.bluetoothNotReady))
+                // Bluetooth not ready yet — defer scan until poweredOn callback
+                self.logger.info("Bluetooth not ready yet, deferring scan until powered on")
+                self.pendingConnect = true
+                self.updateState(.connecting)
                 return
             }
 
@@ -139,14 +145,18 @@ public final class BLETransport: Transport {
             self.logger.info("Scanning for RNode peripherals with NUS service...")
 
             // Start scanning for Nordic UART Service
+            // Allow duplicates in scan-only mode so RSSI updates flow to the picker UI
             let serviceUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
+            let allowDuplicates = (self.targetDeviceName == nil)
             manager.scanForPeripherals(
                 withServices: [serviceUUID],
-                options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+                options: [CBCentralManagerScanOptionAllowDuplicatesKey: allowDuplicates]
             )
 
-            // Start connection timeout
-            self.startConnectionTimeout()
+            // Start connection timeout (only for targeted connections, not scan-only)
+            if self.targetDeviceName != nil {
+                self.startConnectionTimeout()
+            }
         }
     }
 
@@ -239,6 +249,7 @@ public final class BLETransport: Transport {
 
             // Reset reconnect attempt counter
             self.reconnectAttempt = 0
+            self.pendingConnect = false
 
             self.updateState(.disconnected)
         }
@@ -255,7 +266,20 @@ public final class BLETransport: Transport {
         switch cbState {
         case .poweredOn:
             logger.info("Bluetooth powered on")
-            // If we were connecting and got powered on, state machine will handle it
+            // If connect() was called before Bluetooth was ready, start scanning now
+            if pendingConnect {
+                pendingConnect = false
+                logger.info("Starting deferred BLE scan")
+                let allowDuplicates = (targetDeviceName == nil)
+                let serviceUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
+                centralManager?.scanForPeripherals(
+                    withServices: [serviceUUID],
+                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: allowDuplicates]
+                )
+                if targetDeviceName != nil {
+                    startConnectionTimeout()
+                }
+            }
 
         case .poweredOff:
             logger.warning("Bluetooth powered off")
@@ -294,13 +318,15 @@ public final class BLETransport: Transport {
             self?.onPeripheralDiscovered?(peripheral, rssi)
         }
 
-        // Check if we should connect to this peripheral
-        if let targetName = targetDeviceName {
-            // Filter by device name
-            guard peripheral.name == targetName else {
-                logger.debug("Skipping peripheral (name mismatch: \(name, privacy: .public) != \(targetName, privacy: .public))")
-                return
-            }
+        // If no target device name, we're in scan-only mode — don't auto-connect
+        guard let targetName = targetDeviceName else {
+            return
+        }
+
+        // Filter by device name
+        guard peripheral.name == targetName else {
+            logger.debug("Skipping peripheral (name mismatch: \(name, privacy: .public) != \(targetName, privacy: .public))")
+            return
         }
 
         // Stop scanning and connect
