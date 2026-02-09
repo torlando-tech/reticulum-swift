@@ -3,7 +3,7 @@
 //  ReticulumSwift
 //
 //  Resource packet context values for identifying resource packet types.
-//  Values match Python RNS Resource.py and Link.py exactly for interoperability.
+//  Values match Python RNS Packet.py exactly for interoperability.
 //
 
 import Foundation
@@ -13,7 +13,7 @@ import Foundation
 /// Resource packet context values.
 ///
 /// These context values identify different packet types within the resource
-/// transfer protocol. They are used in packet framing alongside the packet data.
+/// transfer protocol. They are used as the wire-format context byte.
 ///
 /// Resource transfer flow:
 /// 1. Sender sends ADVERTISEMENT with resource metadata
@@ -24,23 +24,29 @@ import Foundation
 /// 6. Sender may send HMU (hashmap update) for additional segments
 /// 7. Either side may send CANCEL to abort
 ///
-/// Values match Python RNS Link.py resource constants:
+/// Values match Python RNS Packet.py context constants:
 /// ```python
-/// RESOURCE_ADV = 0x01
-/// RESOURCE_REQ = 0x02
-/// RESOURCE_HMU = 0x03
-/// RESOURCE_PRF = 0x04
-/// RESOURCE_ICL = 0x05
-/// RESOURCE_RCL = 0x06
+/// RESOURCE       = 0x01  # Packet is part of a resource (NOT link-encrypted)
+/// RESOURCE_ADV   = 0x02  # Packet is a resource advertisement
+/// RESOURCE_REQ   = 0x03  # Packet is a resource part request
+/// RESOURCE_HMU   = 0x04  # Packet is a resource hashmap update
+/// RESOURCE_PRF   = 0x05  # Packet is a resource proof
+/// RESOURCE_ICL   = 0x06  # Packet is a resource initiator cancel message
+/// RESOURCE_RCL   = 0x07  # Packet is a resource receiver cancel message
 /// ```
-///
-/// Note: Python RNS uses slightly different constant naming (ADV vs ADVERTISEMENT).
-/// The numeric values are identical.
 public enum ResourcePacketContext {
 
     // MARK: - Context Values
 
-    /// Resource advertisement packet (0x01).
+    /// Resource data part packet (0x01) — Python RESOURCE.
+    ///
+    /// Contains a segment of the resource transfer data.
+    /// IMPORTANT: NOT encrypted by the link (Packet.pack passes through).
+    /// The Resource class handles its own segmented encryption.
+    /// Format: 2-byte big-endian part index + encrypted part data bytes.
+    public static let resource: UInt8 = 0x01
+
+    /// Resource advertisement packet (0x02) — Python RESOURCE_ADV.
     ///
     /// Sent by the sender to advertise availability of a resource.
     /// Contains MessagePack-encoded advertisement data with:
@@ -49,48 +55,41 @@ public enum ResourcePacketContext {
     /// - Hashmap chunk (4-byte hash per part)
     /// - Flags (encrypted, compressed, split, etc.)
     /// - Optional request ID for responses
-    public static let resourceAdvertisement: UInt8 = 0x01
+    /// Link-encrypted.
+    public static let resourceAdvertisement: UInt8 = 0x02
 
-    /// Resource request packet (0x02).
+    /// Resource request packet (0x03) — Python RESOURCE_REQ.
     ///
     /// Sent by the receiver to request specific parts by their hash.
     /// Contains a sequence of 4-byte truncated part hashes from the hashmap.
-    /// Each hash identifies which part is being requested.
-    public static let resourceRequest: UInt8 = 0x02
+    /// Link-encrypted.
+    public static let resourceRequest: UInt8 = 0x03
 
-    /// Resource data packet (0x03).
-    ///
-    /// Sent by the sender containing part data.
-    /// Format: 2-byte big-endian part index + part data bytes.
-    /// The receiver validates the part hash against the hashmap.
-    public static let resourceData: UInt8 = 0x03
-
-    /// Resource proof packet (0x04).
-    ///
-    /// Sent by the receiver after successfully receiving all parts.
-    /// Contains the complete resource hash to prove successful assembly.
-    /// This signals transfer completion to the sender.
-    public static let resourceProof: UInt8 = 0x04
-
-    /// Resource hashmap update packet (0x05).
+    /// Resource hashmap update packet (0x04) — Python RESOURCE_HMU.
     ///
     /// Sent by the sender to provide additional hashmap segments for
     /// resources that are split across multiple advertisements due to
-    /// size constraints. Contains the next segment's advertisement data.
-    public static let resourceHMU: UInt8 = 0x05
+    /// size constraints.
+    /// Link-encrypted.
+    public static let resourceHMU: UInt8 = 0x04
 
-    /// Resource cancel packet (0x06).
+    /// Resource proof packet (0x05) — Python RESOURCE_PRF.
     ///
-    /// Sent by either side to abort the transfer.
-    /// After this packet, both sides should discard the resource and
-    /// free any allocated buffers.
+    /// Sent by the receiver after successfully receiving all parts.
+    /// Contains the complete resource hash to prove successful assembly.
+    /// Link-encrypted.
+    public static let resourceProof: UInt8 = 0x05
+
+    /// Resource initiator cancel packet (0x06) — Python RESOURCE_ICL.
+    ///
+    /// Sent by the sender to abort the transfer.
+    /// Link-encrypted.
     public static let resourceCancel: UInt8 = 0x06
 
-    /// Resource reject packet (0x07).
+    /// Resource receiver cancel/reject packet (0x07) — Python RESOURCE_RCL.
     ///
-    /// Sent by the receiver to reject a resource advertisement.
-    /// Indicates the receiver does not want to receive this resource.
-    /// Sent before transfer begins (in response to advertisement).
+    /// Sent by the receiver to reject or cancel a resource transfer.
+    /// Link-encrypted.
     public static let resourceReject: UInt8 = 0x07
 
     // MARK: - Helpers
@@ -98,11 +97,11 @@ public enum ResourcePacketContext {
     /// Check if a context value is a resource packet context.
     ///
     /// Resource contexts occupy the range 0x01-0x07. Other context values
-    /// (like keep-alive 0xFF/0xFE) are not resource packets.
+    /// (like keep-alive 0xFA) are not resource packets.
     ///
     /// - Parameter context: Context byte to check
     /// - Returns: true if context is a resource packet type
     public static func isResourceContext(_ context: UInt8) -> Bool {
-        return context >= resourceAdvertisement && context <= resourceReject
+        return context >= resource && context <= resourceReject
     }
 }

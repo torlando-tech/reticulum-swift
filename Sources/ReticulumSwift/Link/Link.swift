@@ -10,6 +10,9 @@
 
 import Foundation
 import CryptoKit
+import os.log
+
+private let linkLogger = Logger(subsystem: "com.columba.app", category: "Link")
 
 // MARK: - Link
 
@@ -149,7 +152,9 @@ public actor Link {
     public private(set) var resourceStrategy: ResourceStrategy = .acceptNone
 
     /// Resource callbacks for transfer notifications
-    private weak var resourceCallbacks: (any ResourceCallbacks)?
+    /// Non-weak: handler lifetime is tied to link lifetime, no retain cycle
+    /// since the handler doesn't reference the link.
+    private var resourceCallbacks: (any ResourceCallbacks)?
 
     /// Outbound resources indexed by resource hash
     private var outboundResources: [Data: Resource] = [:]
@@ -736,20 +741,19 @@ public actor Link {
 
     /// Send a keep-alive packet.
     ///
-    /// Encrypts and sends a single-byte keep-alive marker (0xFF for initiator,
-    /// 0xFE for responder) to the peer.
+    /// Sends a single-byte keep-alive marker (0xFF for initiator,
+    /// 0xFE for responder) to the peer. NOT encrypted, matching Python RNS.
+    /// Python Packet.pack() treats KEEPALIVE context as passthrough (no encryption).
     private func sendKeepalive() async {
         guard state.isEstablished else { return }
         guard let send = sendCallback else { return }
 
         // Keep-alive content: 0xFF for initiator, 0xFE for responder
+        // NOT encrypted - Python RNS sends keepalive as raw bytes
         let keepaliveData = Data([initiator ? LinkConstants.KEEPALIVE_INITIATOR : LinkConstants.KEEPALIVE_RESPONDER])
 
         do {
-            // Encrypt the keep-alive data
-            let encrypted = try encrypt(keepaliveData)
-
-            // Build complete keep-alive packet
+            // Build keep-alive packet (data is NOT encrypted per Python RNS)
             let header = PacketHeader(
                 headerType: .header1,
                 hasContext: true,
@@ -763,7 +767,7 @@ public actor Link {
                 header: header,
                 destination: linkId,
                 context: LinkConstants.CONTEXT_KEEPALIVE,
-                data: encrypted
+                data: keepaliveData
             )
 
             try await send(packet.encode())
@@ -870,13 +874,41 @@ public actor Link {
 
     /// Close the link.
     ///
-    /// Stops keep-alive and watchdog tasks, transitions to closed state,
+    /// Sends a LINKCLOSE packet to the remote peer (if link was active),
+    /// stops keep-alive and watchdog tasks, transitions to closed state,
     /// and finishes the state observation stream.
     /// Once closed, the link cannot be reused.
     ///
     /// - Parameter reason: Reason for closing (defaults to initiatorClosed)
     public func close(reason: TeardownReason = .initiatorClosed) {
         guard !state.isTerminal else { return }
+
+        // Send LINKCLOSE to remote peer if link was active
+        // Python RNS sends encrypted(link_id) with context LINKCLOSE
+        // Encrypt BEFORE state transition (encrypt() checks state.isEstablished)
+        if state.isEstablished, let send = sendCallback, let token = token {
+            let linkIdCopy = linkId
+            if let encrypted = try? token.encrypt(linkIdCopy) {
+                let header = PacketHeader(
+                    headerType: .header1,
+                    hasContext: true,
+                    transportType: .broadcast,
+                    destinationType: .link,
+                    packetType: .data,
+                    hopCount: 0
+                )
+                let packet = Packet(
+                    header: header,
+                    destination: linkIdCopy,
+                    context: LinkConstants.CONTEXT_LINKCLOSE,
+                    data: encrypted
+                )
+                let packetBytes = packet.encode()
+                Task {
+                    try? await send(packetBytes)
+                }
+            }
+        }
 
         stopKeepalive()
         stopWatchdog()
@@ -917,6 +949,8 @@ public actor Link {
             throw LinkError.notActive
         }
 
+        print("[RESOURCE_SEND] Starting resource transfer: \(data.count) bytes")
+
         // Create outbound resource
         let resource = Resource(
             data: data,
@@ -926,52 +960,122 @@ public actor Link {
             autoCompress: true
         )
 
-        // Set send callback for encrypted transmission
+        // Set send callback that creates proper link DATA packets
         await resource.setSendCallback { [weak self] packetData in
             guard let self = self else {
                 throw LinkError.notActive
             }
-            guard let send = await self.sendCallback else {
-                throw LinkError.notActive
-            }
-            try await send(packetData)
+            try await self.sendResourcePacket(packetData)
         }
 
-        // Store resource
+        // Prepare the resource (compress, encrypt, hash, split into parts)
+        // Capture the token directly (not the Link actor) for Sendable closure
+        guard let encryptToken = self.token else {
+            throw LinkError.encryptionNotReady
+        }
+        // Disable compression for Python interop: Python uses bz2 but Swift
+        // uses LZMA. Sending uncompressed avoids decompression mismatch.
+        try await resource.prepare(partSize: MDU, linkEncrypt: { plaintext in
+            return try encryptToken.encrypt(plaintext)
+        }, autoCompress: false)
+        let numParts = await resource.numParts
+        let transferSize = await resource.transferSize
+        linkLogger.info("[RESOURCE_SEND] Prepared: \(numParts) parts, partSize=\(MDU), transferSize=\(transferSize)")
+        print("[RESOURCE_SEND] Prepared: \(numParts) parts, partSize=\(MDU)")
+
+        // Store resource (hash is available after prepare)
         let hash = await resource.hash ?? Data()
         outboundResources[hash] = resource
+        let hashHex = hash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        linkLogger.info("[RESOURCE_SEND] Stored resource hash=\(hashHex), outboundResources count=\(self.outboundResources.count)")
 
-        // Resource will be prepared and advertised by caller
+        // Send advertisement to start transfer
+        try await resource.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
+        linkLogger.info("[RESOURCE_SEND] Advertisement sent for resource \(hashHex)")
+        print("[RESOURCE_SEND] Advertisement sent for resource \(hashHex)")
+
         return resource
+    }
+
+    /// Send a resource packet as a proper link DATA packet.
+    ///
+    /// Resource packets start with a context byte (0x01-0x07) followed by payload.
+    /// This method extracts the context, creates a link DATA packet with that context
+    /// as the wire context, and sends it through the link's send callback.
+    ///
+    /// Per Python RNS Packet.pack():
+    /// - Context 0x01 (RESOURCE data): NOT link-encrypted (Resource handles own encryption)
+    /// - Context 0x02-0x07 (control): Link-encrypted
+    ///
+    /// - Parameter data: Resource packet data (context byte + payload)
+    private func sendResourcePacket(_ data: Data) async throws {
+        guard data.count >= 1 else { throw LinkError.notActive }
+
+        let resourceContext = data[data.startIndex]
+        let payload = Data(data.dropFirst())
+
+        // Resource data parts (0x01) are NOT link-encrypted per Python
+        // All other resource packets (0x02-0x07) ARE link-encrypted
+        let wirePayload: Data
+        if resourceContext == ResourcePacketContext.resource {
+            wirePayload = payload
+        } else {
+            wirePayload = try encrypt(payload)
+        }
+
+        let header = PacketHeader(
+            headerType: .header1,
+            hasContext: false,
+            hasIFAC: false,
+            transportType: .broadcast,
+            destinationType: .link,
+            packetType: .data,
+            hopCount: 0
+        )
+
+        let packet = Packet(
+            header: header,
+            destination: linkId,
+            transportAddress: nil,
+            context: resourceContext,
+            data: wirePayload
+        )
+
+        guard let send = sendCallback else { throw LinkError.notActive }
+        try await send(packet.encode())
+        print("[RESOURCE_SEND] Sent resource packet context=0x\(String(format: "%02x", resourceContext)), payload=\(wirePayload.count) bytes")
     }
 
     /// Handle incoming resource packet.
     ///
     /// Routes resource packets to the appropriate handler based on context.
+    /// The context comes from the wire packet header, and data is the pure
+    /// payload (no context byte prefix).
     ///
-    /// - Parameter data: Decrypted packet data (context + payload)
-    public func handleResourcePacket(_ data: Data) async {
-        guard data.count >= 1 else { return }
-
-        let context = data[data.startIndex]
+    /// - Parameters:
+    ///   - context: Resource packet context (0x01-0x07) from wire packet
+    ///   - data: Packet payload (no context byte)
+    public func handleResourcePacket(context: UInt8, data: Data) async {
+        linkLogger.info("[RESOURCE] Received resource packet: context=0x\(String(format: "%02x", context)), data=\(data.count) bytes")
+        print("[RESOURCE_RECV] Resource packet: context=0x\(String(format: "%02x", context)), data=\(data.count) bytes")
 
         switch context {
-        case ResourcePacketContext.resourceAdvertisement:
-            await handleResourceAdvertisement(data)
-        case ResourcePacketContext.resourceRequest:
-            await handleResourceRequest(data)
-        case ResourcePacketContext.resourceData:
+        case ResourcePacketContext.resource:             // 0x01 - RESOURCE data part
             await handleResourceData(data)
-        case ResourcePacketContext.resourceProof:
-            await handleResourceProof(data)
-        case ResourcePacketContext.resourceHMU:
+        case ResourcePacketContext.resourceAdvertisement: // 0x02 - RESOURCE_ADV
+            await handleResourceAdvertisement(data)
+        case ResourcePacketContext.resourceRequest:       // 0x03 - RESOURCE_REQ
+            await handleResourceRequest(data)
+        case ResourcePacketContext.resourceHMU:           // 0x04 - RESOURCE_HMU
             await handleResourceHMU(data)
-        case ResourcePacketContext.resourceReject:
-            await handleResourceReject(data)
-        case ResourcePacketContext.resourceCancel:
+        case ResourcePacketContext.resourceProof:         // 0x05 - RESOURCE_PRF
+            await handleResourceProof(data)
+        case ResourcePacketContext.resourceCancel:        // 0x06 - RESOURCE_ICL
             await handleResourceCancel(data)
+        case ResourcePacketContext.resourceReject:        // 0x07 - RESOURCE_RCL
+            await handleResourceReject(data)
         default:
-            // Unknown resource context
+            print("[RESOURCE_RECV] Unknown resource context: 0x\(String(format: "%02x", context))")
             break
         }
     }
@@ -981,12 +1085,12 @@ public actor Link {
     /// Called when receiving a resource advertisement from the peer.
     /// Checks strategy and callbacks to decide whether to accept.
     ///
-    /// - Parameter data: Advertisement packet data
+    /// - Parameter data: Advertisement payload (context already stripped by caller)
     private func handleResourceAdvertisement(_ data: Data) async {
-        guard data.count > 1 else { return }
+        guard data.count > 0 else { return }
 
-        // Parse advertisement (skip context byte)
-        let advData = data.dropFirst()
+        // Data is pure advertisement payload (context already handled by handleResourcePacket)
+        let advData = data
 
         do {
             let advertisement = try ResourceAdvertisement.unpack(Data(advData))
@@ -1013,68 +1117,122 @@ public actor Link {
                 // Accept the resource
                 let hash = await resource.hash ?? Data()
                 inboundResources[hash] = resource
+                let hashHex = hash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                print("[RESOURCE_RECV] Accepted resource \(hashHex), size=\(advertisement.dataSize)")
 
                 // Notify callback
                 if let callbacks = resourceCallbacks {
                     await callbacks.resourceStarted(resource)
                 }
 
-                // Set send callback for requests/proof
+                // Set send callback for requests/proof (creates proper link DATA packets)
                 await resource.setSendCallback { [weak self] (packetData: Data) in
                     guard let self = self else {
                         throw LinkError.notActive
                     }
-                    guard let send = await self.sendCallback else {
-                        throw LinkError.notActive
-                    }
-                    try await send(packetData)
+                    try await self.sendResourcePacket(packetData)
                 }
 
                 // Accept the resource (starts requesting parts)
                 try await resource.accept()
             } else {
+                print("[RESOURCE_RECV] Rejected resource (strategy=\(resourceStrategy))")
                 // Reject the resource
                 try await resource.reject()
             }
         } catch {
-            // Failed to parse advertisement
+            print("[RESOURCE_RECV] Failed to parse advertisement: \(error)")
         }
     }
 
     /// Handle resource request packet.
     ///
     /// Called when receiving a part request from the peer for an outbound resource.
-    /// Request format: sequence of 4-byte part hashes indicating which parts to send.
+    /// Python RESOURCE_REQ format (from Resource.request_next()):
+    ///   [1-byte flag] + [32-byte resource hash] + [N×4-byte part hashes]
+    /// Where flag: 0x00 = hashmap not exhausted, 0xFF = hashmap exhausted
+    /// If exhausted, an additional 4-byte last_map_hash is prepended before the resource hash.
     ///
-    /// - Parameter data: Request packet data (sequence of 4-byte hashes)
+    /// - Parameter data: Request packet data
     private func handleResourceRequest(_ data: Data) async {
-        // Request contains sequence of 4-byte part hashes
-        guard data.count >= ResourceConstants.MAPHASH_LEN else { return }
+        let resourceHashLen = 32 // RNS.Identity.HASHLENGTH // 8 = 256 // 8 = 32
+        let mapHashLen = ResourceConstants.MAPHASH_LEN // 4
 
-        // Find matching outbound resource by looking at which resources have matching hashes
-        // The resource hash isn't in the request, so we need to search through all outbound resources
-        for (_, resource) in outboundResources {
+        // Minimum: 1 (flag) + 32 (resource hash) = 33 bytes
+        guard data.count >= 1 + resourceHashLen else {
+            print("[RESOURCE_REQ] Too short: \(data.count) bytes")
+            return
+        }
+
+        // Parse exhaustion flag
+        let exhausted = data[data.startIndex] == 0xFF
+        let pad = exhausted ? (1 + mapHashLen) : 1
+
+        // Extract resource hash for matching
+        guard data.count >= pad + resourceHashLen else {
+            print("[RESOURCE_REQ] Too short for resource hash: \(data.count) bytes, pad=\(pad)")
+            return
+        }
+        let resourceHash = Data(data[data.startIndex + pad ..< data.startIndex + pad + resourceHashLen])
+
+        // Extract requested part hashes
+        let hashesStart = pad + resourceHashLen
+        let requestedHashes = data.count > hashesStart ? Data(data[(data.startIndex + hashesStart)...]) : Data()
+
+        let resHashHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        linkLogger.info("[RESOURCE_REQ] resourceHash=\(resHashHex), exhausted=\(exhausted), partHashCount=\(requestedHashes.count / mapHashLen)")
+        print("[RESOURCE_REQ] resourceHash=\(resHashHex)..., exhausted=\(exhausted), partHashes=\(requestedHashes.count / mapHashLen)")
+
+        // Find matching outbound resource by hash
+        for (storedHash, resource) in outboundResources {
+            guard storedHash == resourceHash else { continue }
+
+            // Transition from advertised to transferring on first request (matches Python)
+            let resourceState = await resource.state
+            if resourceState == .advertised {
+                await resource.transitionToTransferring()
+            }
+
             guard let hashmap = await resource.hashmap else { continue }
 
-            // Try to match first requested hash to find the resource
-            let firstHash = data.prefix(ResourceConstants.MAPHASH_LEN)
-            if ResourceHashmap.findPartIndex(for: firstHash, in: hashmap) != nil {
-                // Found the resource, send all requested parts
-                var offset = 0
-                while offset + ResourceConstants.MAPHASH_LEN <= data.count {
-                    let partHash = data[offset..<(offset + ResourceConstants.MAPHASH_LEN)]
-                    if let partIndex = ResourceHashmap.findPartIndex(for: Data(partHash), in: hashmap) {
-                        do {
-                            try await resource.sendPart(at: partIndex)
-                        } catch {
-                            // Part send failed, continue with remaining parts
-                        }
+            // Send all requested parts
+            var offset = 0
+            while offset + mapHashLen <= requestedHashes.count {
+                let partHash = Data(requestedHashes[requestedHashes.startIndex + offset ..< requestedHashes.startIndex + offset + mapHashLen])
+                if let partIndex = ResourceHashmap.findPartIndex(for: partHash, in: hashmap) {
+                    do {
+                        try await resource.sendPart(at: partIndex)
+                        print("[RESOURCE_REQ] Sent part \(partIndex)")
+                    } catch {
+                        print("[RESOURCE_REQ] Failed to send part \(partIndex): \(error)")
                     }
-                    offset += ResourceConstants.MAPHASH_LEN
                 }
-                return
+                offset += mapHashLen
             }
+
+            // Handle hashmap exhaustion (send more hashmap entries)
+            if exhausted {
+                do {
+                    let sent = try await resource.sendNextHashmapSegment(linkMDU: LinkConstants.LINK_MDU)
+                    if sent {
+                        linkLogger.info("[RESOURCE_REQ] Sent HMU for resource \(resHashHex)")
+                        print("[RESOURCE_REQ] Sent HMU for resource \(resHashHex)")
+                    } else {
+                        linkLogger.warning("[RESOURCE_REQ] Hashmap exhausted but no more segments")
+                        print("[RESOURCE_REQ] Hashmap exhausted but no more segments to send")
+                    }
+                } catch {
+                    linkLogger.error("[RESOURCE_REQ] Failed to send HMU: \(error.localizedDescription)")
+                    print("[RESOURCE_REQ] Failed to send HMU: \(error)")
+                }
+            }
+
+            return
         }
+
+        let outboundHashes = outboundResources.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
+        linkLogger.error("[RESOURCE_REQ] No matching outbound resource. resHash=\(resHashHex), have=\(outboundHashes)")
+        print("[RESOURCE_REQ] No matching outbound resource. Have: \(outboundHashes)")
     }
 
     /// Handle resource data packet.
@@ -1154,18 +1312,41 @@ public actor Link {
     ///
     /// - Parameter data: HMU packet data (MessagePack advertisement)
     private func handleResourceHMU(_ data: Data) async {
-        // Parse as advertisement containing hashmap segment
-        guard let advertisement = try? ResourceAdvertisement.unpack(data) else { return }
+        // Python HMU wire format (Resource.py line 1000):
+        //   resource_hash(32) + msgpack([segment, hashmap_bytes])
+        // Python receiver (Resource.py line 442):
+        //   update = umsgpack.unpackb(plaintext[HASHLENGTH//8:])
+        //   self.hashmap_update(update[0], update[1])
+        let hashLen = 32
+        guard data.count > hashLen else {
+            print("[RESOURCE_HMU] Data too short: \(data.count) bytes")
+            return
+        }
 
-        // Find matching inbound resource by original hash
+        let resourceHash = Data(data.prefix(hashLen))
+        let hmuPayload = Data(data.dropFirst(hashLen))
+
+        // Unpack msgpack([segment, hashmap_bytes])
+        guard let value = try? unpackMsgPack(hmuPayload),
+              case .array(let arr) = value,
+              arr.count == 2,
+              case .binary(let hashmapChunk) = arr[1] else {
+            print("[RESOURCE_HMU] Failed to unpack HMU payload")
+            return
+        }
+
+        let resHashHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("[RESOURCE_HMU] Received HMU for \(resHashHex), \(hashmapChunk.count / 4) new hashes")
+
+        // Find matching inbound resource by hash
         for (_, resource) in inboundResources {
-            let resourceHash = await resource.hash
-            if resourceHash == advertisement.hash {
-                // Append hashmap segment to resource
-                await resource.appendHashmapSegment(advertisement.hashmapChunk)
+            let storedHash = await resource.hash
+            if storedHash == resourceHash {
+                await resource.appendHashmapSegment(hashmapChunk)
                 return
             }
         }
+        print("[RESOURCE_HMU] No matching inbound resource for \(resHashHex)")
     }
 
     /// Handle resource reject packet.

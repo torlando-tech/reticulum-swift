@@ -24,13 +24,18 @@ public enum ResourceHashmap {
 
     /// Calculate 4-byte hash for a resource part.
     ///
-    /// Uses first 4 bytes of SHA256 hash (MAPHASH_LEN).
-    /// This matches Python RNS Resource.py part hash calculation.
+    /// Uses first 4 bytes of SHA256(data + randomHash) (MAPHASH_LEN).
+    /// Matches Python RNS Resource.py get_map_hash():
+    ///   `RNS.Identity.full_hash(data + self.random_hash)[:MAPHASH_LEN]`
     ///
-    /// - Parameter data: Part data to hash
+    /// - Parameters:
+    ///   - data: Part data to hash
+    ///   - randomHash: Resource random hash (4 bytes)
     /// - Returns: 4-byte truncated SHA256 hash
-    public static func partHash(_ data: Data) -> Data {
-        return Hashing.truncatedHash(data, length: ResourceConstants.MAPHASH_LEN)
+    public static func partHash(_ data: Data, randomHash: Data) -> Data {
+        var combined = Data(data)
+        combined.append(randomHash)
+        return Hashing.truncatedHash(combined, length: ResourceConstants.MAPHASH_LEN)
     }
 
     /// Get expected hash for a part from hashmap.
@@ -63,8 +68,9 @@ public enum ResourceHashmap {
     /// - Parameters:
     ///   - data: Resource data to hash
     ///   - partSize: Size of each part (Link SDU)
+    ///   - randomHash: Resource random hash (4 bytes) included in each part hash
     /// - Returns: Concatenated 4-byte hashes for all parts
-    public static func generateHashmap(data: Data, partSize: Int) -> Data {
+    public static func generateHashmap(data: Data, partSize: Int, randomHash: Data) -> Data {
         var hashmap = Data()
 
         // Calculate total number of parts
@@ -76,7 +82,7 @@ public enum ResourceHashmap {
             let endOffset = min(startOffset + partSize, data.count)
             let partData = data[startOffset..<endOffset]
 
-            let hash = partHash(partData)
+            let hash = partHash(partData, randomHash: randomHash)
             hashmap.append(hash)
         }
 

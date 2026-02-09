@@ -76,6 +76,9 @@ public actor Resource {
     /// Whether data was compressed
     public private(set) var compressed: Bool = false
 
+    /// Assembled data (available after assemble() completes successfully)
+    public private(set) var assembledData: Data?
+
     // MARK: - Parts
 
     /// Size of each part (Link SDU)
@@ -119,6 +122,12 @@ public actor Resource {
 
     /// Parts received status (true if received)
     private var partsReceived: [Bool] = []
+
+    /// Current hashmap segment (1-based, incremented as HMU requests arrive)
+    public private(set) var currentHashmapSegment: Int = 1
+
+    /// Total hashmap segments needed
+    public private(set) var totalHashmapSegments: Int = 1
 
     // MARK: - Initialization (Outbound)
 
@@ -220,6 +229,18 @@ public actor Resource {
         stateContinuation?.yield(newState)
     }
 
+    /// Transition from advertised to transferring state.
+    ///
+    /// Called by the sender when the first RESOURCE_REQ is received from the peer.
+    /// This matches Python's behavior where `Resource.request()` transitions to
+    /// TRANSFERRING on the first incoming request.
+    public func transitionToTransferring() {
+        if state == .advertised {
+            state = .transferring
+            stateContinuation?.yield(.transferring)
+        }
+    }
+
     // MARK: - Send Callback
 
     /// Set the callback for sending encrypted packets via the link.
@@ -310,14 +331,12 @@ public actor Resource {
         // Get part data
         let partData = try getPart(at: index)
 
-        // Frame: context (1) + index (2 BE) + part data
+        // Frame: context (1) + part data
+        // Python identifies parts by hash, NOT by index.
+        // Python receive_part(): part_hash = get_map_hash(packet.data)
+        // So we send raw part data only (no index prefix).
         var packet = Data()
-        packet.append(ResourcePacketContext.resourceData)
-
-        // Encode index as 2-byte big-endian
-        var indexBE = UInt16(index).bigEndian
-        packet.append(Data(bytes: &indexBE, count: 2))
-
+        packet.append(ResourcePacketContext.resource)
         packet.append(partData)
 
         // Send via link (encrypts and sends)
@@ -327,15 +346,22 @@ public actor Resource {
     /// Send hashmap update for additional segments.
     ///
     /// For resources requiring multiple hashmap segments (due to size constraints),
-    /// this sends the advertisement for subsequent segments. The receiver uses these
+    /// this sends raw hashmap bytes for the next segment. The receiver uses these
     /// to build the complete hashmap for part validation.
     ///
+    /// Python wire format (Resource.py line 1000):
+    ///   `hmu = self.hash + umsgpack.packb([segment, hashmap])`
+    /// Python receiver (Resource.py line 442):
+    ///   `update = umsgpack.unpackb(plaintext[HASHLENGTH//8:])`
+    ///   `self.hashmap_update(update[0], update[1])`
+    ///
     /// Packet format:
-    /// - Context byte: 0x05 (resourceHMU)
-    /// - Advertisement data: MessagePack-encoded advertisement
+    /// - Context byte: 0x04 (resourceHMU)
+    /// - Resource hash: 32 bytes
+    /// - Msgpack([segment_index, raw_hashmap_bytes])
     ///
     /// - Parameters:
-    ///   - segment: Segment number (2+) for the hashmap update
+    ///   - segment: Segment number (1-based internal, converted to 0-based for wire)
     ///   - linkMDU: Link MDU for hashmap segmentation
     /// - Throws: ResourceError if state is invalid or send fails
     public func sendHashmapUpdate(segment: Int, linkMDU: Int) async throws {
@@ -350,19 +376,56 @@ public actor Resource {
             throw ResourceError.transferFailed(reason: "No send callback set")
         }
 
-        // Get advertisement for specified segment
-        let advertisement = try getAdvertisement(segment: segment, linkMDU: linkMDU)
+        guard let resourceHash = hash, let fullHashmap = hashmap else {
+            throw ResourceError.invalidState(
+                expected: "prepared (hash/hashmap available)",
+                actual: "\(state)"
+            )
+        }
 
-        // Encode with MessagePack
-        let advertisementData = try advertisement.pack()
+        // Convert 1-based segment to 0-based for hashmap indexing
+        let zeroBasedSegment = segment - 1
+        let maxLength = ResourceHashmap.hashmapMaxLength(linkMDU: linkMDU)
+        guard let hashmapChunk = ResourceHashmap.getHashmapSegment(
+            hashmap: fullHashmap,
+            segment: zeroBasedSegment,
+            maxLength: maxLength
+        ) else {
+            throw ResourceError.transferFailed(reason: "Hashmap segment \(segment) out of range")
+        }
 
-        // Frame with context byte
+        // Python wire format: resource_hash(32) + msgpack([segment, hashmap_bytes])
+        let hmuPayload = packMsgPack(.array([
+            .int(Int64(zeroBasedSegment)),
+            .binary(Data(hashmapChunk))
+        ]))
+
+        // Frame: context byte + resource hash + msgpack payload
         var packet = Data()
         packet.append(ResourcePacketContext.resourceHMU)
-        packet.append(advertisementData)
+        packet.append(resourceHash)
+        packet.append(hmuPayload)
 
         // Send via link (encrypts and sends)
         try await send(packet)
+    }
+
+    /// Send the next hashmap segment when the receiver reports exhaustion.
+    ///
+    /// Called by the Link when a RESOURCE_REQ arrives with exhausted=true,
+    /// meaning the receiver has used all part hashes from the current segment
+    /// and needs more.
+    ///
+    /// - Parameter linkMDU: Link MDU for segmentation calculation
+    /// - Returns: True if a new segment was sent, false if all segments already sent
+    public func sendNextHashmapSegment(linkMDU: Int) async throws -> Bool {
+        let nextSegment = currentHashmapSegment + 1
+        guard nextSegment <= totalHashmapSegments else {
+            return false
+        }
+        currentHashmapSegment = nextSegment
+        try await sendHashmapUpdate(segment: nextSegment, linkMDU: linkMDU)
+        return true
     }
 
     /// Append a hashmap segment for large resource transfers.
@@ -396,7 +459,22 @@ public actor Resource {
     ///   - partSize: Size of each part (Link SDU)
     ///   - autoCompress: Whether to attempt compression (default true)
     /// - Throws: ResourceError if state is invalid or compression fails
-    public func prepare(partSize: Int, autoCompress: Bool = true) throws {
+    /// Prepare resource for transfer.
+    ///
+    /// Follows Python RNS Resource.__init__() sequence:
+    /// 1. Compress data if beneficial
+    /// 2. Prepend random data prefix (4 bytes) to compressed data
+    /// 3. Link-encrypt the entire blob (random prefix + compressed data)
+    /// 4. Generate SEPARATE random_hash (4 bytes) for hashmap computation
+    /// 5. Compute resource hash = SHA256(original_data + random_hash)
+    /// 6. Generate hashmap from encrypted data parts + random_hash
+    /// 7. Split encrypted data for transfer
+    ///
+    /// - Parameters:
+    ///   - partSize: Maximum part size (Link SDU/MDU)
+    ///   - linkEncrypt: Closure to link-encrypt the data blob
+    ///   - autoCompress: Whether to auto-compress data
+    public func prepare(partSize: Int, linkEncrypt: (Data) throws -> Data, autoCompress: Bool = true) throws {
         guard state == .none else {
             throw ResourceError.invalidState(expected: "none", actual: "\(state)")
         }
@@ -414,33 +492,48 @@ public actor Resource {
         )
         self.compressed = compressionResult.compressed
 
-        // Step 2: Generate random hash (4 bytes)
+        // Step 2: Generate random data prefix (4 bytes) — prepended before encryption
+        // This is NOT the same as self.randomHash (used for hashmap)
+        var randomPrefix = Data(count: ResourceConstants.RANDOM_HASH_SIZE)
+        _ = randomPrefix.withUnsafeMutableBytes { buffer in
+            SecRandomCopyBytes(kSecRandomDefault, ResourceConstants.RANDOM_HASH_SIZE, buffer.baseAddress!)
+        }
+
+        // Step 3: Build pre-encryption blob: random_prefix + compressed_data
+        var preEncryptionData = Data()
+        preEncryptionData.append(randomPrefix)
+        preEncryptionData.append(compressionResult.data)
+
+        // Step 4: Link-encrypt the entire blob
+        let encryptedData = try linkEncrypt(preEncryptionData)
+        self.preparedData = encryptedData
+        self.transferSize = encryptedData.count
+
+        // Step 5: Generate SEPARATE random_hash for hashmap (4 bytes)
         var randomBytes = Data(count: ResourceConstants.RANDOM_HASH_SIZE)
         _ = randomBytes.withUnsafeMutableBytes { buffer in
             SecRandomCopyBytes(kSecRandomDefault, ResourceConstants.RANDOM_HASH_SIZE, buffer.baseAddress!)
         }
         self.randomHash = randomBytes
 
-        // Step 3: Prepend random hash to data
-        var dataWithRandomHash = Data()
-        dataWithRandomHash.append(randomBytes)
-        dataWithRandomHash.append(compressionResult.data)
-        self.preparedData = dataWithRandomHash
-        self.transferSize = dataWithRandomHash.count
+        // Step 6: Calculate resource hash = SHA256(original_data + random_hash)
+        // Python: self.hash = RNS.Identity.full_hash(data + self.random_hash)
+        var hashInput = Data(data) // original uncompressed data
+        hashInput.append(randomBytes)
+        self.hash = Hashing.fullHash(hashInput)
 
-        // Step 4: Calculate resource hash (SHA256 of random_hash || data)
-        self.hash = Hashing.fullHash(dataWithRandomHash)
-
-        // Step 5: Generate hashmap for parts
+        // Step 7: Generate hashmap from ENCRYPTED data parts + random_hash
+        // Python: get_map_hash(encrypted_segment) = SHA256(encrypted_segment + random_hash)[:4]
         self.hashmap = ResourceHashmap.generateHashmap(
-            data: dataWithRandomHash,
-            partSize: partSize
+            data: encryptedData,
+            partSize: partSize,
+            randomHash: randomBytes
         )
 
-        // Calculate number of parts
-        self.numParts = (dataWithRandomHash.count + partSize - 1) / partSize
+        // Calculate number of parts from encrypted data size
+        self.numParts = (encryptedData.count + partSize - 1) / partSize
 
-        // Step 6: Transition to queued
+        // Step 8: Transition to queued
         try transitionState(to: .queued)
     }
 
@@ -483,24 +576,32 @@ public actor Resource {
             )
         }
 
-        // Calculate total segments needed
+        // Calculate hashmap segments needed for HMU tracking
+        // NOTE: hashmap segments != resource segments. Python's "total_segments"
+        // in advertisements refers to data segments for >1MB transfers.
+        // For normal transfers (under MAX_EFFICIENT_SIZE=1MB), it's always 1.
         let maxLength = ResourceHashmap.hashmapMaxLength(linkMDU: linkMDU)
-        let totalSegments = ResourceHashmap.segmentCount(
+        let hashmapSegments = ResourceHashmap.segmentCount(
             totalParts: numParts,
             maxLength: maxLength
         )
+        // Cache for HMU tracking (number of hashmap chunks, not resource segments)
+        self.totalHashmapSegments = hashmapSegments
 
-        // Create flags
+        // Create flags — "split" refers to resource segments, not hashmap segments
+        // Since we send all data in one resource transfer, split is always false
         var flags = ResourceFlags(
             encrypted: true,  // Always encrypted for link-based resources
             compressed: compressed,
-            split: totalSegments > 1
+            split: false
         )
         if isResponse {
             flags.insert(.isResponse)
         }
 
         // Use factory method to create advertisement with proper segmentation
+        // segment=1, totalSegments=1 because this is a single resource transfer
+        // (hashmap segments are handled transparently via HMU packets)
         return ResourceAdvertisement.create(
             transferSize: transferSize,
             dataSize: originalSize,
@@ -508,8 +609,8 @@ public actor Resource {
             resourceHash: resourceHash,
             randomHash: randomHash,
             hashmap: hashmap,
-            segment: segment,
-            totalSegments: totalSegments,
+            segment: 1,
+            totalSegments: 1,
             requestId: requestId,
             flags: flags,
             linkMDU: linkMDU
@@ -724,13 +825,13 @@ public actor Resource {
             throw ResourceError.partMissing(index: index)
         }
 
-        // Validate part hash if hashmap available
-        if let hashmap = hashmap {
+        // Validate part hash if hashmap and randomHash available
+        if let hashmap = hashmap, let randomHash = randomHash {
             let expectedHash = ResourceHashmap.getPartHash(
                 from: hashmap,
                 at: index
             )
-            let actualHash = ResourceHashmap.partHash(partData)
+            let actualHash = ResourceHashmap.partHash(partData, randomHash: randomHash)
 
             guard expectedHash == actualHash else {
                 throw ResourceError.hashmapMismatch(partIndex: index)
@@ -928,7 +1029,8 @@ public actor Resource {
             )
         }
 
-        // Step 4: Transition to complete
+        // Step 4: Store assembled data and transition to complete
+        self.assembledData = finalData
         try transitionState(to: .complete)
 
         return finalData

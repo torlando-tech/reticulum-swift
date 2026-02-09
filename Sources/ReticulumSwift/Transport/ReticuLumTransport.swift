@@ -124,6 +124,10 @@ public actor ReticuLumTransport {
     /// Pending link requests awaiting PROOF (indexed by link ID)
     private var pendingLinks: [Data: Link] = [:]
 
+    /// Destination link callbacks: destHash -> callback when link is established
+    /// Used by LXMF to set up resource handling on inbound links
+    private var destinationLinkCallbacks: [Data: @Sendable (Link) async -> Void] = [:]
+
     // MARK: - Packet Proof Properties
 
     /// Pending packet proof callbacks (key = full 32-byte packet hash).
@@ -429,6 +433,22 @@ public actor ReticuLumTransport {
         print("[LXMF_INBOUND] registerDestination: hash=\(hexFull)")
         print("[LXMF_INBOUND] destinations count=\(destinations.count)")
         logger.info("Registered destination: \(hexFull.prefix(8), privacy: .public)...")
+    }
+
+    /// Register a callback for when a link is established to a destination.
+    ///
+    /// This is used by LXMF to set up resource handling (strategy + callbacks)
+    /// on inbound links to delivery destinations.
+    ///
+    /// Reference: Python Transport.register_destination_link_callback()
+    ///
+    /// - Parameters:
+    ///   - destHash: Destination hash to register callback for
+    ///   - callback: Callback invoked when a link is established to this destination
+    public func registerDestinationLinkCallback(for destHash: Data, callback: @escaping @Sendable (Link) async -> Void) {
+        destinationLinkCallbacks[destHash] = callback
+        let hex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("[TRANSPORT] Registered link callback for destination \(hex)")
     }
 
     /// Unregister a local destination.
@@ -1183,9 +1203,8 @@ public actor ReticuLumTransport {
     }
 
     /// Get the link callback for a destination (if registered).
-    private func getDestinationLinkCallback(for destHash: Data) async -> ((Link) async -> Void)? {
-        // TODO: Add link callback registration to Destination
-        return nil
+    private func getDestinationLinkCallback(for destHash: Data) async -> (@Sendable (Link) async -> Void)? {
+        return destinationLinkCallbacks[destHash]
     }
 
     /// Handle PROOF for a pending link.
@@ -1261,9 +1280,41 @@ public actor ReticuLumTransport {
         }
 
         // FIRST: Check wire-format context for special link packets
-        // These are handled BEFORE decryption check because the context is in the wire format
+        // These are handled BEFORE decryption because the context is in the wire format
 
-        // LINKIDENTIFY (0xFB) - peer revealing identity
+        // KEEPALIVE (0xFA) - NOT encrypted per Python RNS Packet.pack()
+        // Python sends raw 0xFF (initiator) or 0xFE (responder) without encryption
+        if packet.context == LinkConstants.CONTEXT_KEEPALIVE {
+            print("[LINK_DATA] KEEPALIVE packet detected (wire-format context=0xFA), data=\(packet.data.count) bytes")
+            // Pass raw data directly - NOT encrypted
+            await link.processKeepalive(packet.data)
+            return
+        }
+
+        // RESOURCE packets (0x01-0x07) - handle based on type
+        // Python RNS Packet.pack(): context RESOURCE (0x01) is NOT link-encrypted
+        // Other resource contexts (0x02-0x07) ARE link-encrypted
+        if ResourcePacketContext.isResourceContext(packet.context) {
+            let ctxHex = String(format: "0x%02x", packet.context)
+            print("[LINK_DATA] Resource packet detected (context=\(ctxHex)), data=\(packet.data.count) bytes")
+
+            if packet.context == ResourcePacketContext.resource {
+                // Data parts (0x01): NOT link-encrypted, pass through directly
+                await link.handleResourcePacket(context: packet.context, data: packet.data)
+            } else {
+                // Control packets (0x02-0x07): link-encrypted, decrypt first
+                do {
+                    let plaintext = try await link.decrypt(packet.data)
+                    print("[LINK_DATA] Decrypted resource control packet: \(plaintext.count) bytes")
+                    await link.handleResourcePacket(context: packet.context, data: plaintext)
+                } catch {
+                    print("[LINK_DATA] Failed to decrypt resource packet: \(error)")
+                }
+            }
+            return
+        }
+
+        // LINKIDENTIFY (0xFB) - peer revealing identity (encrypted)
         if packet.context == LinkConstants.CONTEXT_LINKIDENTIFY {
             print("[LINK_DATA] LINKIDENTIFY packet detected (wire-format context=0xFB)")
             do {
@@ -1277,14 +1328,24 @@ public actor ReticuLumTransport {
             return
         }
 
-        // LINKCLOSE (0xFC) - peer closing the link
+        // LINKCLOSE (0xFC) - peer closing the link (encrypted)
+        // Python sends encrypted(link_id) and validates plaintext == link_id on receive
         if packet.context == LinkConstants.CONTEXT_LINKCLOSE {
             print("[LINK_DATA] LINKCLOSE packet detected (wire-format context=0xFC)")
-            // Remote peer is closing the link - close our side too
-            await link.close(reason: .destinationClosed)
-            activeLinks.removeValue(forKey: packet.destination)
-            let hexPrefix = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
-            print("[LINK_DATA] Link \(hexPrefix) closed by remote peer")
+            do {
+                let plaintext = try await link.decrypt(packet.data)
+                let expectedLinkId = await link.linkId
+                if plaintext == expectedLinkId {
+                    await link.close(reason: .destinationClosed)
+                    activeLinks.removeValue(forKey: packet.destination)
+                    let hexPrefix = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("[LINK_DATA] Link \(hexPrefix) closed by remote peer (verified)")
+                } else {
+                    print("[LINK_DATA] LINKCLOSE payload mismatch, ignoring")
+                }
+            } catch {
+                print("[LINK_DATA] Failed to decrypt LINKCLOSE: \(error)")
+            }
             return
         }
 
@@ -1314,57 +1375,13 @@ public actor ReticuLumTransport {
             return
         }
 
-        // Decrypt and process
+        // Decrypt and process (encrypted link data)
+        // Resource packets (0x01-0x07) are already handled above by wire context.
+        // Everything here is regular encrypted link data (context 0x00 = NONE).
         do {
             let plaintext = try await link.decrypt(packet.data)
-            let firstByteHex = plaintext.isEmpty ? "empty" : String(format: "0x%02x", plaintext[plaintext.startIndex])
             let hexDump = plaintext.prefix(32).map { String(format: "%02x", $0) }.joined()
-            print("[LINK_DATA] Decrypted \(plaintext.count) bytes, firstByte=\(firstByteHex), data=\(hexDump)")
-
-            // Check for keep-alive (1 byte)
-            if plaintext.count == 1 {
-                print("[LINK_DATA] Routing to keepalive handler")
-                await link.processKeepalive(plaintext)
-                return
-            }
-
-            // Check for resource packet (context byte 0x01-0x07 in payload)
-            // Resource packets have specific structure: [context:1][...resource data...]
-            // IMPORTANT: Only route to resource handler if the packet structure is valid
-            // to avoid misrouting LXMF messages whose destination hash starts with 0x01-0x07
-            if plaintext.count >= 1 {
-                let firstByte = plaintext[plaintext.startIndex]
-                if ResourcePacketContext.isResourceContext(firstByte) {
-                    // Additional validation: resource packets have specific minimum sizes
-                    // - Advertisement (0x01): >50 bytes (msgpack structure)
-                    // - Request (0x02): >20 bytes
-                    // - Data (0x03): >10 bytes
-                    // LXMF messages are always >= 96 bytes (16+16+64 minimum)
-                    //
-                    // Key insight: Resource advertisements have a msgpack structure that
-                    // differs from LXMF's [dest_hash:16][source_hash:16][signature:64]
-                    // We can validate by checking if bytes 1-16 look like a resource structure
-                    // rather than a random hash byte sequence.
-                    //
-                    // For now, use a heuristic: if packet is EXACTLY the expected resource
-                    // packet size range, treat as resource. Otherwise, treat as LXMF.
-                    // Resource packets are typically smaller and have msgpack encoding.
-                    //
-                    // SAFER: Check if byte 17 (would be source_hash[0] in LXMF) also looks
-                    // like it could continue a msgpack structure or if the whole packet
-                    // has the LXMF signature at bytes 32-95.
-                    let isLikelyLXMF = plaintext.count >= 96 && isValidLXMFStructure(plaintext)
-
-                    if !isLikelyLXMF {
-                        // Resource packet - route to link resource handler
-                        print("[LINK_DATA] Routing to resource handler (context=\(firstByteHex))")
-                        await link.handleResourcePacket(plaintext)
-                        return
-                    } else {
-                        print("[LINK_DATA] First byte matches resource context but structure looks like LXMF, treating as LXMF")
-                    }
-                }
-            }
+            print("[LINK_DATA] Decrypted \(plaintext.count) bytes, data=\(hexDump)")
 
             // Regular data packet - deliver via callback
             // For LXMF direct delivery, the plaintext is a complete LXMF message:

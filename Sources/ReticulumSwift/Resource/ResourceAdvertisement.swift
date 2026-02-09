@@ -167,7 +167,7 @@ extension ResourceAdvertisement {
     /// - Returns: MessagePack-encoded advertisement data
     /// - Throws: EncodingError if encoding fails
     public func pack() throws -> Data {
-        var map: [MessagePackValue: MessagePackValue] = [
+        let map: [MessagePackValue: MessagePackValue] = [
             .string("t"): .int(Int64(transferSize)),
             .string("d"): .int(Int64(dataSize)),
             .string("n"): .int(Int64(numParts)),
@@ -176,12 +176,12 @@ extension ResourceAdvertisement {
             .string("o"): .binary(originalHash),
             .string("i"): .int(Int64(segmentIndex)),
             .string("l"): .int(Int64(totalSegments)),
+            // MUST always include "q" key — Python's ResourceAdvertisement.unpack()
+            // unconditionally accesses dictionary["q"], so omitting it causes KeyError
+            .string("q"): requestId.map { MessagePackValue.binary($0) } ?? .null,
             .string("f"): .uint(UInt64(flags.rawValue)),
             .string("m"): .binary(hashmapChunk)
         ]
-        if let reqId = requestId {
-            map[.string("q")] = .binary(reqId)
-        }
         return packMsgPack(.map(map))
     }
 

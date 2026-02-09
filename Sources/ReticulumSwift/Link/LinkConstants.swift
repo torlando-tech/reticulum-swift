@@ -56,6 +56,16 @@ public enum LinkConstants {
 
     // MARK: - Size Constants
 
+    /// Link MDU — max plaintext payload for link-encrypted packets.
+    ///
+    /// Python: `floor((MTU - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD) / AES128_BLOCKSIZE) * AES128_BLOCKSIZE - 1`
+    /// = `floor((500 - 1 - 19 - 48) / 16) * 16 - 1 = 431`
+    ///
+    /// This is smaller than `Reticulum.MDU` (464) because link-encrypted packets
+    /// have additional overhead from AES-CBC IV (16B) + HMAC (32B) + PKCS7 padding.
+    /// Used for hashmap segmentation (advertisements/HMU must fit in one encrypted packet).
+    public static let LINK_MDU: Int = 431
+
     /// Size of elliptic curve public keys in bytes.
     ///
     /// This is 64 bytes total: 32 bytes for the encryption public key
