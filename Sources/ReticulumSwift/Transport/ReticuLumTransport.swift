@@ -17,6 +17,20 @@ import Foundation
 import OSLog
 import Security
 
+/// File-based debug logger for transport packet diagnostics
+private func transportDebugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("columba_transport_recv.log")
+    if let handle = try? FileHandle(forWritingTo: url) {
+        handle.seekToEndOfFile()
+        handle.write(Data(line.utf8))
+        handle.closeFile()
+    } else {
+        try? Data(line.utf8).write(to: url)
+    }
+}
+
 // MARK: - Interface Protocol
 
 /// Protocol for network interfaces that can send and receive packets.
@@ -681,6 +695,7 @@ public actor ReticuLumTransport {
     private func sendRawBytes(_ bytes: Data) async throws {
         let bytesHex = bytes.prefix(20).map { String(format: "%02x", $0) }.joined()
         print("[TRANSPORT] sendRawBytes called with \(bytes.count) bytes: \(bytesHex)...")
+        logger.error("[SEND_RAW] \(bytes.count) bytes, header: \(bytesHex)")
         var successCount = 0
         var lastError: Error?
 
@@ -1059,6 +1074,7 @@ public actor ReticuLumTransport {
 
         case .linkRequest:
             // LINKREQUEST goes to registered destination (if we're the target)
+            logger.error("[RECV] LINKREQUEST packet from \(interfaceId)")
             await handleLinkRequest(packet, from: interfaceId)
 
         case .proof:
@@ -1073,6 +1089,7 @@ public actor ReticuLumTransport {
             print("[PROOF_RECV] pendingLinks count=\(pendingLinks.count), keys=\(pendingKeysHex)")
             print("[PROOF_RECV] activeLinks count=\(activeLinks.count), keys=\(activeKeysHex)")
             print("[PROOF_RECV] context=0x\(String(format: "%02x", packet.context)), dataLen=\(packet.data.count)")
+            logger.error("[RECV] PROOF dest=\(proofDestHex), ctx=0x\(String(format: "%02x", packet.context)), dataLen=\(packet.data.count)")
 
             if let link = pendingLinks[destHash] {
                 print("[PROOF_RECV] MATCH! Found pending link for PROOF, processing...")
@@ -1091,9 +1108,15 @@ public actor ReticuLumTransport {
             let dataDestHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             let dataFullHex = destHash.map { String(format: "%02x", $0) }.joined()
             print("[LXMF_INBOUND] DATA packet received: destType=\(packet.header.destinationType), dest=\(dataDestHex), dataLen=\(packet.data.count)")
+            logger.error("[RECV] DATA packet: destType=\(String(describing: packet.header.destinationType)), dest=\(dataDestHex), ctx=0x\(String(format: "%02x", packet.context)), dataLen=\(packet.data.count)")
+            transportDebugLog("DISPATCH DATA: destType=\(packet.header.destinationType) dest=\(dataDestHex) ctx=0x\(String(format: "%02x", packet.context)) data=\(packet.data.count)B")
             if packet.header.destinationType == .link {
                 // Link DATA packet - route to link
+                let activeKeysHex = activeLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
+                let hasLink = activeLinks[packet.destination] != nil
+                transportDebugLog("  LINK DATA: hasActiveLink=\(hasLink) activeLinks=\(activeKeysHex) isResource=\(ResourcePacketContext.isResourceContext(packet.context))")
                 print("[LXMF_INBOUND] Routing to handleLinkData()")
+                logger.error("[RECV] Routing to handleLinkData()")
                 await handleLinkData(packet)
             } else {
                 // Regular data - deliver to local destination
@@ -1272,10 +1295,12 @@ public actor ReticuLumTransport {
         let linkHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
         let activeKeysList = activeLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
         print("[LINK_DATA] handleLinkData called for dest=\(linkHex), context=0x\(String(format: "%02x", packet.context)), activeLinks=\(activeKeysList)")
+        logger.error("[LINK_DATA] dest=\(linkHex), ctx=0x\(String(format: "%02x", packet.context)), activeLinks=\(activeKeysList), dataLen=\(packet.data.count)")
 
         guard let link = activeLinks[packet.destination] else {
             // Unknown link - ignore
             print("[LINK_DATA] No active link found for \(linkHex), ignoring packet")
+            logger.error("[LINK_DATA] No active link for \(linkHex)")
             return
         }
 
@@ -1371,6 +1396,56 @@ public actor ReticuLumTransport {
                 }
             } else {
                 print("[LINK_DATA] Ignoring LRRTT (initiator=\(isInitiator), state=\(linkState))")
+            }
+            return
+        }
+
+        // REQUEST (0x09) - incoming request from peer (encrypted)
+        // Python: link.decrypt(packet.data), unpack msgpack([timestamp, pathHash, data])
+        if packet.context == RequestPacketContext.request {
+            print("[LINK_DATA] REQUEST packet detected (context=0x09)")
+            logger.error("[LINK_DATA] REQUEST (0x09) detected, dataLen=\(packet.data.count)")
+            do {
+                let plaintext = try await link.decrypt(packet.data)
+                print("[LINK_DATA] Decrypted REQUEST: \(plaintext.count) bytes")
+                logger.error("[LINK_DATA] Decrypted REQUEST: \(plaintext.count) bytes")
+                // TODO: Route to request handler when we implement server-side request handling
+                // For now, log and ignore (we're typically the client, not the server)
+            } catch {
+                print("[LINK_DATA] Failed to decrypt REQUEST: \(error)")
+                logger.error("[LINK_DATA] Failed to decrypt REQUEST: \(error)")
+            }
+            return
+        }
+
+        // RESPONSE (0x0A) - response to our request (encrypted)
+        // Python: link.decrypt(packet.data), unpack msgpack([requestId, responseData])
+        if packet.context == RequestPacketContext.response {
+            print("[LINK_DATA] RESPONSE packet detected (context=0x0A)")
+            logger.error("[LINK_DATA] RESPONSE (0x0A) detected, dataLen=\(packet.data.count)")
+            do {
+                let plaintext = try await link.decrypt(packet.data)
+                print("[LINK_DATA] Decrypted RESPONSE: \(plaintext.count) bytes")
+                logger.error("[LINK_DATA] Decrypted RESPONSE: \(plaintext.count) bytes")
+
+                // Unpack msgpack([requestId, responseData])
+                // responseData can be ANY msgpack type (array, binary, map, etc.)
+                // Re-pack elements[1] back to bytes for the receipt handler
+                if let value = try? unpackMsgPack(plaintext),
+                   case .array(let elements) = value,
+                   elements.count >= 2,
+                   case .binary(let requestId) = elements[0] {
+                    let responseData = packMsgPack(elements[1])
+                    print("[LINK_DATA] RESPONSE for request \(requestId.prefix(8).map { String(format: "%02x", $0) }.joined()), data=\(responseData.count) bytes")
+                    logger.error("[LINK_DATA] RESPONSE matched request \(requestId.prefix(8).map { String(format: "%02x", $0) }.joined()), responseData=\(responseData.count) bytes")
+                    await link.handleRequestResponse(requestId: requestId, data: responseData)
+                } else {
+                    print("[LINK_DATA] Failed to parse RESPONSE msgpack")
+                    logger.error("[LINK_DATA] Failed to parse RESPONSE msgpack from plaintext \(plaintext.count) bytes")
+                }
+            } catch {
+                print("[LINK_DATA] Failed to decrypt RESPONSE: \(error)")
+                logger.error("[LINK_DATA] Failed to decrypt RESPONSE: \(error)")
             }
             return
         }
@@ -1918,6 +1993,9 @@ extension ReticuLumTransport {
         print("[PACKET_RECV] \(data.count) bytes from interface \(interfaceId)")
         print("[PACKET_RECV] Raw hex: \(hexDump)...")
 
+        // File-based log for ALL incoming packets
+        transportDebugLog("RECV \(data.count)B from \(interfaceId), hex=\(hexDump)")
+
         // Parse the data into a packet
         do {
             let packet = try Packet(from: data)
@@ -1926,6 +2004,10 @@ extension ReticuLumTransport {
             let contextStr = packet.header.hasContext ? String(format: "0x%02x", packet.context) : "none"
             print("[PACKET_RECV] Parsed: type=\(packet.header.packetType), destType=\(packet.header.destinationType)")
             print("[PACKET_RECV] dest=\(destHex), context=\(contextStr), dataLen=\(packet.data.count)")
+
+            // File-based log with full packet details
+            let activeKeysHex = activeLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
+            transportDebugLog("  PARSED: type=\(packet.header.packetType) destType=\(packet.header.destinationType) dest=\(destHex) ctx=0x\(String(format: "%02x", packet.context)) data=\(packet.data.count)B activeLinks=\(activeKeysHex)")
 
             // Log pending links status for every packet
             let pendingKeysHex = pendingLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
@@ -1936,6 +2018,7 @@ extension ReticuLumTransport {
                 await self.receive(packet: packet, from: interfaceId)
             }
         } catch {
+            transportDebugLog("  PARSE ERROR: \(error)")
             print("[PACKET_RECV] ERROR parsing packet: \(error)")
             logger.error("Failed to parse packet from interface \(interfaceId, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }

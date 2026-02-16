@@ -17,11 +17,11 @@ import Foundation
 /// These context bytes identify request and response packets
 /// within the link data stream.
 public enum RequestPacketContext {
-    /// Request packet context byte
-    public static let request: UInt8 = 0x08
+    /// Request packet context byte (matches Python RNS Packet.REQUEST = 0x09)
+    public static let request: UInt8 = 0x09
 
-    /// Response packet context byte
-    public static let response: UInt8 = 0x09
+    /// Response packet context byte (matches Python RNS Packet.RESPONSE = 0x0A)
+    public static let response: UInt8 = 0x0A
 }
 
 // MARK: - RequestReceipt

@@ -14,6 +14,20 @@ import os.log
 
 private let linkLogger = Logger(subsystem: "com.columba.app", category: "Link")
 
+/// File-based debug logger for resource diagnostics
+private func resourceDebugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("columba_resource_debug.log")
+    if let handle = try? FileHandle(forWritingTo: url) {
+        handle.seekToEndOfFile()
+        handle.write(Data(line.utf8))
+        handle.closeFile()
+    } else {
+        try? Data(line.utf8).write(to: url)
+    }
+}
+
 // MARK: - Link
 
 /// Actor-based Reticulum link for encrypted peer-to-peer communication.
@@ -1056,6 +1070,7 @@ public actor Link {
     ///   - context: Resource packet context (0x01-0x07) from wire packet
     ///   - data: Packet payload (no context byte)
     public func handleResourcePacket(context: UInt8, data: Data) async {
+        resourceDebugLog("RESOURCE packet: ctx=0x\(String(format: "%02x", context)), data=\(data.count)B")
         linkLogger.info("[RESOURCE] Received resource packet: context=0x\(String(format: "%02x", context)), data=\(data.count) bytes")
         print("[RESOURCE_RECV] Resource packet: context=0x\(String(format: "%02x", context)), data=\(data.count) bytes")
 
@@ -1094,22 +1109,33 @@ public actor Link {
 
         do {
             let advertisement = try ResourceAdvertisement.unpack(Data(advData))
+            let advReqId = advertisement.requestId?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
+            resourceDebugLog("ADV: size=\(advertisement.dataSize), parts=\(advertisement.numParts), reqId=\(advReqId), segments=\(advertisement.totalSegments)")
 
             // Create inbound resource
             let resource = Resource(advertisement: advertisement, link: self)
 
             // Check acceptance strategy
+            // Auto-accept resources with requestId matching a pending request (response resources)
+            // This matches Python Link.py behavior where response resources bypass strategy
             let shouldAccept: Bool
-            switch resourceStrategy {
-            case .acceptNone:
-                shouldAccept = false
-            case .acceptAll:
+            if let reqId = advertisement.requestId,
+               pendingRequests.contains(where: { $0.requestId == reqId }) {
+                resourceDebugLog("ADV: Auto-accepting response resource for pending request \(reqId.prefix(8).map { String(format: "%02x", $0) }.joined())")
+                print("[RESOURCE_RECV] Auto-accepting response resource for pending request \(reqId.prefix(8).map { String(format: "%02x", $0) }.joined())")
                 shouldAccept = true
-            case .acceptApp:
-                if let callbacks = resourceCallbacks {
-                    shouldAccept = await callbacks.resourceAdvertised(resource)
-                } else {
+            } else {
+                switch resourceStrategy {
+                case .acceptNone:
                     shouldAccept = false
+                case .acceptAll:
+                    shouldAccept = true
+                case .acceptApp:
+                    if let callbacks = resourceCallbacks {
+                        shouldAccept = await callbacks.resourceAdvertised(resource)
+                    } else {
+                        shouldAccept = false
+                    }
                 }
             }
 
@@ -1118,7 +1144,8 @@ public actor Link {
                 let hash = await resource.hash ?? Data()
                 inboundResources[hash] = resource
                 let hashHex = hash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("[RESOURCE_RECV] Accepted resource \(hashHex), size=\(advertisement.dataSize)")
+                resourceDebugLog("ACCEPT: resource \(hashHex), size=\(advertisement.dataSize), parts=\(advertisement.numParts)")
+                linkLogger.error("[RESOURCE_RECV] Accepted resource \(hashHex), size=\(advertisement.dataSize), parts=\(advertisement.numParts)")
 
                 // Notify callback
                 if let callbacks = resourceCallbacks {
@@ -1133,14 +1160,26 @@ public actor Link {
                     try await self.sendResourcePacket(packetData)
                 }
 
+                // Set decrypt callback for assembled resource data
+                // Capture the token directly to avoid actor isolation issues
+                let linkToken = self.token
+                await resource.setDecryptCallback { (ciphertext: Data) in
+                    guard let token = linkToken else {
+                        throw LinkError.encryptionNotReady
+                    }
+                    return try token.decrypt(ciphertext)
+                }
+
                 // Accept the resource (starts requesting parts)
                 try await resource.accept()
             } else {
+                resourceDebugLog("REJECT: resource rejected (strategy=\(resourceStrategy))")
                 print("[RESOURCE_RECV] Rejected resource (strategy=\(resourceStrategy))")
                 // Reject the resource
                 try await resource.reject()
             }
         } catch {
+            resourceDebugLog("ADV ERROR: Failed to parse: \(error)")
             print("[RESOURCE_RECV] Failed to parse advertisement: \(error)")
         }
     }
@@ -1238,12 +1277,11 @@ public actor Link {
     /// Handle resource data packet.
     ///
     /// Called when receiving a data part from the peer for an inbound resource.
-    /// Data format: 2-byte big-endian part index + part data
+    /// Parts are identified by content hash SHA256(partData + randomHash)[:4].
     ///
-    /// - Parameter data: Data packet data (index + part data)
+    /// - Parameter data: Part data (no index prefix — identified by content hash)
     private func handleResourceData(_ data: Data) async {
-        // Need at least 2 bytes for index
-        guard data.count > 2 else { return }
+        guard data.count > 0 else { return }
 
         // Find the inbound resource that's currently transferring
         // (there should typically be only one active at a time per link)
@@ -1253,10 +1291,39 @@ public actor Link {
 
             do {
                 let complete = try await resource.handlePartPacket(data)
+                let total = await resource.numParts
+                let received = await resource.receivedCount
+                resourceDebugLog("PART: \(received)/\(total), complete=\(complete), data=\(data.count)B")
+                linkLogger.error("[RESOURCE_DATA] Part received (of \(total)), complete=\(complete)")
+
                 if complete {
                     // Resource transfer complete - assemble and send proof
-                    _ = try await resource.assemble()
+                    let assembledData = try await resource.assemble()
+                    resourceDebugLog("COMPLETE: assembled \(assembledData.count)B, sending proof")
+                    linkLogger.error("[RESOURCE_DATA] Assembled \(assembledData.count) bytes, sending proof")
                     try await resource.sendProof()
+
+                    // If this resource is a response to a pending request,
+                    // deliver the assembled data as the request response.
+                    // Python: packed_response = umsgpack.packb([request_id, response])
+                    // The assembled data IS this msgpack blob.
+                    if let reqId = await resource.requestId {
+                        let reqHex = reqId.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        resourceDebugLog("DELIVER: response resource for request \(reqHex), data=\(assembledData.count)B")
+                        linkLogger.error("[RESOURCE_DATA] Response resource complete for request \(reqHex), data=\(assembledData.count) bytes")
+                        // Unpack msgpack([requestId, responseData]) and deliver
+                        if let value = try? unpackMsgPack(assembledData),
+                           case .array(let elements) = value,
+                           elements.count >= 2,
+                           case .binary(let responseRequestId) = elements[0] {
+                            let responseData = packMsgPack(elements[1])
+                            resourceDebugLog("DELIVER: unpacked OK, responseData=\(responseData.count)B")
+                            await handleRequestResponse(requestId: responseRequestId, data: responseData)
+                        } else {
+                            resourceDebugLog("DELIVER: FAILED to unpack assembled data")
+                            linkLogger.error("[RESOURCE_DATA] Failed to unpack assembled data as msgpack([requestId, response])")
+                        }
+                    }
 
                     // Notify callback
                     await resourceCallbacks?.resourceConcluded(resource)
@@ -1266,7 +1333,7 @@ public actor Link {
                 }
                 return
             } catch {
-                // Part handling failed - resource may retry or fail
+                linkLogger.error("[RESOURCE_DATA] Part handling error: \(error)")
             }
         }
     }

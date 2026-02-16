@@ -109,6 +109,9 @@ public actor Resource {
     /// Send callback for encrypted packet transmission
     private var sendCallback: ((Data) async throws -> Void)?
 
+    /// Decrypt callback for link decryption of assembled resource data
+    private var decryptCallback: ((Data) throws -> Data)?
+
     // MARK: - Window Management
 
     /// Window manager for flow control
@@ -128,6 +131,10 @@ public actor Resource {
 
     /// Total hashmap segments needed
     public private(set) var totalHashmapSegments: Int = 1
+
+    /// Whether we're waiting for a hashmap update (HMU) from the sender.
+    /// When true, no further RESOURCE_REQ should be sent until HMU arrives.
+    public private(set) var waitingForHMU: Bool = false
 
     // MARK: - Initialization (Outbound)
 
@@ -252,6 +259,14 @@ public actor Resource {
     /// - Parameter callback: Async closure that encrypts and sends data
     public func setSendCallback(_ callback: @escaping (Data) async throws -> Void) {
         self.sendCallback = callback
+    }
+
+    /// Set the callback for link-decrypting assembled resource data.
+    ///
+    /// Called by the receiver to decrypt the assembled encrypted parts
+    /// before stripping the random prefix and decompressing.
+    public func setDecryptCallback(_ callback: @escaping (Data) throws -> Data) {
+        self.decryptCallback = callback
     }
 
     // MARK: - Outbound Transfer
@@ -434,12 +449,17 @@ public actor Resource {
     /// hashmap segments for resources that exceed HASHMAP_MAX_LEN parts.
     ///
     /// - Parameter segment: Additional hashmap segment data
-    public func appendHashmapSegment(_ segment: Data) {
+    public func appendHashmapSegment(_ segment: Data) async {
         if var existing = hashmap {
             existing.append(segment)
             hashmap = existing
         } else {
             hashmap = segment
+        }
+        // Clear HMU wait flag and resume requesting parts
+        waitingForHMU = false
+        if state == .transferring {
+            try? await requestNextParts()
         }
     }
 
@@ -700,8 +720,15 @@ public actor Resource {
             )
         }
 
+        // Don't send requests while waiting for a hashmap update
+        guard !waitingForHMU else { return }
+
         guard let send = sendCallback else {
             throw ResourceError.transferFailed(reason: "No send callback set")
+        }
+
+        guard let resHash = hash else {
+            throw ResourceError.transferFailed(reason: "No resource hash available for request")
         }
 
         // Get indices of parts to request
@@ -712,12 +739,63 @@ public actor Resource {
             return
         }
 
-        // Build request data (4-byte hashes)
-        var requestData = Data()
+        // Determine hashmap coverage: how many parts have hashmap entries
+        let hashmapCoverage = (hashmap?.count ?? 0) / ResourceConstants.MAPHASH_LEN
+
+        // Separate indices into those we have hashes for and those beyond hashmap
+        var requestableIndices: [Int] = []
+        var hashmapExhausted = false
         for index in indices {
-            let partHash = try getPartHash(at: index)
-            requestData.append(partHash)
+            if index < hashmapCoverage {
+                requestableIndices.append(index)
+            } else {
+                hashmapExhausted = true
+            }
         }
+
+        // Build request data:
+        // Python Resource.request_next():
+        //   flag = 0x00 (normal) or 0xFF (hashmap exhausted)
+        //   If exhausted: flag(0xFF) + last_map_hash(4) + resource_hash(32) + part_hashes
+        //   If normal: flag(0x00) + resource_hash(32) + part_hashes
+        var requestData = Data()
+
+        // Track how many parts we're actually requesting (for window outstanding count).
+        // Only count indices we actually send hashes for — NOT indices beyond hashmap.
+        let actualRequestCount: Int
+
+        if hashmapExhausted {
+            // Hashmap exhausted: need HMU from sender
+            // last_map_hash = hash of the last part we know about in the hashmap
+            let lastKnownIndex = hashmapCoverage - 1
+            let lastMapHash: Data
+            if lastKnownIndex >= 0 {
+                lastMapHash = (try? getPartHash(at: lastKnownIndex)) ?? Data(repeating: 0, count: ResourceConstants.MAPHASH_LEN)
+            } else {
+                lastMapHash = Data(repeating: 0, count: ResourceConstants.MAPHASH_LEN)
+            }
+            requestData.append(0xFF) // HASHMAP_IS_EXHAUSTED
+            requestData.append(lastMapHash) // 4-byte last map hash
+            requestData.append(resHash) // 32-byte resource hash
+            for index in requestableIndices {
+                let partHash = try getPartHash(at: index)
+                requestData.append(partHash)
+            }
+            actualRequestCount = requestableIndices.count
+            waitingForHMU = true
+        } else {
+            // Normal request: all indices have hashmap entries
+            requestData.append(0x00) // HASHMAP_IS_NOT_EXHAUSTED
+            requestData.append(resHash)
+            for index in requestableIndices {
+                let partHash = try getPartHash(at: index)
+                requestData.append(partHash)
+            }
+            actualRequestCount = requestableIndices.count
+        }
+
+        // Mark only actually-sent parts as outstanding (not beyond-hashmap indices)
+        windowManager.markRequested(count: actualRequestCount)
 
         // Frame with context byte
         var packet = Data()
@@ -742,24 +820,47 @@ public actor Resource {
     /// - Returns: true if transfer is complete (all parts received)
     /// - Throws: ResourceError if parsing or validation fails
     public func handlePartPacket(_ data: Data) async throws -> Bool {
-        guard data.count >= 2 else {
+        guard data.count > 0 else {
             throw ResourceError.transferFailed(
-                reason: "Part packet too short for index (need 2 bytes, got \(data.count))"
+                reason: "Part packet empty"
             )
         }
 
-        // Parse index (2 bytes big-endian)
-        let indexBE = data.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt16.self) }
-        let index = Int(UInt16(bigEndian: indexBE))
+        // Python identifies parts by content hash, NOT by index prefix.
+        // Compute SHA256(partData + randomHash)[:4] and find matching entry in hashmap.
+        guard let rHash = randomHash, let hmap = hashmap else {
+            throw ResourceError.transferFailed(
+                reason: "No randomHash or hashmap available for part identification"
+            )
+        }
 
-        // Extract part data
-        let partData = data.dropFirst(2)
+        let partData = Data(data)
+        let contentHash = ResourceHashmap.partHash(partData, randomHash: rHash)
+
+        // Search hashmap for matching 4-byte hash
+        let hashLen = ResourceConstants.MAPHASH_LEN
+        var index: Int? = nil
+        for i in 0..<numParts {
+            let start = i * hashLen
+            let end = start + hashLen
+            guard end <= hmap.count else { break }
+            if hmap[start..<end] == contentHash {
+                index = i
+                break
+            }
+        }
+
+        guard let foundIndex = index else {
+            throw ResourceError.transferFailed(
+                reason: "Part hash not found in hashmap"
+            )
+        }
 
         // Store part (validates hash)
-        try receivePart(Data(partData), at: index)
+        try receivePart(partData, at: foundIndex)
 
-        // Check if complete
-        if isComplete {
+        // Check if all parts received (don't use isComplete which has a state guard)
+        if partsReceived.allSatisfy({ $0 }) {
             // All parts received, transition to assembling
             try transitionState(to: .assembling)
             return true
@@ -851,9 +952,10 @@ public actor Resource {
             // Calculate transfer rate and adjust window
             let rate = calculateTransferRate()
             windowManager.onAllPartsReceived(transferRate: rate)
-
-            // Transition to awaiting proof (if outbound) or complete (if inbound)
-            try transitionState(to: .awaitingProof)
+            // State transition is handled by the caller (handlePartPacket for inbound,
+            // handleResourceProof for outbound). Don't transition here because
+            // inbound goes transferring→assembling→complete while outbound goes
+            // transferring→awaitingProof→complete.
         }
     }
 
@@ -876,15 +978,14 @@ public actor Resource {
     /// Uses window manager to determine which parts should be requested
     /// based on current window size and consecutive completion height.
     ///
+    /// NOTE: Does NOT call markRequested — the caller (requestNextParts)
+    /// must mark only the indices that are actually sent in the request,
+    /// since hashmap exhaustion may reduce the set of requestable indices.
+    ///
     /// - Returns: Array of part indices to request
     public func getNextPartIndices() -> [Int] {
         lastRequestTime = Date()
-        let indices = windowManager.getRequestRange(parts: partsReceived)
-
-        // Mark as requested for outstanding count
-        windowManager.markRequested(count: indices.count)
-
-        return indices
+        return windowManager.getRequestRange(parts: partsReceived)
     }
 
     /// Handle timeout for outstanding parts.
@@ -1006,15 +1107,26 @@ public actor Resource {
             )
         }
 
-        // Step 2: Remove random hash prefix (4 bytes)
-        guard assembled.count >= ResourceConstants.RANDOM_HASH_SIZE else {
+        // Step 2: Link-decrypt the assembled data
+        // Python: if self.encrypted: data = self.link.decrypt(stream)
+        // Resource parts are transmitted encrypted; the link does NOT decrypt
+        // resource data packets (context 0x01 is passthrough).
+        let decrypted: Data
+        if let decrypt = decryptCallback {
+            decrypted = try decrypt(assembled)
+        } else {
+            decrypted = assembled
+        }
+
+        // Step 3: Remove random hash prefix (4 bytes)
+        guard decrypted.count >= ResourceConstants.RANDOM_HASH_SIZE else {
             throw ResourceError.transferFailed(
-                reason: "Assembled data too short to contain random hash"
+                reason: "Decrypted data too short to contain random hash prefix"
             )
         }
-        let dataWithoutRandomHash = assembled.dropFirst(ResourceConstants.RANDOM_HASH_SIZE)
+        let dataWithoutRandomHash = decrypted.dropFirst(ResourceConstants.RANDOM_HASH_SIZE)
 
-        // Step 3: Decompress if needed
+        // Step 4: Decompress if needed
         let finalData: Data
         if compressed {
             finalData = try ResourceCompression.decompress(Data(dataWithoutRandomHash))

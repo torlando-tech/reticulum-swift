@@ -187,6 +187,8 @@ public enum ResourceState: Sendable, Equatable, CustomStringConvertible {
             return true
         case (.transferring, .awaitingProof):
             return true
+        case (.transferring, .assembling):
+            return true
         case (.transferring, .failed):
             return true
         case (.awaitingProof, .complete):
