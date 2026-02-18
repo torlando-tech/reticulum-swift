@@ -163,6 +163,25 @@ public actor ReticuLumTransport {
     /// Maximum packets to queue per destination
     private let maxPendingPacketsPerDestination: Int = 10
 
+    /// PLAIN destination for receiving path requests from other nodes
+    private var pathRequestDestination: Destination?
+
+    /// Dedup cache for path request tags (matching Python max_pr_tags=32000)
+    private var discoveryPrTags: [Data] = []
+    private let maxPrTags = 32000
+
+    /// Pending discovery path requests (for forwarding, keyed by dest hash)
+    private var discoveryPathRequests: [Data: (timeout: Date, requestingInterfaceId: String?)] = [:]
+
+    /// Path request constants matching Python Transport.py
+    private static let PATH_REQUEST_GRACE: TimeInterval = 0.4
+    private static let PATH_REQUEST_TIMEOUT: TimeInterval = 15.0
+
+    /// Interface ID that last delivered an inbound packet (set before dispatch).
+    /// Used by handlePathRequest to know which interface to avoid when forwarding.
+    /// Safe because this actor processes packets sequentially.
+    private var lastReceivedInterfaceId: String?
+
     // MARK: - Initialization
 
     /// Create a new transport with optional dependency injection.
@@ -1105,6 +1124,7 @@ public actor ReticuLumTransport {
             }
 
         case .data:
+            lastReceivedInterfaceId = interfaceId  // Track for path request handler
             let dataDestHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             let dataFullHex = destHash.map { String(format: "%02x", $0) }.joined()
             print("[LXMF_INBOUND] DATA packet received: destType=\(packet.header.destinationType), dest=\(dataDestHex), dataLen=\(packet.data.count)")
@@ -1732,7 +1752,7 @@ public actor ReticuLumTransport {
 
             let newHeader = PacketHeader(
                 headerType: .header2,
-                hasContext: action.blockRebroadcasts,
+                hasContext: action.packet.header.hasContext,  // Preserve original (ratchet flag)
                 hasIFAC: false,
                 transportType: .transport,
                 destinationType: action.packet.header.destinationType,
@@ -1744,7 +1764,7 @@ public actor ReticuLumTransport {
                 header: newHeader,
                 destination: action.packet.destination,
                 transportAddress: transportId,
-                context: action.blockRebroadcasts ? 0x01 : 0x00, // PATH_RESPONSE context
+                context: action.blockRebroadcasts ? PacketContext.PATH_RESPONSE : PacketContext.NONE,
                 data: action.packet.data
             )
 
@@ -1783,6 +1803,12 @@ public actor ReticuLumTransport {
         }
     }
 
+    /// Clean up expired discovery path requests.
+    private func cleanupDiscoveryPathRequests() {
+        let now = Date()
+        discoveryPathRequests = discoveryPathRequests.filter { $0.value.timeout > now }
+    }
+
     /// Start the periodic announce retransmission task.
     ///
     /// Called when transport is set up. Runs every ~1 second.
@@ -1793,6 +1819,7 @@ public actor ReticuLumTransport {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self = self else { break }
                 await self.processAnnounceRetransmissions()
+                await self.cleanupDiscoveryPathRequests()
             }
         }
     }
@@ -1895,12 +1922,15 @@ public actor ReticuLumTransport {
         var requestTag = Data(count: 16)
         _ = requestTag.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
 
-        // Path request data: destination_hash (16 bytes) + request_tag (16 bytes)
+        // Path request data: destination_hash (16) [+ transport_id (16)] + request_tag (16)
         var requestData = destinationHash
+        if transportEnabled, let txHash = transportIdentityHash {
+            requestData.append(txHash)
+        }
         requestData.append(requestTag)
 
         // Compute destination hash for "Transport.path.request" (PLAIN destination)
-        let pathRequestDestHash = Destination.plainHash(appName: "Transport", aspects: ["path", "request"])
+        let pathRequestDestHash = Destination.plainHash(appName: "rnstransport", aspects: ["path", "request"])
 
         // Build path request packet (DATA packet, BROADCAST transport, HEADER_1)
         let header = PacketHeader(
@@ -1997,6 +2027,274 @@ public actor ReticuLumTransport {
     /// - Returns: Array of queued packets, or nil if none
     public func getPendingPackets(for destinationHash: Data) -> [Packet]? {
         return pendingPackets[destinationHash]
+    }
+
+    // MARK: - Path Request Handler
+
+    /// Register the PLAIN destination for receiving path requests from other nodes.
+    ///
+    /// Must be called once during transport setup. After registration, incoming
+    /// path request packets are automatically routed to `handlePathRequest()`.
+    ///
+    /// Reference: Python Transport.py:2646 (path_request_handler registration)
+    public func registerPathRequestHandler() async {
+        let pathReqDest = Destination(
+            plainAppName: "rnstransport",
+            aspects: ["path", "request"]
+        )
+        pathRequestDestination = pathReqDest
+        registerDestination(pathReqDest)
+
+        // Register callback for incoming path requests
+        await callbackManager.registerAsync(destinationHash: pathReqDest.hash) { [weak self] data, packet in
+            guard let self = self else { return }
+            Task {
+                await self.handlePathRequest(data: data)
+            }
+        }
+
+        let destHex = pathReqDest.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        logger.info("Path request handler registered (dest: \(destHex, privacy: .public))")
+    }
+
+    /// Handle incoming path request from another node.
+    ///
+    /// Format: dest_hash(16) [+ transport_id(16)] + tag(16)
+    ///
+    /// Decision tree (matching Python Transport.py:2698-2820):
+    /// 1. Local destination → respond with announce (PATH_RESPONSE)
+    /// 2. Known path in path_table → insert cached announce into announce table
+    ///    with blockRebroadcasts=true and GRACE delay
+    /// 3. Transport enabled → forward request on all other interfaces (discovery)
+    ///
+    /// Reference: Python Transport.py:2646-2820
+    private func handlePathRequest(data: Data) async {
+        guard data.count >= TRUNCATED_HASH_LENGTH else { return }
+
+        let destinationHash = Data(data.prefix(TRUNCATED_HASH_LENGTH))
+
+        // Extract requesting_transport_instance and tag based on data length
+        let requestingTransportId: Data?
+        let tagBytes: Data?
+        if data.count > TRUNCATED_HASH_LENGTH * 2 {
+            // Has transport_id: dest_hash(16) + transport_id(16) + tag(16)
+            requestingTransportId = Data(data[TRUNCATED_HASH_LENGTH..<(TRUNCATED_HASH_LENGTH * 2)])
+            let rawTag = Data(data[(TRUNCATED_HASH_LENGTH * 2)...])
+            tagBytes = Data(rawTag.prefix(TRUNCATED_HASH_LENGTH))
+        } else if data.count > TRUNCATED_HASH_LENGTH {
+            // No transport_id: dest_hash(16) + tag(16)
+            requestingTransportId = nil
+            let rawTag = Data(data[TRUNCATED_HASH_LENGTH...])
+            tagBytes = Data(rawTag.prefix(TRUNCATED_HASH_LENGTH))
+        } else {
+            requestingTransportId = nil
+            tagBytes = nil
+        }
+
+        // Dedup via unique_tag
+        guard let tag = tagBytes else { return }
+        let uniqueTag = destinationHash + tag
+        if discoveryPrTags.contains(uniqueTag) { return }
+        discoveryPrTags.append(uniqueTag)
+        if discoveryPrTags.count > maxPrTags {
+            discoveryPrTags.removeFirst(discoveryPrTags.count - maxPrTags)
+        }
+
+        let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let receivingInterfaceId = lastReceivedInterfaceId
+
+        // 1. Check local destinations
+        if let localDest = destinations[destinationHash] {
+            logger.info("Answering path request for \(destHex, privacy: .public): destination is local")
+            respondWithAnnounce(destination: localDest, pathResponse: true, attachedInterfaceId: receivingInterfaceId)
+            return
+        }
+
+        // 2. Check path table for known path
+        if transportEnabled, let pathEntry = await pathTable.lookup(destinationHash: destinationHash) {
+            // Don't answer if next hop is the requestor
+            if let reqTxId = requestingTransportId, pathEntry.nextHop == reqTxId {
+                logger.debug("Not answering path request for \(destHex, privacy: .public): next hop is requestor")
+                return
+            }
+
+            logger.info("Answering path request for \(destHex, privacy: .public): path is known")
+            respondWithCachedPath(
+                destinationHash: destinationHash,
+                pathEntry: pathEntry,
+                attachedInterfaceId: receivingInterfaceId
+            )
+            return
+        }
+
+        // 3. Forward path request to other interfaces (discovery mode)
+        if transportEnabled {
+            if discoveryPathRequests[destinationHash] != nil {
+                logger.debug("Already forwarding path request for \(destHex, privacy: .public)")
+                return
+            }
+
+            logger.info("Forwarding path request for \(destHex, privacy: .public) to other interfaces")
+            discoveryPathRequests[destinationHash] = (
+                timeout: Date().addingTimeInterval(Self.PATH_REQUEST_TIMEOUT),
+                requestingInterfaceId: receivingInterfaceId
+            )
+
+            // Forward on all interfaces except the one we received from
+            for (id, interface) in interfaces {
+                guard id != receivingInterfaceId else { continue }
+                guard interface.state == .connected else { continue }
+                await sendPathRequest(for: destinationHash, onInterface: id, tag: tag)
+            }
+        }
+    }
+
+    /// Respond to a path request with a fresh announce for a local destination.
+    ///
+    /// Builds an Announce with `pathResponse: true` (context=0x0B) and sends it
+    /// on the specified interface (or all if nil).
+    ///
+    /// Reference: Python Transport.py:2751-2759
+    private func respondWithAnnounce(
+        destination: Destination,
+        pathResponse: Bool,
+        attachedInterfaceId: String?
+    ) {
+        let announce = Announce(destination: destination, pathResponse: pathResponse)
+        guard let packet = try? announce.buildPacket() else {
+            logger.warning("Failed to build path response announce")
+            return
+        }
+        let encoded = packet.encode()
+
+        Task { [weak self] in
+            guard let self = self else { return }
+            if let attachedId = attachedInterfaceId,
+               let interface = await self.getInterface(id: attachedId) {
+                try? await interface.send(encoded)
+            } else {
+                for (_, interface) in await self.allInterfaces() {
+                    guard interface.state == .connected else { continue }
+                    try? await interface.send(encoded)
+                }
+            }
+        }
+    }
+
+    /// Respond to a path request with a cached path from the path table.
+    ///
+    /// Inserts the cached announce into the announce table with
+    /// `blockRebroadcasts=true` and `PATH_REQUEST_GRACE` delay, so the
+    /// retransmission loop sends it as a PATH_RESPONSE (context=0x0B).
+    ///
+    /// Reference: Python Transport.py:2786-2820
+    private func respondWithCachedPath(
+        destinationHash: Data,
+        pathEntry: PathEntry,
+        attachedInterfaceId: String?
+    ) {
+        guard let cachedData = pathEntry.announceData, !cachedData.isEmpty else {
+            let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+            logger.warning("Cannot respond to path request for \(destHex, privacy: .public): no cached announce data")
+            return
+        }
+
+        let header = PacketHeader(
+            headerType: .header1,
+            hasContext: false,
+            hasIFAC: false,
+            transportType: .broadcast,
+            destinationType: .single,
+            packetType: .announce,
+            hopCount: pathEntry.hopCount
+        )
+
+        let cachedPacket = Packet(
+            header: header,
+            destination: destinationHash,
+            transportAddress: nil,
+            context: PacketContext.NONE,
+            data: cachedData
+        )
+
+        Task { [weak self] in
+            guard let self = self else { return }
+            await self.announceTable.insert(
+                destinationHash: destinationHash,
+                packet: cachedPacket,
+                hops: pathEntry.hopCount,
+                receivedFrom: destinationHash,
+                blockRebroadcasts: true,
+                attachedInterfaceId: attachedInterfaceId
+            )
+        }
+    }
+
+    /// Send a path request on a specific interface (for forwarding).
+    ///
+    /// Reference: Python Transport.py:2541-2588
+    private func sendPathRequest(for destinationHash: Data, onInterface interfaceId: String, tag: Data) async {
+        var requestData = destinationHash
+        if transportEnabled, let txHash = transportIdentityHash {
+            requestData.append(txHash)
+        }
+        requestData.append(tag)
+
+        let pathRequestDestHash = Destination.plainHash(appName: "rnstransport", aspects: ["path", "request"])
+        let header = PacketHeader(
+            headerType: .header1,
+            hasContext: false,
+            hasIFAC: false,
+            transportType: .broadcast,
+            destinationType: .plain,
+            packetType: .data,
+            hopCount: 0
+        )
+        let packet = Packet(
+            header: header,
+            destination: pathRequestDestHash,
+            transportAddress: nil,
+            context: PacketContext.NONE,
+            data: requestData
+        )
+        let encoded = packet.encode()
+
+        guard let interface = interfaces[interfaceId] else { return }
+        do {
+            try await interface.send(encoded)
+        } catch {
+            logger.warning("Failed to forward path request via \(interfaceId, privacy: .public)")
+        }
+    }
+
+    /// Request a path and wait until it's found or timeout.
+    ///
+    /// Matching Python Transport.await_path():
+    /// 1. If path already known, return true
+    /// 2. Send path request
+    /// 3. Poll pathTable every 50ms until found or timeout
+    ///
+    /// - Parameters:
+    ///   - destinationHash: 16-byte destination hash
+    ///   - timeout: Max wait time (default 15s)
+    /// - Returns: true if path was found
+    public func awaitPath(for destinationHash: Data, timeout: TimeInterval = 15.0) async -> Bool {
+        if await pathTable.hasPath(for: destinationHash) { return true }
+
+        await requestPath(for: destinationHash)
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await pathTable.hasPath(for: destinationHash) { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+
+        return await pathTable.hasPath(for: destinationHash)
+    }
+
+    /// Get all interfaces (for internal use).
+    private func allInterfaces() -> [String: any NetworkInterface] {
+        return interfaces
     }
 }
 

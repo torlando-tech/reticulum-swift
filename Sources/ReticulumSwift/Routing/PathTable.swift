@@ -108,7 +108,8 @@ public actor PathTable {
                     random_blobs TEXT NOT NULL,
                     ratchet BLOB,
                     app_data BLOB,
-                    next_hop BLOB
+                    next_hop BLOB,
+                    announce_data BLOB
                 )
                 """
             if sqlite3_exec(db, createSQL, nil, nil, nil) != SQLITE_OK {
@@ -118,6 +119,9 @@ public actor PathTable {
 
             // Migrate old schema: rename random_blob → random_blobs if needed
             migrateRandomBlobColumn()
+
+            // Add announce_data column if missing (migration for existing databases)
+            migrateAnnounceDataColumn()
 
             // Load existing paths into memory
             loadFromDatabase()
@@ -387,6 +391,26 @@ public actor PathTable {
         print("[PATHTABLE] Migration complete, \(oldRows.count) rows migrated")
     }
 
+    /// Add announce_data column if it doesn't exist (migration for existing databases).
+    private func migrateAnnounceDataColumn() {
+        guard let db = db else { return }
+
+        var hasColumn = false
+        var infoStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "PRAGMA table_info(paths)", -1, &infoStmt, nil) == SQLITE_OK {
+            while sqlite3_step(infoStmt) == SQLITE_ROW {
+                if let namePtr = sqlite3_column_text(infoStmt, 1) {
+                    if String(cString: namePtr) == "announce_data" { hasColumn = true }
+                }
+            }
+            sqlite3_finalize(infoStmt)
+        }
+
+        guard !hasColumn else { return }
+        print("[PATHTABLE] Migrating: adding announce_data column")
+        sqlite3_exec(db, "ALTER TABLE paths ADD COLUMN announce_data BLOB", nil, nil, nil)
+    }
+
     // MARK: - Database Persistence
 
     /// Encode random blobs array as JSON string for storage.
@@ -423,7 +447,7 @@ public actor PathTable {
     private func loadFromDatabase() {
         guard let db = db else { return }
 
-        let selectSQL = "SELECT destination_hash, public_keys, interface_id, hop_count, timestamp, expires, random_blobs, ratchet, app_data, next_hop FROM paths"
+        let selectSQL = "SELECT destination_hash, public_keys, interface_id, hop_count, timestamp, expires, random_blobs, ratchet, app_data, next_hop, announce_data FROM paths"
         var stmt: OpaquePointer?
 
         guard sqlite3_prepare_v2(db, selectSQL, -1, &stmt, nil) == SQLITE_OK else {
@@ -471,6 +495,12 @@ public actor PathTable {
                 nextHop = Data(bytes: nextHopPtr, count: Int(nextHopLen))
             }
 
+            var announceData: Data? = nil
+            if let announceDataPtr = sqlite3_column_blob(stmt, 10) {
+                let announceDataLen = sqlite3_column_bytes(stmt, 10)
+                announceData = Data(bytes: announceDataPtr, count: Int(announceDataLen))
+            }
+
             let firstBlob = randomBlobs.first ?? Data()
             let entry = PathEntry(
                 destinationHash: destinationHash,
@@ -483,7 +513,8 @@ public actor PathTable {
                 randomBlobs: randomBlobs,
                 ratchet: ratchet,
                 appData: appData,
-                nextHop: nextHop
+                nextHop: nextHop,
+                announceData: announceData
             )
 
             // Only load non-expired entries
@@ -498,8 +529,8 @@ public actor PathTable {
         guard let db = db else { return }
 
         let upsertSQL = """
-            INSERT OR REPLACE INTO paths (destination_hash, public_keys, interface_id, hop_count, timestamp, expires, random_blobs, ratchet, app_data, next_hop)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO paths (destination_hash, public_keys, interface_id, hop_count, timestamp, expires, random_blobs, ratchet, app_data, next_hop, announce_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
         var stmt: OpaquePointer?
 
@@ -548,6 +579,14 @@ public actor PathTable {
             sqlite3_bind_null(stmt, 10)
         }
 
+        if let announceData = entry.announceData {
+            announceData.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(announceData.count), nil)
+            }
+        } else {
+            sqlite3_bind_null(stmt, 11)
+        }
+
         if sqlite3_step(stmt) != SQLITE_DONE {
             print("[PATHTABLE] Failed to save path: \(String(cString: sqlite3_errmsg(db)))")
         }
@@ -584,6 +623,7 @@ public actor PathTable {
     ///   - ratchet: Optional 32-byte ratchet public key for forward secrecy
     ///   - appData: Optional application data from announce
     ///   - nextHop: Optional 16-byte next hop transport node hash for routing
+    ///   - announceData: Optional cached raw announce payload for path responses
     /// - Returns: true if path was recorded, false if ignored
     @discardableResult
     public func record(
@@ -595,7 +635,8 @@ public actor PathTable {
         expiration: TimeInterval = PathEntry.standardExpiration,
         ratchet: Data? = nil,
         appData: Data? = nil,
-        nextHop: Data? = nil
+        nextHop: Data? = nil,
+        announceData: Data? = nil
     ) -> Bool {
         let entry = PathEntry(
             destinationHash: destinationHash,
@@ -606,7 +647,8 @@ public actor PathTable {
             randomBlob: randomBlob,
             ratchet: ratchet,
             appData: appData,
-            nextHop: nextHop
+            nextHop: nextHop,
+            announceData: announceData
         )
         return record(entry: entry)
     }

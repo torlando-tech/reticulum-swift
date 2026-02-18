@@ -76,6 +76,12 @@ public struct PathEntry: Codable, Sendable, Equatable {
     /// This enables multi-hop routing through transport nodes.
     public let nextHop: Data?
 
+    /// Cached raw announce payload data for path response retransmission.
+    /// Stored when the path is learned from an announce, used to answer
+    /// path requests from other nodes without reconstructing the announce.
+    /// Reference: Python Transport.py path_request() uses cached announce.
+    public let announceData: Data?
+
     // MARK: - Expiration Constants
 
     /// Standard path expiration (7 days)
@@ -309,6 +315,7 @@ public struct PathEntry: Codable, Sendable, Equatable {
     ///   - ratchet: Optional 32-byte ratchet public key for forward secrecy
     ///   - appData: Optional application data from announce
     ///   - nextHop: Optional 16-byte next hop transport node hash for routing
+    ///   - announceData: Optional cached raw announce payload for path responses
     public init(
         destinationHash: Data,
         publicKeys: Data,
@@ -321,7 +328,8 @@ public struct PathEntry: Codable, Sendable, Equatable {
         pathState: Int = TransportConstants.PATH_STATE_UNKNOWN,
         ratchet: Data? = nil,
         appData: Data? = nil,
-        nextHop: Data? = nil
+        nextHop: Data? = nil,
+        announceData: Data? = nil
     ) {
         self.destinationHash = destinationHash
         self.publicKeys = publicKeys
@@ -334,6 +342,7 @@ public struct PathEntry: Codable, Sendable, Equatable {
         self.ratchet = ratchet
         self.appData = appData
         self.nextHop = nextHop
+        self.announceData = announceData
     }
 
     /// Create a path entry with expiration interval.
@@ -350,6 +359,7 @@ public struct PathEntry: Codable, Sendable, Equatable {
     ///   - ratchet: Optional 32-byte ratchet public key for forward secrecy
     ///   - appData: Optional application data from announce
     ///   - nextHop: Optional 16-byte next hop transport node hash for routing
+    ///   - announceData: Optional cached raw announce payload for path responses
     public init(
         destinationHash: Data,
         publicKeys: Data,
@@ -361,7 +371,8 @@ public struct PathEntry: Codable, Sendable, Equatable {
         pathState: Int = TransportConstants.PATH_STATE_UNKNOWN,
         ratchet: Data? = nil,
         appData: Data? = nil,
-        nextHop: Data? = nil
+        nextHop: Data? = nil,
+        announceData: Data? = nil
     ) {
         let now = Date()
         self.destinationHash = destinationHash
@@ -375,6 +386,7 @@ public struct PathEntry: Codable, Sendable, Equatable {
         self.ratchet = ratchet
         self.appData = appData
         self.nextHop = nextHop
+        self.announceData = announceData
     }
 }
 

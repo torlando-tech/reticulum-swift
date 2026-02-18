@@ -203,7 +203,8 @@ public actor AnnounceHandler {
             expiration: interfaceMode.pathExpiration,
             ratchet: parsed.ratchet,  // Pass ratchet for forward secrecy encryption
             appData: parsed.appData,
-            nextHop: nextHop  // Pass transport address for multi-hop routing
+            nextHop: nextHop,  // Pass transport address for multi-hop routing
+            announceData: packet.data  // Cache raw announce payload for path responses
         )
 
         // Only proceed if path was actually recorded (not a replay or worse path)

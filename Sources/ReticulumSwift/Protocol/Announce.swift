@@ -84,6 +84,12 @@ public struct Announce: Sendable {
     /// Peers will encrypt messages to this ratchet key instead of the base identity key.
     public let ratchet: Data?
 
+    /// Whether this announce is a path response (answering a path request).
+    /// When true, context = PATH_RESPONSE (0x0B) which tells receiving nodes
+    /// NOT to rebroadcast this announce further.
+    /// Reference: Python Destination.py:309 (`path_response` parameter)
+    public let pathResponse: Bool
+
     // MARK: - Initialization
 
     /// Create an announce for a destination.
@@ -93,16 +99,19 @@ public struct Announce: Sendable {
     ///   - appData: Optional application data (overrides destination.appData)
     ///   - randomHash: Optional random hash for testing (10 bytes, defaults to random)
     ///   - ratchet: Optional 32-byte X25519 ratchet public key for forward secrecy
+    ///   - pathResponse: Whether this is a path response announce (context=0x0B)
     public init(
         destination: Destination,
         appData: Data? = nil,
         randomHash: Data? = nil,
-        ratchet: Data? = nil
+        ratchet: Data? = nil,
+        pathResponse: Bool = false
     ) {
         self.destination = destination
         self.appData = appData
         self.randomHash = randomHash ?? Announce.generateRandomHash()
         self.ratchet = ratchet
+        self.pathResponse = pathResponse
     }
 
     // MARK: - Building
@@ -225,7 +234,7 @@ public struct Announce: Sendable {
             header: header,
             destination: destination.hash,
             transportAddress: nil,
-            context: 0x00,
+            context: pathResponse ? PacketContext.PATH_RESPONSE : PacketContext.NONE,
             data: payload
         )
     }
