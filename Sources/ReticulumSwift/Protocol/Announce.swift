@@ -21,6 +21,9 @@ public let SIGNATURE_LENGTH = 64
 /// Public keys length (64 bytes: 32 encryption + 32 signing)
 public let PUBLIC_KEYS_LENGTH = 64
 
+/// X25519 ratchet public key length (32 bytes)
+public let RATCHET_KEY_LENGTH = 32
+
 // MARK: - Announce Errors
 
 /// Errors during announce construction
@@ -42,9 +45,14 @@ public enum AnnounceError: Error, Sendable, Equatable {
 /// Announces broadcast a destination's identity to the network, allowing
 /// other nodes to discover and communicate with the destination.
 ///
-/// Announce payload structure:
+/// Announce payload structure (without ratchet):
 /// ```
 /// [public_keys 64B][name_hash 16*N B][random_hash 10B][signature 64B][app_data optional]
+/// ```
+///
+/// Announce payload structure (with ratchet):
+/// ```
+/// [public_keys 64B][name_hash 16*N B][random_hash 10B][ratchet 32B][signature 64B][app_data optional]
 /// ```
 /// where N = number of aspects (app_name + aspects.count)
 ///
@@ -55,7 +63,7 @@ public enum AnnounceError: Error, Sendable, Equatable {
 ///
 /// Signature covers (in order):
 /// ```
-/// destination_hash || public_keys || name_hash || random_hash [|| app_data]
+/// destination_hash || public_keys || name_hash || random_hash [|| ratchet] [|| app_data]
 /// ```
 public struct Announce: Sendable {
 
@@ -71,6 +79,11 @@ public struct Announce: Sendable {
     /// Can be set explicitly for testing, otherwise random
     public let randomHash: Data
 
+    /// Optional 32-byte X25519 ratchet public key for forward secrecy.
+    /// When present, the announce includes the ratchet and sets context_flag=0x01.
+    /// Peers will encrypt messages to this ratchet key instead of the base identity key.
+    public let ratchet: Data?
+
     // MARK: - Initialization
 
     /// Create an announce for a destination.
@@ -79,14 +92,17 @@ public struct Announce: Sendable {
     ///   - destination: The destination to announce
     ///   - appData: Optional application data (overrides destination.appData)
     ///   - randomHash: Optional random hash for testing (10 bytes, defaults to random)
+    ///   - ratchet: Optional 32-byte X25519 ratchet public key for forward secrecy
     public init(
         destination: Destination,
         appData: Data? = nil,
-        randomHash: Data? = nil
+        randomHash: Data? = nil,
+        ratchet: Data? = nil
     ) {
         self.destination = destination
         self.appData = appData
         self.randomHash = randomHash ?? Announce.generateRandomHash()
+        self.ratchet = ratchet
     }
 
     // MARK: - Building
@@ -95,9 +111,14 @@ public struct Announce: Sendable {
     ///
     /// This constructs the announce data (NOT the complete packet with header).
     ///
-    /// For SINGLE/GROUP destinations with identity:
+    /// For SINGLE/GROUP destinations with identity (no ratchet):
     /// ```
     /// public_keys || name_hash || random_hash || signature [|| app_data]
+    /// ```
+    ///
+    /// For SINGLE/GROUP destinations with identity (with ratchet):
+    /// ```
+    /// public_keys || name_hash || random_hash || ratchet || signature [|| app_data]
     /// ```
     ///
     /// For PLAIN destinations:
@@ -122,12 +143,15 @@ public struct Announce: Sendable {
         let nameHash = destination.nameHash  // 10 bytes = full_hash(full_name)[:10]
         let effectiveAppData = appData ?? destination.appData ?? Data()
 
-        // Build signed data: dest_hash || public_keys || name_hash || random_hash [|| app_data]
+        // Build signed data: dest_hash || public_keys || name_hash || random_hash [|| ratchet] [|| app_data]
         var signedData = Data()
         signedData.append(destination.hash)
         signedData.append(publicKeys)
         signedData.append(nameHash)
         signedData.append(randomHash)
+        if let ratchet = ratchet {
+            signedData.append(ratchet)
+        }
         if !effectiveAppData.isEmpty {
             signedData.append(effectiveAppData)
         }
@@ -140,11 +164,14 @@ public struct Announce: Sendable {
             throw AnnounceError.signatureFailed
         }
 
-        // Build announce payload: public_keys || name_hash || random_hash || signature [|| app_data]
+        // Build announce payload: public_keys || name_hash || random_hash [|| ratchet] || signature [|| app_data]
         var payload = Data()
         payload.append(publicKeys)
         payload.append(nameHash)
         payload.append(randomHash)
+        if let ratchet = ratchet {
+            payload.append(ratchet)
+        }
         payload.append(signature)
         if !effectiveAppData.isEmpty {
             payload.append(effectiveAppData)
@@ -159,7 +186,7 @@ public struct Announce: Sendable {
     ///
     /// Header configuration for announces:
     /// - headerType: .header1 (single address)
-    /// - hasContext: false (no ratchet)
+    /// - hasContext: true if ratchet present (context_flag=0x01)
     /// - hasIFAC: false
     /// - transportType: .broadcast
     /// - destinationType: from destination
@@ -186,7 +213,7 @@ public struct Announce: Sendable {
 
         let header = PacketHeader(
             headerType: .header1,
-            hasContext: false,
+            hasContext: ratchet != nil,
             hasIFAC: false,
             transportType: .broadcast,
             destinationType: headerDestType,
@@ -258,6 +285,7 @@ public struct Announce: Sendable {
 extension Announce: CustomStringConvertible {
     public var description: String {
         let hasAppData = (appData ?? destination.appData) != nil
-        return "Announce<\(destination.destinationType), appData:\(hasAppData)>"
+        let hasRatchet = ratchet != nil
+        return "Announce<\(destination.destinationType), appData:\(hasAppData), ratchet:\(hasRatchet)>"
     }
 }

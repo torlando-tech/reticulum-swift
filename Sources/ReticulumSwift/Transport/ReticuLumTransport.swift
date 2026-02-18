@@ -1580,7 +1580,29 @@ public actor ReticuLumTransport {
                 // NOT the destination hash. This matches Python RNS Identity.get_salt().
                 let identityHash = identity.hash
                 print("[LXMF_INBOUND] Attempting decrypt, identityHash=\(identityHash.prefix(8).map { String(format: "%02x", $0) }.joined()), ciphertext len=\(packet.data.count)")
-                deliveryData = try identity.decrypt(packet.data, identityHash: identityHash)
+
+                // Use ratchet fallback chain if destination has ratchets enabled
+                let ratchetKeys: [Data]
+                let enforce: Bool
+                if let ratchetMgr = destination.ratchetManager {
+                    ratchetKeys = await ratchetMgr.allRatchetPrivateKeys()
+                    enforce = destination.ratchetsEnforced
+                } else {
+                    ratchetKeys = []
+                    enforce = false
+                }
+
+                if !ratchetKeys.isEmpty {
+                    deliveryData = try identity.decrypt(
+                        packet.data,
+                        identityHash: identityHash,
+                        ratchets: ratchetKeys,
+                        enforceRatchets: enforce
+                    )
+                } else {
+                    deliveryData = try identity.decrypt(packet.data, identityHash: identityHash)
+                }
+
                 let dataHex = deliveryData.prefix(16).map { String(format: "%02x", $0) }.joined()
                 print("[LXMF_INBOUND] Decrypted SINGLE packet: \(deliveryData.count) bytes, data[0:16]=\(dataHex)")
             } catch {

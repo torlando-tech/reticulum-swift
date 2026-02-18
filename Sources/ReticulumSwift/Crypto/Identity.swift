@@ -460,6 +460,97 @@ public struct Identity {
         }
     }
 
+    // MARK: - Ratchet Encryption
+
+    /// Encrypt data to a specific ratchet public key (raw 32 bytes).
+    ///
+    /// Identical to standard encrypt, but takes raw ratchet key bytes
+    /// instead of the identity's encryption public key. Used when a
+    /// destination has ratchets enabled for forward secrecy.
+    ///
+    /// - Parameters:
+    ///   - plaintext: Data to encrypt
+    ///   - ratchetPublicKey: 32-byte X25519 ratchet public key
+    ///   - identityHash: 16-byte identity hash (used as HKDF salt)
+    /// - Returns: Encrypted token with prepended ephemeral public key
+    public static func encrypt(
+        _ plaintext: Data,
+        toRatchetKey ratchetPublicKey: Data,
+        identityHash: Data
+    ) throws -> Data {
+        guard ratchetPublicKey.count == 32 else {
+            throw IdentityError.encryptionFailed(reason: "Ratchet key must be 32 bytes")
+        }
+        let pubKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: ratchetPublicKey)
+        return try encrypt(plaintext, to: pubKey, identityHash: identityHash)
+    }
+
+    /// Decrypt data with ratchet fallback chain.
+    ///
+    /// Tries each ratchet private key in order (newest first), then falls
+    /// back to the base identity key. This allows decryption of messages
+    /// encrypted to any of our current or recent ratchet keys.
+    ///
+    /// Python reference: Identity.decrypt() with ratchets parameter.
+    ///
+    /// - Parameters:
+    ///   - ciphertext: Encrypted token with prepended ephemeral public key
+    ///   - identityHash: 16-byte identity hash (used as HKDF salt)
+    ///   - ratchets: Array of 32-byte X25519 ratchet private keys to try
+    ///   - enforceRatchets: If true, reject messages not encrypted to a ratchet
+    /// - Returns: Decrypted plaintext
+    public func decrypt(
+        _ ciphertext: Data,
+        identityHash: Data,
+        ratchets: [Data],
+        enforceRatchets: Bool = false
+    ) throws -> Data {
+        // Minimum size: 32 (ephemeral pub) + 64 (minimum token)
+        guard ciphertext.count >= 96 else {
+            throw IdentityError.decryptionFailed(reason: "Ciphertext too short")
+        }
+
+        // Extract ephemeral public key
+        let ephemeralPubBytes = ciphertext.prefix(32)
+        let tokenData = Data(ciphertext.dropFirst(32))
+
+        let ephemeralPublicKey: Curve25519.KeyAgreement.PublicKey
+        do {
+            ephemeralPublicKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeralPubBytes)
+        } catch {
+            throw IdentityError.decryptionFailed(reason: "Invalid ephemeral public key")
+        }
+
+        // Try each ratchet private key
+        for ratchetPriv in ratchets {
+            guard ratchetPriv.count == 32 else { continue }
+            do {
+                let ratchetKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: ratchetPriv)
+                let sharedSecret = try ratchetKey.sharedSecretFromKeyAgreement(with: ephemeralPublicKey)
+                let sharedSecretData = sharedSecret.withUnsafeBytes { Data($0) }
+                let derivedKey = KeyDerivation.deriveKey(
+                    length: 64,
+                    inputKeyMaterial: sharedSecretData,
+                    salt: identityHash,
+                    context: nil
+                )
+                let token = try Token(derivedKey: derivedKey)
+                return try token.decrypt(tokenData)
+            } catch {
+                // Try next ratchet
+                continue
+            }
+        }
+
+        // No ratchet succeeded
+        if enforceRatchets {
+            throw IdentityError.decryptionFailed(reason: "No ratchet key could decrypt and ratchets are enforced")
+        }
+
+        // Fallback to base identity key
+        return try decrypt(ciphertext, identityHash: identityHash)
+    }
+
     // MARK: - Persistence
 
     /// Export private keys for storage (64 bytes: enc_priv + sig_priv)

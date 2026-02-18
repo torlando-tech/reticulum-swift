@@ -93,6 +93,15 @@ public final class Destination: @unchecked Sendable {
     /// Callback manager for packet delivery (weak reference, set externally)
     public weak var callbackManager: (any DestinationCallbackManager)?
 
+    /// Ratchet manager for forward secrecy (nil if ratchets not enabled)
+    public var ratchetManager: RatchetManager?
+
+    /// Whether ratchets are enabled for this destination
+    public private(set) var ratchetsEnabled: Bool = false
+
+    /// Whether ratchets are enforced (reject non-ratcheted messages)
+    public private(set) var ratchetsEnforced: Bool = false
+
     // MARK: - Computed Properties
 
     /// 16-byte destination hash
@@ -246,6 +255,32 @@ public final class Destination: @unchecked Sendable {
             return nil
         }
         return manager.createStream(for: self.hash)
+    }
+
+    // MARK: - Ratchet Management
+
+    /// Enable ratchets for forward secrecy.
+    ///
+    /// Loads existing ratchets from disk or generates an initial ratchet.
+    /// Once enabled, announces will include the current ratchet public key,
+    /// and the decrypt path will try ratchet keys before the base identity key.
+    ///
+    /// - Parameter storagePath: File path for persistent ratchet storage
+    public func enableRatchets(storagePath: String) async throws {
+        guard let identity = identity, identity.hasPrivateKeys else { return }
+        let manager = RatchetManager(storagePath: storagePath, identity: identity)
+        try await manager.loadOrCreate()
+        self.ratchetManager = manager
+        self.ratchetsEnabled = true
+    }
+
+    /// Enforce ratchets — reject messages not encrypted to a ratchet key.
+    ///
+    /// Only effective if ratchets are already enabled.
+    /// When enforced, messages encrypted to the base identity key will be dropped.
+    public func enforceRatchets() {
+        guard ratchetsEnabled else { return }
+        self.ratchetsEnforced = true
     }
 
     // MARK: - Static Hash Methods (Backward Compatibility)
