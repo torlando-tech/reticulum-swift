@@ -178,6 +178,41 @@ public actor Link {
 
     // MARK: - Identity
 
+    // MARK: - Packet Callback
+
+    /// Generic per-link packet callback matching Python's link.set_packet_callback().
+    /// Called for context 0x00 (DATA) packets before LXMF routing.
+    /// LXST and other protocols use this for raw link data delivery.
+    private var packetCallback: (@Sendable (Data, Packet) async -> Void)?
+
+    /// Whether a packet callback is registered on this link.
+    public var hasPacketCallback: Bool {
+        packetCallback != nil
+    }
+
+    /// Set a generic packet callback for this link.
+    ///
+    /// Matches Python's `link.set_packet_callback(callback)`.
+    /// The callback receives decrypted plaintext and the original packet.
+    /// When set, context 0x00 DATA packets are delivered here instead of LXMF routing.
+    ///
+    /// - Parameter callback: Async callback receiving (plaintext, packet), or nil to clear
+    public func setPacketCallback(_ callback: (@Sendable (Data, Packet) async -> Void)?) {
+        self.packetCallback = callback
+    }
+
+    /// Deliver decrypted data to the packet callback if one is registered.
+    ///
+    /// - Parameters:
+    ///   - data: Decrypted plaintext
+    ///   - packet: Original wire packet
+    /// - Returns: true if delivered to callback, false if no callback set
+    public func deliverToPacketCallback(data: Data, packet: Packet) async -> Bool {
+        guard let callback = packetCallback else { return false }
+        await callback(data, packet)
+        return true
+    }
+
     /// Channel for typed message communication (lazy-created via getOrCreateChannel).
     var channel: Channel?
 
