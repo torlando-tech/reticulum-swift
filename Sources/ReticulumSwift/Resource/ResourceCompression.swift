@@ -2,17 +2,15 @@
 //  ResourceCompression.swift
 //  ReticulumSwift
 //
-//  Compression utilities for resource data.
-//  Matches Python RNS Resource.py compression behavior where possible.
+//  BZ2 compression utilities for resource data.
+//  Matches Python RNS Resource.py compression behavior using bz2.compress/decompress.
 //
-//  Note: Python RNS uses bz2 compression. Apple's Compression framework
-//  does not support bz2, so we use LZMA which provides similar compression
-//  ratios. For full Python RNS interop, compression should be disabled
-//  or a bz2 library added as a dependency.
+//  Uses the system libbz2 library available on all Apple platforms
+//  (macOS, iOS, watchOS, tvOS, visionOS) via the CBZ2 system library target.
 //
 
 import Foundation
-import Compression
+import CBZ2
 
 // MARK: - Compression Result
 
@@ -38,28 +36,174 @@ public struct CompressionResult: Sendable {
     }
 }
 
+// MARK: - BZ2 Error
+
+/// Errors specific to BZ2 compression/decompression operations.
+public enum BZ2Error: Error, CustomStringConvertible {
+    case compressFailed(code: Int32)
+    case decompressFailed(code: Int32)
+    case outputBufferTooSmall
+
+    public var description: String {
+        switch self {
+        case .compressFailed(let code):
+            return "BZ2 compression failed with code \(code) (\(BZ2Error.errorName(code)))"
+        case .decompressFailed(let code):
+            return "BZ2 decompression failed with code \(code) (\(BZ2Error.errorName(code)))"
+        case .outputBufferTooSmall:
+            return "BZ2 output buffer too small after maximum retries"
+        }
+    }
+
+    /// Map BZ2 error codes to human-readable names.
+    static func errorName(_ code: Int32) -> String {
+        switch code {
+        case BZ_OK:              return "BZ_OK"
+        case BZ_RUN_OK:          return "BZ_RUN_OK"
+        case BZ_FLUSH_OK:        return "BZ_FLUSH_OK"
+        case BZ_FINISH_OK:       return "BZ_FINISH_OK"
+        case BZ_STREAM_END:      return "BZ_STREAM_END"
+        case BZ_SEQUENCE_ERROR:  return "BZ_SEQUENCE_ERROR"
+        case BZ_PARAM_ERROR:     return "BZ_PARAM_ERROR"
+        case BZ_MEM_ERROR:       return "BZ_MEM_ERROR"
+        case BZ_DATA_ERROR:      return "BZ_DATA_ERROR"
+        case BZ_DATA_ERROR_MAGIC: return "BZ_DATA_ERROR_MAGIC"
+        case BZ_IO_ERROR:        return "BZ_IO_ERROR"
+        case BZ_UNEXPECTED_EOF:  return "BZ_UNEXPECTED_EOF"
+        case BZ_OUTBUFF_FULL:    return "BZ_OUTBUFF_FULL"
+        case BZ_CONFIG_ERROR:    return "BZ_CONFIG_ERROR"
+        default:                 return "UNKNOWN(\(code))"
+        }
+    }
+}
+
 // MARK: - Resource Compression
 
-/// Compression utilities for resource data.
+/// BZ2 compression utilities for resource data.
 ///
-/// Python RNS compresses data < 64MB and uses uncompressed if
-/// compressed output is larger than input (e.g., for random/encrypted data).
+/// Python RNS compresses data < 64MB using `bz2.compress()` and uses
+/// uncompressed if compressed output is larger than input (e.g., for
+/// random/encrypted data).
 ///
-/// This fallback behavior is critical for efficiency: attempting to
-/// compress already-compressed or encrypted data typically produces
-/// output larger than the input due to compression overhead.
-///
-/// Note: For full Python RNS interoperability, set autoCompress to false
-/// since Python uses bz2 compression which is not natively available on Apple platforms.
+/// This implementation uses the system libbz2 library (available on all
+/// Apple platforms) for full Python RNS interoperability.
 public enum ResourceCompression {
 
-    // MARK: - Compression Algorithm
+    // MARK: - BZ2 Parameters
 
-    /// Compression algorithm to use.
-    /// LZMA provides good compression ratios similar to bz2.
-    private static let algorithm = COMPRESSION_LZMA
+    /// Default BZ2 block size (1-9). Python bz2.compress() defaults to 9.
+    /// Block size 9 = 900KB blocks, best compression ratio.
+    private static let defaultBlockSize: Int32 = 9
 
-    // MARK: - Compression
+    /// BZ2 work factor. 0 = default (30). Controls fallback algorithm behavior.
+    private static let workFactor: Int32 = 0
+
+    /// BZ2 small decompress flag. 0 = normal, 1 = reduced memory mode.
+    private static let smallDecompress: Int32 = 0
+
+    // MARK: - Low-Level BZ2 API
+
+    /// Compress data using BZ2.
+    ///
+    /// Calls `BZ2_bzBuffToBuffCompress` from the system libbz2 library.
+    /// This matches Python's `bz2.compress(data, compresslevel=9)`.
+    ///
+    /// - Parameters:
+    ///   - data: Input data to compress
+    ///   - blockSize: BZ2 block size (1-9, default 9)
+    /// - Returns: BZ2-compressed data (starts with "BZh" magic bytes)
+    /// - Throws: BZ2Error on compression failure
+    public static func bz2Compress(_ data: Data, blockSize: Int32 = 9) throws -> Data {
+        guard !data.isEmpty else {
+            return Data()
+        }
+
+        // BZ2 worst case: output can be ~1% larger than input + 600 bytes overhead
+        var destLen = UInt32(data.count + data.count / 100 + 600)
+        var destBuffer = [UInt8](repeating: 0, count: Int(destLen))
+
+        let result = data.withUnsafeBytes { sourceBuffer -> Int32 in
+            guard let sourcePointer = sourceBuffer.baseAddress else {
+                return BZ_PARAM_ERROR
+            }
+            return BZ2_bzBuffToBuffCompress(
+                &destBuffer,
+                &destLen,
+                UnsafeMutableRawPointer(mutating: sourcePointer).assumingMemoryBound(to: CChar.self),
+                UInt32(data.count),
+                blockSize,
+                0,          // verbosity
+                workFactor
+            )
+        }
+
+        guard result == BZ_OK else {
+            throw BZ2Error.compressFailed(code: result)
+        }
+
+        return Data(bytes: destBuffer, count: Int(destLen))
+    }
+
+    /// Decompress BZ2-compressed data.
+    ///
+    /// Calls `BZ2_bzBuffToBuffDecompress` from the system libbz2 library.
+    /// This matches Python's `bz2.decompress(data)`.
+    ///
+    /// Uses progressive buffer sizing: starts at 4x input size, doubles up to
+    /// 5 attempts to handle unknown decompressed sizes.
+    ///
+    /// - Parameters:
+    ///   - data: BZ2-compressed input data
+    ///   - expectedSize: Optional hint for output buffer size
+    /// - Returns: Decompressed data
+    /// - Throws: BZ2Error on decompression failure
+    public static func bz2Decompress(_ data: Data, expectedSize: Int? = nil) throws -> Data {
+        guard !data.isEmpty else {
+            return Data()
+        }
+
+        // Start with expected size or 4x input as estimate
+        var bufferSize = expectedSize ?? (data.count * 4)
+        // Minimum buffer to avoid trivially small allocations
+        if bufferSize < 1024 {
+            bufferSize = 1024
+        }
+
+        let maxAttempts = 6
+
+        for attempt in 0..<maxAttempts {
+            var destLen = UInt32(bufferSize)
+            var destBuffer = [UInt8](repeating: 0, count: bufferSize)
+
+            let result = data.withUnsafeBytes { sourceBuffer -> Int32 in
+                guard let sourcePointer = sourceBuffer.baseAddress else {
+                    return BZ_PARAM_ERROR
+                }
+                return BZ2_bzBuffToBuffDecompress(
+                    &destBuffer,
+                    &destLen,
+                    UnsafeMutableRawPointer(mutating: sourcePointer).assumingMemoryBound(to: CChar.self),
+                    UInt32(data.count),
+                    smallDecompress,
+                    0  // verbosity
+                )
+            }
+
+            if result == BZ_OK {
+                return Data(bytes: destBuffer, count: Int(destLen))
+            } else if result == BZ_OUTBUFF_FULL && attempt < maxAttempts - 1 {
+                // Double buffer and retry
+                bufferSize *= 2
+                continue
+            } else {
+                throw BZ2Error.decompressFailed(code: result)
+            }
+        }
+
+        throw BZ2Error.outputBufferTooSmall
+    }
+
+    // MARK: - Resource Compression API
 
     /// Compress data, falling back to uncompressed if larger.
     ///
@@ -94,34 +238,27 @@ public enum ResourceCompression {
             )
         }
 
-        // Attempt compression using Apple's Compression framework
-        let destinationBufferSize = originalSize + 1024  // Allow some overhead
-        var destinationBuffer = [UInt8](repeating: 0, count: destinationBufferSize)
+        // Attempt BZ2 compression
+        do {
+            let compressed = try bz2Compress(data, blockSize: defaultBlockSize)
 
-        let compressedSize = data.withUnsafeBytes { sourceBuffer -> Int in
-            guard let sourcePointer = sourceBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return 0
+            // Use compressed only if smaller than original
+            if compressed.count < originalSize {
+                return CompressionResult(
+                    data: compressed,
+                    compressed: true,
+                    originalSize: originalSize
+                )
+            } else {
+                // Compressed output is larger, use original
+                return CompressionResult(
+                    data: data,
+                    compressed: false,
+                    originalSize: originalSize
+                )
             }
-            return compression_encode_buffer(
-                &destinationBuffer,
-                destinationBufferSize,
-                sourcePointer,
-                originalSize,
-                nil,
-                algorithm
-            )
-        }
-
-        // Check if compression succeeded and produced smaller output
-        if compressedSize > 0 && compressedSize < originalSize {
-            let compressed = Data(bytes: destinationBuffer, count: compressedSize)
-            return CompressionResult(
-                data: compressed,
-                compressed: true,
-                originalSize: originalSize
-            )
-        } else {
-            // Compression failed or output larger than input, use original
+        } catch {
+            // Compression failed, fall back to uncompressed
             return CompressionResult(
                 data: data,
                 compressed: false,
@@ -132,10 +269,10 @@ public enum ResourceCompression {
 
     // MARK: - Decompression
 
-    /// Decompress compressed data.
+    /// Decompress BZ2 compressed data.
     ///
     /// - Parameters:
-    ///   - data: Compressed data
+    ///   - data: BZ2-compressed data
     ///   - expectedSize: Expected decompressed size (for buffer allocation)
     /// - Returns: Decompressed data
     /// - Throws: ResourceError.decompressionFailed on error
@@ -144,68 +281,25 @@ public enum ResourceCompression {
             return Data()
         }
 
-        // Start with expected size or reasonable estimate
-        var bufferSize = expectedSize ?? (data.count * 10)
-        var attempts = 0
-        let maxAttempts = 5
-
-        while attempts < maxAttempts {
-            var destinationBuffer = [UInt8](repeating: 0, count: bufferSize)
-
-            let decompressedSize = data.withUnsafeBytes { sourceBuffer -> Int in
-                guard let sourcePointer = sourceBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                    return 0
-                }
-                return compression_decode_buffer(
-                    &destinationBuffer,
-                    bufferSize,
-                    sourcePointer,
-                    data.count,
-                    nil,
-                    algorithm
-                )
-            }
-
-            if decompressedSize > 0 {
-                return Data(bytes: destinationBuffer, count: decompressedSize)
-            } else if decompressedSize == 0 && bufferSize < data.count * 100 {
-                // Buffer might be too small, try larger
-                bufferSize *= 2
-                attempts += 1
-            } else {
-                break
-            }
+        do {
+            return try bz2Decompress(data, expectedSize: expectedSize)
+        } catch {
+            throw ResourceError.decompressionFailed(
+                reason: "BZ2 decompression failed: \(error)"
+            )
         }
-
-        throw ResourceError.decompressionFailed(
-            reason: "Decompression failed after \(attempts) attempts"
-        )
     }
 
     // MARK: - Python RNS Interoperability
 
-    /// Check if data appears to be bz2 compressed (Python RNS format).
+    /// Check if data appears to be BZ2 compressed (Python RNS format).
     ///
-    /// bz2 magic bytes: 0x42 0x5A 0x68 ("BZh")
+    /// BZ2 magic bytes: 0x42 0x5A 0x68 ("BZh")
     ///
     /// - Parameter data: Data to check
-    /// - Returns: true if data starts with bz2 magic bytes
+    /// - Returns: true if data starts with BZ2 magic bytes
     public static func isBZ2Compressed(_ data: Data) -> Bool {
         guard data.count >= 3 else { return false }
         return data[0] == 0x42 && data[1] == 0x5A && data[2] == 0x68
-    }
-
-    /// Check if data appears to be LZMA compressed (Swift format).
-    ///
-    /// LZMA magic bytes vary, but we use a simple heuristic.
-    ///
-    /// - Parameter data: Data to check
-    /// - Returns: true if data might be LZMA compressed
-    public static func isLZMACompressed(_ data: Data) -> Bool {
-        // LZMA streams typically start with specific property bytes
-        // This is a heuristic, not a guarantee
-        guard data.count >= 5 else { return false }
-        // LZMA properties byte is usually in a specific range
-        return data[0] <= 0xE0
     }
 }

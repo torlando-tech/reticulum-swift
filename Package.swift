@@ -17,9 +17,13 @@ let package = Package(
         .package(url: "https://github.com/krzyzanowskim/CryptoSwift.git", from: "1.8.0"),
     ],
     targets: [
+        .systemLibrary(
+            name: "CBZ2",
+            path: "Sources/CBZ2"
+        ),
         .target(
             name: "ReticulumSwift",
-            dependencies: ["CryptoSwift"],
+            dependencies: ["CryptoSwift", "CBZ2"],
             path: "Sources/ReticulumSwift"
         ),
         .testTarget(

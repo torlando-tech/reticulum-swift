@@ -1025,11 +1025,10 @@ public actor Link {
         guard let encryptToken = self.token else {
             throw LinkError.encryptionNotReady
         }
-        // Disable compression for Python interop: Python uses bz2 but Swift
-        // uses LZMA. Sending uncompressed avoids decompression mismatch.
+        // BZ2 compression enabled: matches Python RNS bz2.compress() for full interop.
         try await resource.prepare(partSize: MDU, linkEncrypt: { plaintext in
             return try encryptToken.encrypt(plaintext)
-        }, autoCompress: false)
+        }, autoCompress: true)
         let numParts = await resource.numParts
         let transferSize = await resource.transferSize
         linkLogger.info("[RESOURCE_SEND] Prepared: \(numParts) parts, partSize=\(MDU), transferSize=\(transferSize)")
