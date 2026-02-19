@@ -1420,6 +1420,17 @@ public actor ReticuLumTransport {
             return
         }
 
+        // CHANNEL (0x0E) - typed message channel data (encrypted)
+        if packet.context == PacketContext.CHANNEL {
+            do {
+                let plaintext = try await link.decrypt(packet.data)
+                await link.handleChannelData(plaintext)
+            } catch {
+                print("[LINK_DATA] Failed to decrypt CHANNEL data: \(error)")
+            }
+            return
+        }
+
         // REQUEST (0x09) - incoming request from peer (encrypted)
         // Python: link.decrypt(packet.data), unpack msgpack([timestamp, pathHash, data])
         if packet.context == RequestPacketContext.request {

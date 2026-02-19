@@ -178,6 +178,9 @@ public actor Link {
 
     // MARK: - Identity
 
+    /// Channel for typed message communication (lazy-created via getOrCreateChannel).
+    var channel: Channel?
+
     /// Remote peer's identity (after LINKIDENTIFY received)
     public private(set) var remoteIdentity: Identity?
 

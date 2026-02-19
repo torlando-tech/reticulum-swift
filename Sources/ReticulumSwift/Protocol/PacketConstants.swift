@@ -29,6 +29,7 @@ public enum PacketContext {
     public static let PATH_RESPONSE: UInt8 = 0x0B
     public static let COMMAND: UInt8 = 0x0C
     public static let COMMAND_STATUS: UInt8 = 0x0D
+    public static let CHANNEL: UInt8 = 0x0E
     public static let KEEPALIVE: UInt8 = 0xFA
     public static let LINKIDENTIFY: UInt8 = 0xFB
     public static let LINKCLOSE: UInt8 = 0xFC

@@ -66,6 +66,10 @@ public enum LinkConstants {
     /// Used for hashmap segmentation (advertisements/HMU must fit in one encrypted packet).
     public static let LINK_MDU: Int = 431
 
+    /// Channel MDU — max message payload per envelope.
+    /// LINK_MDU (431) - envelope header (6) = 425 bytes.
+    public static let CHANNEL_MDU: Int = LINK_MDU - 6
+
     /// Size of elliptic curve public keys in bytes.
     ///
     /// This is 64 bytes total: 32 bytes for the encryption public key
