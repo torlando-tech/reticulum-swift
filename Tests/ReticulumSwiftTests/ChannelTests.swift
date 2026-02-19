@@ -81,20 +81,14 @@ final class ChannelTests: XCTestCase {
         XCTAssertEqual(unpacked.payload.count, 0)
     }
 
-    // MARK: - ACK / NACK Envelopes
+    // MARK: - System MSGTYPE Envelopes
 
-    func testACKEnvelopeFormat() {
-        let ack = Envelope(msgtype: Channel.MSGTYPE_ACK, sequence: 42, payload: Data())
-        let packed = ack.pack()
-        XCTAssertEqual(packed[0], 0xFF) // MSGTYPE_ACK high
-        XCTAssertEqual(packed[1], 0xFF) // MSGTYPE_ACK low
-    }
-
-    func testNACKEnvelopeFormat() {
-        let nack = Envelope(msgtype: Channel.MSGTYPE_NACK, sequence: 7, payload: Data())
-        let packed = nack.pack()
-        XCTAssertEqual(packed[0], 0xFF) // MSGTYPE_NACK high
-        XCTAssertEqual(packed[1], 0xFE) // MSGTYPE_NACK low
+    func testSystemMSGTYPEEnvelopeFormat() {
+        // StreamDataMessage system type 0xFF00
+        let env = Envelope(msgtype: 0xFF00, sequence: 0, payload: Data())
+        let packed = env.pack()
+        XCTAssertEqual(packed[0], 0xFF) // MSGTYPE high
+        XCTAssertEqual(packed[1], 0x00) // MSGTYPE low
     }
 
     // MARK: - Sequence Wrap
@@ -225,9 +219,7 @@ final class ChannelTests: XCTestCase {
 
     // MARK: - System MSGTYPE Constants
 
-    func testSystemMSGTYPEConstants() {
-        XCTAssertEqual(Channel.MSGTYPE_ACK, 0xFFFF)
-        XCTAssertEqual(Channel.MSGTYPE_NACK, 0xFFFE)
+    func testStreamDataMSGTYPE() {
         XCTAssertEqual(StreamDataMessage.MSGTYPE, 0xFF00)
     }
 }
