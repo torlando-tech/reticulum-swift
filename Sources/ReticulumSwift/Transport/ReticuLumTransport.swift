@@ -1114,9 +1114,18 @@ public actor ReticuLumTransport {
                 print("[PROOF_RECV] MATCH! Found pending link for PROOF, processing...")
                 await handleLinkProof(packet, link: link)
             } else if let link = activeLinks[destHash] {
-                // DATA packet proof on an active link (e.g., propagation node confirming delivery)
-                print("[PROOF_RECV] DATA proof on active link \(proofDestHex)")
-                await handleDataProof(packet, link: link)
+                // PROOF on active link: could be data proof or resource proof
+                if packet.context == ResourcePacketContext.resourceProof {
+                    // Resource proof (RESOURCE_PRF) - route to link's resource handler
+                    // PROOF packets over links are NOT encrypted (Python Packet.pack():
+                    // "Packet proofs over links are not encrypted" → ciphertext = data)
+                    print("[PROOF_RECV] RESOURCE proof on active link \(proofDestHex), data=\(packet.data.count) bytes")
+                    await link.handleResourcePacket(context: packet.context, data: packet.data)
+                } else {
+                    // DATA packet proof (e.g., propagation node confirming delivery)
+                    print("[PROOF_RECV] DATA proof on active link \(proofDestHex)")
+                    await handleDataProof(packet, link: link)
+                }
             } else {
                 // Announce PROOF or path request response - existing handling
                 print("[PROOF_RECV] No link match, treating as announce PROOF")
@@ -1198,16 +1207,23 @@ public actor ReticuLumTransport {
             try await self.sendRawBytes(data)
         }
 
-        // Set link established callback
+        // Configure link with destination callbacks IMMEDIATELY (before LRRTT).
+        // This prevents a race condition where a resource advertisement arrives
+        // and is processed before the LRRTT completes. Without this, the resource
+        // strategy is still .acceptNone when the advertisement is checked, causing
+        // the resource to be rejected and the link to close prematurely.
+        // This is the actor-concurrency equivalent of Python's single-threaded
+        // guarantee that callbacks fire before the next packet is processed.
+        if let destCallback = destinationLinkCallbacks[packet.destination] {
+            await destCallback(link)
+            print("[LINK_RESPONDER] Pre-configured link \(linkIdHex) with destination callbacks")
+        }
+
+        // Set link established callback (for logging and any post-establishment work)
         await link.setLinkEstablishedCallback { [weak self] (establishedLink: Link) async -> Void in
             guard let self = self else { return }
             let linkIdHex = await establishedLink.linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
             print("[LINK_RESPONDER] Link \(linkIdHex) established (responder)")
-
-            // Notify destination's link callback
-            if let callback = await self.getDestinationLinkCallback(for: packet.destination) {
-                await callback(establishedLink)
-            }
         }
 
         // Create and send PROOF

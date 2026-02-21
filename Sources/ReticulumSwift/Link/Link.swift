@@ -728,16 +728,16 @@ public actor Link {
     /// Uses the Token created after ECDH key exchange to verify and decrypt
     /// data received from the peer.
     ///
+    /// Note: No state check — the responder must decrypt LRRTT while still
+    /// in `.handshake` state (before processLRRTT transitions to `.active`).
+    /// Python's Link.decrypt() has no state guard either. The token guard
+    /// is sufficient: if keys have been derived, decryption should work.
+    ///
     /// - Parameter ciphertext: Encrypted data in Token format
     /// - Returns: Decrypted plaintext
-    /// - Throws: `LinkError.notActive` if link not established
     /// - Throws: `LinkError.encryptionNotReady` if Token not created
     /// - Throws: `LinkError.decryptionFailed` if decryption fails
     public func decrypt(_ ciphertext: Data) throws -> Data {
-        guard state.isEstablished else {
-            throw LinkError.notActive
-        }
-
         guard let token = token else {
             throw LinkError.encryptionNotReady
         }
@@ -1065,14 +1065,23 @@ public actor Link {
         let resourceContext = data[data.startIndex]
         let payload = Data(data.dropFirst())
 
-        // Resource data parts (0x01) are NOT link-encrypted per Python
-        // All other resource packets (0x02-0x07) ARE link-encrypted
+        // Encryption rules per Python Packet.pack():
+        // - Resource data parts (0x01): NOT link-encrypted (Resource handles own encryption)
+        // - Resource proof (0x05): NOT encrypted (PROOF packets over links are plaintext)
+        //   Python: "Packet proofs over links are not encrypted" → ciphertext = data
+        // - All other resource packets (0x02-0x04, 0x06-0x07): ARE link-encrypted
         let wirePayload: Data
-        if resourceContext == ResourcePacketContext.resource {
+        if resourceContext == ResourcePacketContext.resource ||
+           resourceContext == ResourcePacketContext.resourceProof {
             wirePayload = payload
         } else {
             wirePayload = try encrypt(payload)
         }
+
+        // Resource proof (0x05) uses PROOF packet type per Python
+        // Python: RNS.Packet(self.link, proof_data, packet_type=RNS.Packet.PROOF, context=RNS.Packet.RESOURCE_PRF)
+        // Python's Link.receive() only handles RESOURCE_PRF in the PROOF branch
+        let pktType: PacketType = resourceContext == ResourcePacketContext.resourceProof ? .proof : .data
 
         let header = PacketHeader(
             headerType: .header1,
@@ -1080,7 +1089,7 @@ public actor Link {
             hasIFAC: false,
             transportType: .broadcast,
             destinationType: .link,
-            packetType: .data,
+            packetType: pktType,
             hopCount: 0
         )
 
@@ -1378,18 +1387,22 @@ public actor Link {
     /// Handle resource proof packet.
     ///
     /// Called when receiving proof of successful transfer from the peer.
-    /// Proof format: resource hash (32 bytes)
+    /// Python proof format: resource_hash(32) + SHA256(assembled_data + resource_hash)(32) = 64 bytes
+    /// Validation: proof_data[32:] == expected_proof where expected_proof = SHA256(original_data + hash)
     ///
-    /// - Parameter data: Proof packet data (resource hash)
+    /// - Parameter data: Proof packet data (64 bytes: hash + proof)
     private func handleResourceProof(_ data: Data) async {
-        // Proof should be 32-byte resource hash
-        guard data.count >= 32 else { return }
+        // Proof should be 64 bytes: resource_hash(32) + proof(32)
+        guard data.count >= 64 else {
+            print("[RESOURCE_PROOF] Proof too short: \(data.count) bytes (expected 64)")
+            return
+        }
 
         let proofHash = data.prefix(32)
 
         // Find matching outbound resource
         for (hash, resource) in outboundResources {
-            // Check if proof matches this resource
+            // Match by resource hash (first 32 bytes of proof)
             if let resourceHash = await resource.hash, Data(proofHash) == resourceHash {
                 do {
                     // Mark as complete

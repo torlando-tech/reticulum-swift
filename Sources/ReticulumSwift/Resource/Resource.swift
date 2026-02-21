@@ -877,11 +877,19 @@ public actor Resource {
     /// Send proof of successful resource assembly.
     ///
     /// Called by the receiver after successfully assembling all parts.
-    /// Sends the complete resource hash as proof to the sender.
+    /// Python Resource.prove() sends:
+    ///   proof = SHA256(assembled_data + resource_hash)
+    ///   proof_data = resource_hash(32) + proof(32) = 64 bytes
+    /// Python sender validates: proof_data[32:] == expected_proof
+    /// where expected_proof = SHA256(original_data + resource_hash)
     ///
     /// Packet format:
-    /// - Context byte: 0x04 (resourceProof)
-    /// - Resource hash: complete hash of assembled resource
+    /// - Context byte: 0x05 (resourceProof)
+    /// - resource_hash (32 bytes)
+    /// - SHA256(assembledData + resource_hash) (32 bytes)
+    ///
+    /// IMPORTANT: This must be sent as packet_type=PROOF (not DATA).
+    /// Python's Link.receive() routes RESOURCE_PRF only in the PROOF branch.
     ///
     /// - Throws: ResourceError if state is invalid or send fails
     public func sendProof() async throws {
@@ -900,12 +908,24 @@ public actor Resource {
             throw ResourceError.transferFailed(reason: "No resource hash available")
         }
 
-        // Frame with context byte
+        guard let assembled = assembledData else {
+            throw ResourceError.transferFailed(reason: "No assembled data available for proof")
+        }
+
+        // Compute proof = SHA256(assembled_data + resource_hash)
+        // Python: proof = RNS.Identity.full_hash(self.data + self.hash)
+        var proofInput = assembled
+        proofInput.append(resourceHash)
+        let proof = Data(SHA256.hash(data: proofInput))
+
+        // Frame: context byte + resource_hash(32) + proof(32) = 65 bytes
+        // Python: proof_data = self.hash + proof
         var packet = Data()
         packet.append(ResourcePacketContext.resourceProof)
         packet.append(resourceHash)
+        packet.append(proof)
 
-        // Send via link (encrypts and sends)
+        // Send via link (encrypts and sends as PROOF packet type)
         try await send(packet)
     }
 
