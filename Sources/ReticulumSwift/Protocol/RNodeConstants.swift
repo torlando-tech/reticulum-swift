@@ -177,6 +177,9 @@ public enum RNodeConstants {
     /// Modem timeout
     public static let ERROR_MODEM_TIMEOUT: UInt8 = 0x06
 
+    /// Invalid configuration (e.g., TX power exceeds device limits)
+    public static let ERROR_INVALID_CONFIG: UInt8 = 0x40
+
     // MARK: - Platform IDs
 
     /// AVR platform (Arduino, ATmega)

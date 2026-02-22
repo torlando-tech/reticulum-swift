@@ -152,8 +152,8 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// Last packet RSSI (dBm)
     private var rStatRssi: Int?
 
-    /// Last packet SNR (dB)
-    private var rStatSnr: Int?
+    /// Last packet SNR (dB, firmware reports in 0.25 dB increments)
+    private var rStatSnr: Double?
 
     /// Battery state
     private var rBatteryState: UInt8?
@@ -503,10 +503,13 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         }
     }
 
+    /// Delay between radio config commands (150ms, matches Python CONFIG_DELAY).
+    private let configDelay: UInt64 = 150_000_000
+
     /// Initialize radio with configured parameters.
     ///
     /// Matches Python initRadio() (lines 470-481).
-    /// Sends configuration commands in order:
+    /// Sends configuration commands in order with CONFIG_DELAY (150ms) between each:
     /// 1. Frequency (4 bytes big-endian)
     /// 2. Bandwidth (4 bytes big-endian)
     /// 3. TX Power (1 byte)
@@ -515,33 +518,37 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// 6. Short-term airtime lock (optional, 2 bytes big-endian)
     /// 7. Long-term airtime lock (optional, 2 bytes big-endian)
     /// 8. Radio state ON (1 byte)
-    ///
-    /// Then waits 2 seconds for BLE settling.
     private func initRadio() async throws {
         guard let config = radioConfig else {
             throw RNodeError.notConfigured
         }
 
-        // Send config commands in order
         try await setFrequency(config.frequency)
-        try await setBandwidth(config.bandwidth)
-        try await setTXPower(config.txPower)
-        try await setSpreadingFactor(config.spreadingFactor)
-        try await setCodingRate(config.codingRate)
+        try await Task.sleep(nanoseconds: configDelay)
 
-        // Optional airtime locks
+        try await setBandwidth(config.bandwidth)
+        try await Task.sleep(nanoseconds: configDelay)
+
+        try await setTXPower(config.txPower)
+        try await Task.sleep(nanoseconds: configDelay)
+
+        try await setSpreadingFactor(config.spreadingFactor)
+        try await Task.sleep(nanoseconds: configDelay)
+
+        try await setCodingRate(config.codingRate)
+        try await Task.sleep(nanoseconds: configDelay)
+
         if let stAlock = config.stAlock {
             try await setSTALock(stAlock)
+            try await Task.sleep(nanoseconds: configDelay)
         }
         if let ltAlock = config.ltAlock {
             try await setLTALock(ltAlock)
+            try await Task.sleep(nanoseconds: configDelay)
         }
 
-        // Turn radio on
         try await setRadioState(RNodeConstants.RADIO_STATE_ON)
-
-        // BLE settling time (Python line 481)
-        try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+        try await Task.sleep(nanoseconds: configDelay)
     }
 
     /// Validate radio state by comparing echoed values to requested values.
@@ -699,6 +706,9 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
 
     /// Handle received data frame (CMD_DATA).
     private func handleDataReceived(_ data: Data) {
+        // Only deliver data when online (Python line 1063)
+        guard online else { return }
+
         bytesReceived += UInt64(data.count)
 
         // Clear per-packet stats (Python process_incoming line 704)
@@ -860,8 +870,8 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
 
     private func handleCmdStatSnr(_ payload: Data) {
         guard !payload.isEmpty else { return }
-        // SNR is signed byte
-        rStatSnr = Int(Int8(bitPattern: payload[0]))
+        // SNR is signed byte in 0.25 dB increments — divide by 4 (Python line 870)
+        rStatSnr = Double(Int8(bitPattern: payload[0])) / 4.0
     }
 
     private func handleCmdStatBat(_ payload: Data) {
@@ -901,6 +911,11 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         case RNodeConstants.ERROR_MODEM_TIMEOUT:
             // Log only
             print("[RNodeInterface] Warning: RNode modem timeout")
+
+        case RNodeConstants.ERROR_INVALID_CONFIG:
+            lastErrorDescription = "Invalid configuration — TX power may exceed device limits"
+            notifyError(RNodeError.invalidConfig)
+            Task { await disconnect() }
 
         default:
             // Unknown error

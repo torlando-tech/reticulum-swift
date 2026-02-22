@@ -42,6 +42,12 @@ public enum RNodeError: Error, Sendable {
     /// a hardware fault or firmware bug.
     case modemTimeout
 
+    /// Invalid configuration (ERROR_INVALID_CONFIG = 0x40).
+    ///
+    /// The RNode rejected the radio configuration. Most commonly caused
+    /// by TX power exceeding device limits (SX1262=22dBm, SX1276=17dBm).
+    case invalidConfig
+
     /// Unknown hardware error code received.
     ///
     /// The firmware sent an error code not recognized by this
@@ -105,6 +111,9 @@ extension RNodeError: LocalizedError {
 
         case .modemTimeout:
             return "RNode modem timeout. Hardware may be faulty."
+
+        case .invalidConfig:
+            return "RNode rejected configuration — TX power may exceed device limits. Try reducing TX power."
 
         case .unknownHardwareError(let code):
             return "RNode hardware error: unknown error code 0x\(String(format: "%02X", code))."

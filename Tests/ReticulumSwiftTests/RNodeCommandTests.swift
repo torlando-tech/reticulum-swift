@@ -32,6 +32,7 @@ final class RNodeCommandTests: XCTestCase {
         XCTAssertEqual(RNodeConstants.ERROR_QUEUE_FULL, 0x04)
         XCTAssertEqual(RNodeConstants.ERROR_MEMORY_LOW, 0x05)
         XCTAssertEqual(RNodeConstants.ERROR_MODEM_TIMEOUT, 0x06)
+        XCTAssertEqual(RNodeConstants.ERROR_INVALID_CONFIG, 0x40)
     }
 
     func testDetectConstants() {
@@ -173,5 +174,34 @@ final class RNodeCommandTests: XCTestCase {
     func testRadioConfigInvalidBandwidth() {
         let badBW = RadioConfig(frequency: 915_000_000, bandwidth: 99_999, txPower: 17, spreadingFactor: 10, codingRate: 5)
         XCTAssertThrowsError(try badBW.validate())
+    }
+
+    // MARK: - SNR Calculation Tests
+
+    func testSnrPositiveValue() {
+        // SNR byte 0x14 (20 signed) → 20 / 4.0 = 5.0 dB
+        let snrByte: UInt8 = 0x14
+        let snr = Double(Int8(bitPattern: snrByte)) / 4.0
+        XCTAssertEqual(snr, 5.0)
+    }
+
+    func testSnrNegativeValue() {
+        // SNR byte 0xEC (-20 signed) → -20 / 4.0 = -5.0 dB
+        let negByte: UInt8 = 0xEC
+        let negSnr = Double(Int8(bitPattern: negByte)) / 4.0
+        XCTAssertEqual(negSnr, -5.0)
+    }
+
+    func testSnrZero() {
+        let zeroByte: UInt8 = 0x00
+        let snr = Double(Int8(bitPattern: zeroByte)) / 4.0
+        XCTAssertEqual(snr, 0.0)
+    }
+
+    func testSnrQuarterDbResolution() {
+        // SNR byte 0x01 (1 signed) → 1 / 4.0 = 0.25 dB
+        let snrByte: UInt8 = 0x01
+        let snr = Double(Int8(bitPattern: snrByte)) / 4.0
+        XCTAssertEqual(snr, 0.25)
     }
 }
