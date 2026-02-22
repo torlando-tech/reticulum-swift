@@ -482,22 +482,52 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
         connection: any BLEPeerConnection,
         isOutgoing: Bool
     ) async {
-        // MAC rotation check: if same identity exists at different address
         if let existingPeer = peers[identityHex] {
             let existingState = await existingPeer.state
-            if existingState == .connected {
-                // Healthy existing connection — reject new one
-                logger.debug("Rejecting duplicate connection for \(identityHex.prefix(8), privacy: .public) (already connected)")
-                connection.close()
-                return
-            } else {
-                // Dead connection — replace
-                logger.info("Replacing dead connection for \(identityHex.prefix(8), privacy: .public)")
-                await existingPeer.detach()
-                onPeerRemoved?(existingPeer.id)
+            let isStale = await existingPeer.isStale
+
+            if existingState == .connected && !isStale {
+                // Healthy existing connection — check for dual-connection dedup
+                let existingIsOutgoing = await existingPeer.isOutgoing
+                if existingIsOutgoing != isOutgoing {
+                    // Dual connection: same identity connected as both central and peripheral.
+                    // Keep the outgoing (central-initiated) connection — it's further along
+                    // with service discovery. Both sides follow this rule for determinism.
+                    if existingIsOutgoing {
+                        logger.info("Dual-dedup: keeping existing outgoing for \(identityHex.prefix(8), privacy: .public)")
+                        connection.close()
+                        return
+                    } else {
+                        logger.info("Dual-dedup: replacing incoming with outgoing for \(identityHex.prefix(8), privacy: .public)")
+                        // Fall through to hot-swap
+                    }
+                } else {
+                    // Same direction, healthy — reject duplicate
+                    logger.debug("Rejecting duplicate \(isOutgoing ? "outgoing" : "incoming", privacy: .public) for \(identityHex.prefix(8), privacy: .public)")
+                    connection.close()
+                    return
+                }
             }
+
+            // Hot-swap: stale, dead, or dual-dedup replacement
+            if existingState == .connected && isStale {
+                logger.info("MAC rotation: hot-swapping stale connection for \(identityHex.prefix(8), privacy: .public)")
+            } else if existingState != .connected {
+                logger.info("Replacing dead connection for \(identityHex.prefix(8), privacy: .public)")
+            }
+
+            // Update address mapping
+            let oldAddress = addressToIdentity.first { $0.value == identityHex }?.key
+            if let oldAddress { addressToIdentity.removeValue(forKey: oldAddress) }
+            addressToIdentity[connection.address] = identityHex
+
+            // Hot-swap preserves the peer's registration with Transport
+            await existingPeer.updateConnection(connection, isOutgoing: isOutgoing)
+            logger.info("Hot-swapped connection for \(identityHex.prefix(8), privacy: .public) at \(connection.address.prefix(8), privacy: .public)")
+            return
         }
 
+        // New peer — normal add flow
         let peer = BLEPeerInterface(
             parentId: id,
             peerIdentityHex: identityHex,

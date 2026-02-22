@@ -142,16 +142,26 @@ public final class BLETransport: Transport {
             }
 
             self.updateState(.connecting)
-            self.logger.info("Scanning for RNode peripherals with NUS service...")
 
-            // Start scanning for Nordic UART Service
-            // Allow duplicates in scan-only mode so RSSI updates flow to the picker UI
-            let serviceUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
-            let allowDuplicates = (self.targetDeviceName == nil)
-            manager.scanForPeripherals(
-                withServices: [serviceUUID],
-                options: [CBCentralManagerScanOptionAllowDuplicatesKey: allowDuplicates]
-            )
+            let isScanOnly = (self.targetDeviceName == nil)
+
+            if isScanOnly {
+                // Scan-only mode (device picker): scan ALL devices so RNodes that
+                // don't advertise NUS service UUID still appear. User selects by name.
+                self.logger.info("Scanning for all BLE peripherals (discovery mode)...")
+                manager.scanForPeripherals(
+                    withServices: nil,
+                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+                )
+            } else {
+                // Targeted mode: filter by NUS service for efficient connection
+                self.logger.info("Scanning for RNode peripherals with NUS service...")
+                let serviceUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
+                manager.scanForPeripherals(
+                    withServices: [serviceUUID],
+                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+                )
+            }
 
             // Start connection timeout (only for targeted connections, not scan-only)
             if self.targetDeviceName != nil {
@@ -223,6 +233,88 @@ public final class BLETransport: Transport {
         }
     }
 
+    /// Resume scanning after a connection attempt (successful or failed).
+    ///
+    /// Cancels any pending reconnect, disconnects any peripheral, clears
+    /// connection state, and restarts the BLE scan. Used by wizard/picker UI
+    /// to go back to discovery mode without creating a new CBCentralManager.
+    public func resumeScan() {
+        bleQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            // Cancel connection timeout
+            self.connectionTimeoutWork?.cancel()
+            self.connectionTimeoutWork = nil
+
+            // Disconnect peripheral if any
+            if let peripheral = self.peripheral {
+                self.centralManager?.cancelPeripheralConnection(peripheral)
+            }
+            self.peripheral = nil
+            self.txCharacteristic = nil
+            self.rxCharacteristic = nil
+            self.reconnectAttempt = 0
+
+            // Restart scanning
+            guard let manager = self.centralManager, manager.state == .poweredOn else {
+                self.updateState(.disconnected)
+                return
+            }
+
+            manager.stopScan()
+
+            let isScanOnly = (self.targetDeviceName == nil)
+            if isScanOnly {
+                manager.scanForPeripherals(
+                    withServices: nil,
+                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+                )
+            } else {
+                let serviceUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
+                manager.scanForPeripherals(
+                    withServices: [serviceUUID],
+                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+                )
+            }
+            self.updateState(.connecting)
+        }
+    }
+
+    /// Connect to a specific already-discovered peripheral.
+    ///
+    /// Used to trigger BLE pairing by connecting to a peripheral that was
+    /// discovered during a scan-only session (targetDeviceName == nil).
+    /// Stops scanning before connecting.
+    ///
+    /// - Parameter peripheral: The peripheral to connect to (must have been
+    ///   discovered by THIS transport's CBCentralManager).
+    public func connectToPeripheral(_ peripheral: CBPeripheral) {
+        bleQueue.async { [weak self] in
+            guard let self = self else {
+                Logger(subsystem: "com.columba.core", category: "BLETransport")
+                    .error("[PROBE] connectToPeripheral: self is nil")
+                return
+            }
+            let name = peripheral.name ?? "Unknown"
+            self.logger.error("[PROBE] connectToPeripheral called for \(name, privacy: .public), peripheral.state=\(String(describing: peripheral.state.rawValue), privacy: .public)")
+            guard let manager = self.centralManager, manager.state == .poweredOn else {
+                self.logger.error("[PROBE] manager not powered on, state=\(String(describing: self.centralManager?.state.rawValue ?? -1), privacy: .public)")
+                self.updateState(.failed(BLEError.bluetoothNotReady))
+                return
+            }
+
+            // Stop scanning
+            manager.stopScan()
+
+            // Store peripheral and connect
+            self.peripheral = peripheral
+            self.updateState(.connecting)
+            self.startConnectionTimeout()
+            self.logger.error("[PROBE] calling manager.connect for \(name, privacy: .public)")
+            manager.connect(peripheral, options: nil)
+        }
+    }
+
     /// Disconnect and clean up the BLE connection.
     public func disconnect() {
         bleQueue.async { [weak self] in
@@ -270,13 +362,18 @@ public final class BLETransport: Transport {
             if pendingConnect {
                 pendingConnect = false
                 logger.info("Starting deferred BLE scan")
-                let allowDuplicates = (targetDeviceName == nil)
-                let serviceUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
-                centralManager?.scanForPeripherals(
-                    withServices: [serviceUUID],
-                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: allowDuplicates]
-                )
-                if targetDeviceName != nil {
+                let isScanOnly = (targetDeviceName == nil)
+                if isScanOnly {
+                    centralManager?.scanForPeripherals(
+                        withServices: nil,
+                        options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+                    )
+                } else {
+                    let serviceUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
+                    centralManager?.scanForPeripherals(
+                        withServices: [serviceUUID],
+                        options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+                    )
                     startConnectionTimeout()
                 }
             }
@@ -341,7 +438,7 @@ public final class BLETransport: Transport {
     /// Called by BLEDelegateWrapper when peripheral connects.
     func handleConnectedPeripheral(_ peripheral: CBPeripheral) {
         let name = peripheral.name ?? "Unknown"
-        logger.info("Connected to peripheral: \(name, privacy: .public)")
+        logger.error("[PROBE] Connected to peripheral: \(name, privacy: .public)")
 
         // Discover Nordic UART Service
         let serviceUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
@@ -354,7 +451,7 @@ public final class BLETransport: Transport {
     func handleFailedToConnect(_ peripheral: CBPeripheral, error: Error?) {
         let name = peripheral.name ?? "Unknown"
         let errorDesc = error?.localizedDescription ?? "Unknown error"
-        logger.error("Failed to connect to \(name, privacy: .public): \(errorDesc, privacy: .public)")
+        logger.error("[PROBE] Failed to connect to \(name, privacy: .public): \(errorDesc, privacy: .public)")
 
         connectionTimeoutWork?.cancel()
         connectionTimeoutWork = nil
@@ -373,12 +470,12 @@ public final class BLETransport: Transport {
         let name = peripheral.name ?? "Unknown"
 
         if let error = error {
-            logger.error("Disconnected from \(name, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            logger.error("[PROBE] Disconnected from \(name, privacy: .public): \(error.localizedDescription, privacy: .public)")
             updateState(.failed(error))
             // Schedule reconnect with exponential backoff
             scheduleReconnect()
         } else {
-            logger.info("Disconnected from \(name, privacy: .public) (clean disconnect)")
+            logger.error("[PROBE] Disconnected from \(name, privacy: .public) (clean disconnect)")
             updateState(.disconnected)
         }
 
@@ -553,6 +650,7 @@ public final class BLETransport: Transport {
 
     /// Update state and notify callback on main queue.
     private func updateState(_ newState: TransportState) {
+        logger.error("[PROBE] state -> \(String(describing: newState), privacy: .public)")
         state = newState
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }

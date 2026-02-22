@@ -36,7 +36,7 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
     public let peerIdentityHex: String
 
     /// Whether this is an outgoing (central) connection
-    public let isOutgoing: Bool
+    public private(set) var isOutgoing: Bool
 
     /// Latest RSSI reading
     public private(set) var rssi: Int = 0
@@ -45,7 +45,7 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
     public private(set) var lastActivity: Date = Date()
 
     /// When this peer connection was established
-    public let connectedAt: Date = Date()
+    public private(set) var connectedAt: Date = Date()
 
     /// Total bytes sent to this peer
     public private(set) var bytesSent: Int = 0
@@ -201,17 +201,33 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
         }
     }
 
-    /// Update the underlying connection (e.g., after MAC rotation).
-    public func updateConnection(_ newConnection: any BLEPeerConnection) {
+    /// Whether this peer's connection appears stale (no activity for staleConnectionThreshold).
+    /// Used by BLEInterface to allow MAC-rotated peers to replace stale connections
+    /// without waiting for the disconnect event.
+    public var isStale: Bool {
+        Date().timeIntervalSince(lastActivity) > BLEMeshConstants.staleConnectionThreshold
+    }
+
+    /// Update the underlying connection (e.g., after MAC rotation hot-swap).
+    /// Resets stats and restarts background loops on the new connection.
+    public func updateConnection(_ newConnection: any BLEPeerConnection, isOutgoing newIsOutgoing: Bool) {
         // Cancel existing loops
         receiveTask?.cancel()
         keepaliveTask?.cancel()
         rssiTask?.cancel()
 
+        connection.close()
         connection = newConnection
+        self.isOutgoing = newIsOutgoing
         fragmenter = BLEFragmenter(mtu: newConnection.mtu)
         reassembler.reset()
         lastActivity = Date()
+        connectedAt = Date()
+        bytesSent = 0
+        bytesReceived = 0
+        packetsSent = 0
+        packetsReceived = 0
+        state = .connected
 
         // Restart loops
         startReceiving()
@@ -281,6 +297,13 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
 
     private func logDebug(_ message: String) {
         logger.debug("\(message, privacy: .public)")
+    }
+
+    // MARK: - Testing
+
+    /// Set lastActivity to an arbitrary date (for staleness testing).
+    internal func setLastActivityForTesting(_ date: Date) {
+        lastActivity = date
     }
 }
 

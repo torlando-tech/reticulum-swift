@@ -72,4 +72,11 @@ public enum BLEMeshConstants {
     // MARK: - RSSI Poll
 
     public static let rssiPollInterval: TimeInterval = 10.0
+
+    // MARK: - MAC Rotation
+
+    /// If a "connected" peer has no activity for this long, treat it as stale
+    /// and allow replacement by a new connection with the same identity.
+    /// Set to 2x keepalive interval.
+    public static let staleConnectionThreshold: TimeInterval = 30.0
 }

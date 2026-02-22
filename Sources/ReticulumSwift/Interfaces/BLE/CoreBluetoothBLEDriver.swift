@@ -185,7 +185,11 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
     }
 
     public func connect(address: String) async throws -> any BLEPeerConnection {
-        guard let peripheral = discoveredPeripherals[address] else {
+        // Must synchronize with bleQueue — didDiscover writes discoveredPeripherals on bleQueue,
+        // but connect() is called from BLEInterface actor (Swift concurrency thread).
+        // Unsynchronized concurrent read+write corrupts the dictionary (CVE: __NSTaggedDate objectForKey:).
+        let peripheral: CBPeripheral? = bleQueue.sync { discoveredPeripherals[address] }
+        guard let peripheral else {
             throw InterfaceError.connectionFailed(underlying: "Peripheral not found: \(address)")
         }
 
@@ -217,26 +221,32 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
     }
 
     public func disconnect(address: String) async {
-        if let peripheral = connectedPeripherals[address] {
-            centralManager.cancelPeripheralConnection(peripheral)
+        // Synchronize with bleQueue (these dictionaries are written on bleQueue from CB callbacks)
+        bleQueue.sync {
+            if let peripheral = connectedPeripherals[address] {
+                centralManager.cancelPeripheralConnection(peripheral)
+            }
+            peripheralConnections.removeValue(forKey: address)
+            connectedPeripherals.removeValue(forKey: address)
         }
-        peripheralConnections.removeValue(forKey: address)
-        connectedPeripherals.removeValue(forKey: address)
     }
 
     public func shutdown() {
-        centralManager.stopScan()
-        peripheralManager.stopAdvertising()
+        // Synchronize dictionary cleanup with bleQueue to avoid races with CB callbacks
+        bleQueue.sync {
+            centralManager.stopScan()
+            peripheralManager.stopAdvertising()
 
-        for (_, peripheral) in connectedPeripherals {
-            centralManager.cancelPeripheralConnection(peripheral)
+            for (_, peripheral) in connectedPeripherals {
+                centralManager.cancelPeripheralConnection(peripheral)
+            }
+
+            connectedPeripherals.removeAll()
+            peripheralConnections.removeAll()
+            discoveredPeripherals.removeAll()
+            subscribedCentrals.removeAll()
+            centralConnections.removeAll()
         }
-
-        connectedPeripherals.removeAll()
-        peripheralConnections.removeAll()
-        discoveredPeripherals.removeAll()
-        subscribedCentrals.removeAll()
-        centralConnections.removeAll()
 
         discoveredPeersContinuation?.finish()
         incomingConnectionsContinuation?.finish()
@@ -638,7 +648,8 @@ extension CoreBluetoothBLEDriver {
 
     /// Read RSSI for a connected peripheral.
     func readRssi(address: String) async throws -> Int {
-        guard let peripheral = connectedPeripherals[address] else {
+        let peripheral: CBPeripheral? = bleQueue.sync { connectedPeripherals[address] }
+        guard let peripheral else {
             throw InterfaceError.notConnected
         }
 
