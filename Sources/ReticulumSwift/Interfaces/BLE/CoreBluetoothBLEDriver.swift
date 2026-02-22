@@ -14,6 +14,12 @@ import Foundation
 import CoreBluetooth
 import OSLog
 
+// BLE diagnostic log — uses os_log Logger at error level for guaranteed unredacted syslog output
+private let bleDiagLogger = Logger(subsystem: "net.reticulum", category: "BLEDiag")
+private func bleDiag(_ message: String) {
+    bleDiagLogger.error("[BLE_DRV] \(message, privacy: .public)")
+}
+
 // MARK: - CoreBluetooth BLE Driver
 
 /// iOS CoreBluetooth implementation of the BLE mesh driver.
@@ -111,15 +117,25 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
     }()
 
     public func startAdvertising() async throws {
+        bleDiag("startAdvertising() called, peripheralReady=\(peripheralReady)")
         if !peripheralReady {
-            // Wait for peripheral manager to be ready
-            try await Task.sleep(for: .seconds(1))
+            bleDiag("Waiting up to 3s for peripheral manager...")
+            for i in 1...6 {
+                try await Task.sleep(for: .milliseconds(500))
+                if peripheralReady {
+                    bleDiag("Peripheral ready after \(i * 500)ms")
+                    break
+                }
+            }
+            bleDiag("After wait, peripheralReady=\(peripheralReady)")
         }
         guard peripheralReady else {
+            bleDiag("ERROR: Peripheral NOT ready — cannot advertise")
             throw InterfaceError.connectionFailed(underlying: "Bluetooth peripheral not ready")
         }
 
         setupGATTService()
+        bleDiag("GATT service set up")
 
         peripheralManager.startAdvertising([
             CBAdvertisementDataServiceUUIDsKey: [BLEMeshConstants.serviceUUID],
@@ -130,7 +146,7 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
         _isRunning = true
         lock.unlock()
 
-        logger.info("BLE advertising started")
+        bleDiag("Advertising started for service \(BLEMeshConstants.serviceUUIDString)")
     }
 
     public func stopAdvertising() async {
@@ -139,10 +155,20 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
     }
 
     public func startScanning() async throws {
+        bleDiag("startScanning() called, centralReady=\(centralReady)")
         if !centralReady {
-            try await Task.sleep(for: .seconds(1))
+            bleDiag("Waiting up to 3s for central manager...")
+            for i in 1...6 {
+                try await Task.sleep(for: .milliseconds(500))
+                if centralReady {
+                    bleDiag("Central ready after \(i * 500)ms")
+                    break
+                }
+            }
+            bleDiag("After wait, centralReady=\(centralReady)")
         }
         guard centralReady else {
+            bleDiag("ERROR: Central NOT ready — cannot scan")
             throw InterfaceError.connectionFailed(underlying: "Bluetooth central not ready")
         }
 
@@ -151,7 +177,7 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
         )
 
-        logger.info("BLE scanning started")
+        bleDiag("Scanning started for service \(BLEMeshConstants.serviceUUIDString)")
     }
 
     public func stopScanning() async {
@@ -271,11 +297,18 @@ extension CoreBluetoothBLEDriver: CBCentralManagerDelegate {
         centralReady = central.state == .poweredOn
         lock.unlock()
 
-        if central.state == .poweredOn {
-            logger.info("Central manager powered on")
-        } else {
-            logger.warning("Central manager state: \(String(describing: central.state.rawValue), privacy: .public)")
+        let stateStr: String
+        switch central.state {
+        case .poweredOn: stateStr = "poweredOn"
+        case .poweredOff: stateStr = "poweredOff"
+        case .unauthorized: stateStr = "unauthorized"
+        case .unsupported: stateStr = "unsupported"
+        case .resetting: stateStr = "resetting"
+        case .unknown: stateStr = "unknown"
+        @unknown default: stateStr = "rawValue=\(central.state.rawValue)"
         }
+        bleDiag("Central manager state: \(stateStr)")
+        logger.info("[BLE_DIAG] Central manager state: \(stateStr, privacy: .public)")
     }
 
     public func centralManager(
@@ -285,7 +318,14 @@ extension CoreBluetoothBLEDriver: CBCentralManagerDelegate {
         rssi RSSI: NSNumber
     ) {
         let address = peripheral.identifier.uuidString
+        let name = peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? "unknown"
+        let isNew = discoveredPeripherals[address] == nil
         discoveredPeripherals[address] = peripheral
+
+        // Only log first sighting of each peer (fires ~10x/s per peer with allowDuplicates)
+        if isNew {
+            bleDiag("Discovered NEW peer: \(name) addr=\(address.prefix(8)) rssi=\(RSSI.intValue)")
+        }
 
         let peer = DiscoveredPeer(
             address: address,
@@ -301,6 +341,7 @@ extension CoreBluetoothBLEDriver: CBCentralManagerDelegate {
         didConnect peripheral: CBPeripheral
     ) {
         let address = peripheral.identifier.uuidString
+        bleDiag("didConnect peripheral \(address.prefix(8))")
         connectedPeripherals[address] = peripheral
         peripheral.delegate = self
 
@@ -315,6 +356,7 @@ extension CoreBluetoothBLEDriver: CBCentralManagerDelegate {
     ) {
         let address = peripheral.identifier.uuidString
         let errorMsg = error?.localizedDescription ?? "Unknown error"
+        bleDiag("didFailToConnect \(address.prefix(8)): \(errorMsg)")
 
         lock.lock()
         if let continuation = pendingConnect.removeValue(forKey: address) {
@@ -331,6 +373,7 @@ extension CoreBluetoothBLEDriver: CBCentralManagerDelegate {
         error: Error?
     ) {
         let address = peripheral.identifier.uuidString
+        bleDiag("didDisconnect peripheral \(address.prefix(8)), error=\(error?.localizedDescription ?? "none")")
         connectedPeripherals.removeValue(forKey: address)
 
         if let conn = peripheralConnections.removeValue(forKey: address) {
@@ -349,6 +392,8 @@ extension CoreBluetoothBLEDriver: CBPeripheralDelegate {
         _ peripheral: CBPeripheral,
         didDiscoverServices error: Error?
     ) {
+        let address = peripheral.identifier.uuidString
+        bleDiag("didDiscoverServices for \(address.prefix(8)), error=\(error?.localizedDescription ?? "none"), services=\(peripheral.services?.map { $0.uuid.uuidString } ?? [])")
         guard error == nil,
               let service = peripheral.services?.first(where: { $0.uuid == BLEMeshConstants.serviceUUID }) else {
             let address = peripheral.identifier.uuidString
@@ -374,6 +419,7 @@ extension CoreBluetoothBLEDriver: CBPeripheralDelegate {
         error: Error?
     ) {
         let address = peripheral.identifier.uuidString
+        bleDiag("didDiscoverCharacteristics for \(address.prefix(8)), error=\(error?.localizedDescription ?? "none"), chars=\(service.characteristics?.map { $0.uuid.uuidString } ?? [])")
 
         guard error == nil, let chars = service.characteristics else {
             lock.lock()
@@ -426,6 +472,9 @@ extension CoreBluetoothBLEDriver: CBPeripheralDelegate {
             mtu: min(mtu, BLEMeshConstants.maxMTU)
         )
 
+        // Eagerly initialize receivedFragments to set continuation before any data arrives
+        _ = connection.receivedFragments
+
         peripheralConnections[address] = connection
 
         // Resume pending connect
@@ -443,11 +492,28 @@ extension CoreBluetoothBLEDriver: CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
-        guard error == nil, let data = characteristic.value else { return }
+        guard error == nil, let data = characteristic.value else {
+            // If identity read failed, resume with error
+            if characteristic.uuid == BLEMeshConstants.identityCharUUID {
+                let address = peripheral.identifier.uuidString
+                if let conn = peripheralConnections[address] {
+                    bleDiag("Identity read failed for \(address.prefix(8)): \(error?.localizedDescription ?? "no data")")
+                    conn.handleIdentityReadError(error ?? InterfaceError.connectionFailed(underlying: "No identity data"))
+                }
+            }
+            return
+        }
         let address = peripheral.identifier.uuidString
 
         if let conn = peripheralConnections[address] {
-            conn.handleReceivedData(data)
+            if characteristic.uuid == BLEMeshConstants.identityCharUUID {
+                // Identity characteristic read response — route to identity handler
+                bleDiag("Identity read response from \(address.prefix(8)): \(data.count) bytes")
+                conn.handleIdentityRead(data)
+            } else {
+                // TX notification — route to data handler
+                conn.handleReceivedData(data)
+            }
         }
     }
 
@@ -481,11 +547,18 @@ extension CoreBluetoothBLEDriver: CBPeripheralManagerDelegate {
         peripheralReady = peripheral.state == .poweredOn
         lock.unlock()
 
-        if peripheral.state == .poweredOn {
-            logger.info("Peripheral manager powered on")
-        } else {
-            logger.warning("Peripheral manager state: \(String(describing: peripheral.state.rawValue), privacy: .public)")
+        let stateStr: String
+        switch peripheral.state {
+        case .poweredOn: stateStr = "poweredOn"
+        case .poweredOff: stateStr = "poweredOff"
+        case .unauthorized: stateStr = "unauthorized"
+        case .unsupported: stateStr = "unsupported"
+        case .resetting: stateStr = "resetting"
+        case .unknown: stateStr = "unknown"
+        @unknown default: stateStr = "rawValue=\(peripheral.state.rawValue)"
         }
+        bleDiag("Peripheral manager state: \(stateStr)")
+        logger.info("[BLE_DIAG] Peripheral manager state: \(stateStr, privacy: .public)")
     }
 
     public func peripheralManager(
@@ -500,12 +573,14 @@ extension CoreBluetoothBLEDriver: CBPeripheralManagerDelegate {
 
             if request.characteristic.uuid == BLEMeshConstants.rxCharUUID {
                 let centralId = request.central.identifier.uuidString
+                bleDiag("didReceiveWrite from \(centralId.prefix(8)), \(data.count) bytes, existing=\(centralConnections[centralId] != nil), hex=\(data.prefix(32).map { String(format: "%02x", $0) }.joined())")
 
                 // Route to appropriate connection
                 if let conn = centralConnections[centralId] {
                     conn.handleReceivedData(data)
                 } else {
                     // New central writing to us — create connection for handshake
+                    bleDiag("New incoming central \(centralId.prefix(8)) — creating connection")
                     let conn = CoreBluetoothPeerConnection(
                         address: centralId,
                         central: request.central,
@@ -514,6 +589,12 @@ extension CoreBluetoothBLEDriver: CBPeripheralManagerDelegate {
                         mtu: min(request.central.maximumUpdateValueLength + BLEMeshConstants.headerSize, BLEMeshConstants.maxMTU)
                     )
                     centralConnections[centralId] = conn
+
+                    // IMPORTANT: Eagerly initialize the receivedFragments lazy var
+                    // BEFORE calling handleReceivedData. Otherwise the fragmentContinuation
+                    // is nil and the first data (identity) is silently dropped.
+                    _ = conn.receivedFragments
+
                     conn.handleReceivedData(data)
 
                     // Emit as incoming connection
@@ -532,7 +613,7 @@ extension CoreBluetoothBLEDriver: CBPeripheralManagerDelegate {
     ) {
         let centralId = central.identifier.uuidString
         subscribedCentrals[centralId] = central
-        logger.debug("Central \(centralId.prefix(8), privacy: .public) subscribed to TX")
+        bleDiag("Central \(centralId.prefix(8)) subscribed to TX (char=\(characteristic.uuid.uuidString))")
     }
 
     public func peripheralManager(
@@ -541,6 +622,7 @@ extension CoreBluetoothBLEDriver: CBPeripheralManagerDelegate {
         didUnsubscribeFrom characteristic: CBCharacteristic
     ) {
         let centralId = central.identifier.uuidString
+        bleDiag("Central \(centralId.prefix(8)) unsubscribed from TX — tearing down connection")
         subscribedCentrals.removeValue(forKey: centralId)
 
         if let conn = centralConnections.removeValue(forKey: centralId) {
@@ -548,7 +630,6 @@ extension CoreBluetoothBLEDriver: CBPeripheralManagerDelegate {
         }
 
         connectionLostContinuation?.yield(centralId)
-        logger.debug("Central \(centralId.prefix(8), privacy: .public) unsubscribed from TX")
     }
 }
 
@@ -707,6 +788,15 @@ final class CoreBluetoothPeerConnection: BLEPeerConnection, @unchecked Sendable 
 
         identity = data
         cont?.resume(returning: data)
+    }
+
+    func handleIdentityReadError(_ error: Error) {
+        lock.lock()
+        let cont = pendingIdentityRead
+        pendingIdentityRead = nil
+        lock.unlock()
+
+        cont?.resume(throwing: error)
     }
 
     func handleDisconnection() {

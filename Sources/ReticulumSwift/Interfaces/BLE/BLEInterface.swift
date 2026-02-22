@@ -13,6 +13,12 @@
 import Foundation
 import OSLog
 
+// BLE diagnostic log — uses os_log Logger for unredacted syslog output
+private let bleDiagLogger = Logger(subsystem: "net.reticulum", category: "BLEDiag")
+private func bleDiag(_ message: String) {
+    bleDiagLogger.error("[BLE_IF] \(message, privacy: .public)")
+}
+
 // MARK: - BLE Interface
 
 /// BLE mesh parent interface that orchestrates peer discovery and lifecycle.
@@ -121,28 +127,51 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
     public func connect() async throws {
         guard state != .connected else { return }
 
-        logger.info("BLEInterface[\(self.id, privacy: .public)] starting")
+        bleDiag("connect() starting for id=\(id)")
         state = .connecting
         delegateRef?.delegate?.interface(id: id, didChangeState: .connecting)
 
-        // Start advertising first, then scanning with a small delay
-        try await driver.startAdvertising()
+        // IMPORTANT: Eagerly initialize the AsyncStream lazy vars to set continuations
+        // BEFORE starting advertising/scanning. Otherwise discoveries arrive before
+        // the continuation exists and are silently dropped.
+        _ = driver.discoveredPeers
+        _ = driver.incomingConnections
+        _ = driver.connectionLost
+        bleDiag("Eagerly initialized driver streams")
 
-        // Brief delay before scanning (matches Kotlin 100ms)
-        try await Task.sleep(for: .milliseconds(100))
-
-        try await driver.startScanning()
-
-        // Start background tasks
+        // Start background consumer tasks BEFORE advertising/scanning
         startDiscoveryCollection()
         startIncomingCollection()
         startDisconnectionCollection()
         startPeriodicCleanup()
         startZombieDetection()
+        bleDiag("Background tasks started")
+
+        // Small yield to let the consumer Tasks run and enter their for-await loops
+        try await Task.sleep(for: .milliseconds(50))
+
+        do {
+            try await driver.startAdvertising()
+            bleDiag("Advertising started OK")
+        } catch {
+            bleDiag("startAdvertising FAILED: \(error)")
+            throw error
+        }
+
+        // Brief delay before scanning (matches Kotlin 100ms)
+        try await Task.sleep(for: .milliseconds(100))
+
+        do {
+            try await driver.startScanning()
+            bleDiag("Scanning started OK")
+        } catch {
+            bleDiag("startScanning FAILED: \(error)")
+            throw error
+        }
 
         state = .connected
         delegateRef?.delegate?.interface(id: id, didChangeState: .connected)
-        logger.info("BLEInterface[\(self.id, privacy: .public)] connected")
+        bleDiag("Fully connected — advertising + scanning active, state=\(state)")
     }
 
     // MARK: - Disconnect
@@ -183,18 +212,32 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
     // MARK: - Task 1: Discovered Peers Collection
 
     private func startDiscoveryCollection() {
+        bleDiag("startDiscoveryCollection() called")
+        // Access the stream eagerly on the actor, before creating the Task
+        let stream = driver.discoveredPeers
+        bleDiag("got discoveredPeers stream")
         discoveryTask = Task { [weak self] in
-            guard let self = self else { return }
-            let stream = await self.getDiscoveredPeers()
+            bleDiag("discoveryTask: body entered (self=\(self == nil ? "nil" : "alive"))")
+            guard let self = self else {
+                bleDiag("discoveryTask: self is nil, exiting")
+                return
+            }
+            bleDiag("discoveryTask: entering for-await loop")
+            var count = 0
             for await discovered in stream {
-                guard !Task.isCancelled else { break }
+                guard !Task.isCancelled else {
+                    bleDiag("discoveryTask: cancelled, breaking")
+                    break
+                }
+                count += 1
+                if count <= 5 || count % 50 == 0 {
+                    bleDiag("discoveryTask: discovery #\(count) \(discovered.address.prefix(8))")
+                }
                 await self.handleDiscoveredPeer(discovered)
             }
+            bleDiag("discoveryTask: stream ended after \(count) discoveries")
         }
-    }
-
-    private nonisolated func getDiscoveredPeers() -> AsyncStream<DiscoveredPeer> {
-        driver.discoveredPeers
+        bleDiag("startDiscoveryCollection() task created")
     }
 
     private func handleDiscoveredPeer(_ discovered: DiscoveredPeer) async {
@@ -202,14 +245,19 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
 
         // Skip if blacklisted
         if let expiry = blacklist[address], Date() < expiry {
+            bleDiag("Skip \(address.prefix(8)): blacklisted until \(expiry)")
             return
         }
 
-        // Skip if RSSI too weak
-        guard discovered.rssi >= BLEMeshConstants.minRSSI else { return }
+        // Skip if RSSI too weak (silent — fires constantly)
+        guard discovered.rssi >= BLEMeshConstants.minRSSI else {
+            return
+        }
 
-        // Skip if already connected at this address
-        if addressToIdentity[address] != nil { return }
+        // Skip if already connected at this address (silent — this fires constantly with allowDuplicates)
+        if addressToIdentity[address] != nil {
+            return
+        }
 
         // Check capacity
         if peers.count >= BLEMeshConstants.maxConnections {
@@ -226,11 +274,14 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
 
         // Connect
         do {
+            bleDiag("Connecting to discovered peer \(address.prefix(8)) rssi=\(discovered.rssi)")
             let connection = try await driver.connect(address: address)
+            bleDiag("Connected to \(address.prefix(8)), performing handshake...")
             let identityHex = try await performCentralHandshake(connection: connection)
+            bleDiag("Handshake complete, identity=\(identityHex.prefix(8))")
             await addPeer(identityHex: identityHex, connection: connection, isOutgoing: true)
         } catch {
-            logger.debug("Connection to \(address, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            bleDiag("Connection to \(address.prefix(8)) failed: \(error)")
             applyBackoff(address: address)
         }
     }
@@ -238,31 +289,35 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
     // MARK: - Task 2: Incoming Connections Collection
 
     private func startIncomingCollection() {
+        bleDiag("startIncomingCollection() called")
+        let stream = driver.incomingConnections
+        bleDiag("got incomingConnections stream")
         incomingTask = Task { [weak self] in
+            bleDiag("incomingTask: body entered")
             guard let self = self else { return }
-            let stream = await self.getIncomingConnections()
             for await connection in stream {
                 guard !Task.isCancelled else { break }
+                bleDiag("incomingTask: got incoming connection from \(connection.address.prefix(8))")
                 await self.handleIncomingConnection(connection)
             }
+            bleDiag("incomingTask: stream ended")
         }
-    }
-
-    private nonisolated func getIncomingConnections() -> AsyncStream<any BLEPeerConnection> {
-        driver.incomingConnections
     }
 
     private func handleIncomingConnection(_ connection: any BLEPeerConnection) async {
         let address = connection.address
+        bleDiag("handleIncomingConnection from \(address.prefix(8))")
 
         // Skip if already connected at this address
         if addressToIdentity[address] != nil {
+            bleDiag("Already connected at \(address.prefix(8)), closing")
             connection.close()
             return
         }
 
         // Check capacity
         guard peers.count < BLEMeshConstants.maxConnections else {
+            bleDiag("At max connections (\(BLEMeshConstants.maxConnections)), closing incoming")
             connection.close()
             return
         }
@@ -270,9 +325,10 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
         // Peripheral handshake: wait for central to write its identity
         do {
             let identityHex = try await performPeripheralHandshake(connection: connection)
+            bleDiag("Incoming handshake success, identity=\(identityHex.prefix(8))")
             await addPeer(identityHex: identityHex, connection: connection, isOutgoing: false)
         } catch {
-            logger.debug("Incoming handshake failed from \(address, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            bleDiag("Incoming handshake failed from \(address.prefix(8)): \(error)")
             connection.close()
         }
     }
@@ -280,18 +336,15 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
     // MARK: - Task 3: Disconnection Collection
 
     private func startDisconnectionCollection() {
+        let stream = driver.connectionLost
         disconnectionTask = Task { [weak self] in
             guard let self = self else { return }
-            let stream = await self.getConnectionLost()
             for await address in stream {
                 guard !Task.isCancelled else { break }
+                bleDiag("disconnectionTask: lost connection to \(address.prefix(8))")
                 await self.handleDisconnection(address: address)
             }
         }
-    }
-
-    private nonisolated func getConnectionLost() -> AsyncStream<String> {
-        driver.connectionLost
     }
 
     private func handleDisconnection(address: String) async {
@@ -318,6 +371,15 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
 
     private func cleanupExpired() {
         let now = Date()
+
+        // Periodic status dump
+        bleDiag("STATUS: state=\(state), peers=\(peers.count)/\(BLEMeshConstants.maxConnections), addressMap=\(addressToIdentity.count), blacklist=\(blacklist.count)")
+        for (identityHex, _) in peers {
+            bleDiag("  peer: \(identityHex.prefix(16))")
+        }
+        for (addr, expiry) in blacklist {
+            bleDiag("  blacklisted: \(addr.prefix(8)) until \(expiry)")
+        }
 
         // Expire blacklist entries
         for (address, expiry) in blacklist where now >= expiry {
@@ -386,12 +448,15 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
 
     /// Peripheral-side handshake: wait for central to write its identity.
     private func performPeripheralHandshake(connection: any BLEPeerConnection) async throws -> String {
+        bleDiag("performPeripheralHandshake: waiting for identity from \(connection.address.prefix(8))")
         // Wait for the central to write its 16-byte identity to our RX characteristic
         let remoteIdentity = try await withTimeout(seconds: BLEMeshConstants.handshakeTimeout) {
             for await fragment in connection.receivedFragments {
+                bleDiag("peripheralHandshake: received fragment \(fragment.count) bytes from \(connection.address.prefix(8)): \(fragment.prefix(32).map { String(format: "%02x", $0) }.joined())")
                 if fragment.count == 16 {
                     return fragment
                 }
+                bleDiag("peripheralHandshake: fragment not 16 bytes, skipping")
             }
             throw InterfaceError.connectionFailed(underlying: "Handshake stream ended without identity")
         }
