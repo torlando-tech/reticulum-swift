@@ -148,7 +148,7 @@ public final class BLETransport: Transport {
             if isScanOnly {
                 // Scan-only mode (device picker): scan ALL devices so RNodes that
                 // don't advertise NUS service UUID still appear. User selects by name.
-                self.logger.info("Scanning for all BLE peripherals (discovery mode)...")
+                self.logger.error("[BLETRANS] Scanning all peripherals (discovery mode)")
                 manager.scanForPeripherals(
                     withServices: nil,
                     options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
@@ -157,7 +157,7 @@ public final class BLETransport: Transport {
                 // Targeted mode: scan without service filter because many RNodes
                 // don't advertise the NUS service UUID in BLE advertisement packets.
                 // We filter by peripheral name instead (in handleDiscoveredPeripheral).
-                self.logger.info("Scanning for RNode peripheral named '\(self.targetDeviceName ?? "")'...")
+                self.logger.error("[BLETRANS] Scanning for peripheral named '\(self.targetDeviceName ?? "", privacy: .public)'")
                 manager.scanForPeripherals(
                     withServices: nil,
                     options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
@@ -173,8 +173,10 @@ public final class BLETransport: Transport {
 
     /// Send data to the connected RNode peripheral.
     ///
-    /// Data is chunked to respect the peripheral's MTU. Writes use
-    /// "write without response" for lowest latency.
+    /// Data is chunked to respect the peripheral's MTU. The write type is
+    /// determined by the RX characteristic's supported properties:
+    /// - `.writeWithoutResponse` preferred for lowest latency
+    /// - `.write` (with response) used as fallback
     ///
     /// - Parameters:
     ///   - data: Data to send.
@@ -201,36 +203,51 @@ public final class BLETransport: Transport {
                 return
             }
 
-            // Check if write buffer is available
-            guard peripheral.canSendWriteWithoutResponse else {
-                self.logger.warning("Write buffer full")
-                completion?(BLEError.bufferFull)
+            // Determine write type based on characteristic properties
+            let writeType: CBCharacteristicWriteType
+            if rxChar.properties.contains(.writeWithoutResponse) {
+                // Check if buffer is available for write-without-response
+                guard peripheral.canSendWriteWithoutResponse else {
+                    self.logger.warning("Write buffer full, falling back to writeWithResponse")
+                    // Fall back to write-with-response instead of failing
+                    if rxChar.properties.contains(.write) {
+                        self.doWrite(data, to: peripheral, char: rxChar, type: .withResponse, completion: completion)
+                    } else {
+                        completion?(BLEError.bufferFull)
+                    }
+                    return
+                }
+                writeType = .withoutResponse
+            } else if rxChar.properties.contains(.write) {
+                writeType = .withResponse
+            } else {
+                self.logger.error("[BLETRANS] RX characteristic supports neither write nor writeWithoutResponse! props=\(rxChar.properties.rawValue, privacy: .public)")
+                completion?(BLEError.notConnected)
                 return
             }
 
-            // Query MTU and apply safety floor
-            let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
-            let safeMtu = max(mtu, BLEConstants.DEFAULT_MTU)
+            self.doWrite(data, to: peripheral, char: rxChar, type: writeType, completion: completion)
+        }
+    }
 
-            self.logger.debug("Sending \(data.count, privacy: .public) bytes (MTU: \(safeMtu, privacy: .public))")
+    /// Perform the actual BLE write with chunking.
+    private func doWrite(_ data: Data, to peripheral: CBPeripheral, char rxChar: CBCharacteristic, type writeType: CBCharacteristicWriteType, completion: ((Error?) -> Void)?) {
+        // Query MTU for the selected write type
+        let mtu = peripheral.maximumWriteValueLength(for: writeType)
+        let safeMtu = max(mtu, BLEConstants.DEFAULT_MTU)
 
-            // Send data (chunk if necessary)
-            if data.count <= safeMtu {
-                // Single write
-                peripheral.writeValue(data, for: rxChar, type: .withoutResponse)
-                self.logger.debug("Sent \(data.count, privacy: .public) bytes in single write")
-                completion?(nil)
-            } else {
-                // Chunk into MTU-sized pieces
-                let chunks = data.chunked(into: safeMtu)
-                self.logger.debug("Chunking into \(chunks.count, privacy: .public) pieces")
+        self.logger.error("[BLETRANS] TX \(data.count, privacy: .public) bytes (MTU: \(safeMtu, privacy: .public), type: \(writeType == .withResponse ? "withResp" : "noResp", privacy: .public)): \(data.prefix(20).map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public)")
 
-                for (index, chunk) in chunks.enumerated() {
-                    peripheral.writeValue(chunk, for: rxChar, type: .withoutResponse)
-                    self.logger.debug("Sent chunk \(index + 1, privacy: .public)/\(chunks.count, privacy: .public) (\(chunk.count, privacy: .public) bytes)")
-                }
-                completion?(nil)
+        // Send data (chunk if necessary)
+        if data.count <= safeMtu {
+            peripheral.writeValue(data, for: rxChar, type: writeType)
+            completion?(nil)
+        } else {
+            let chunks = data.chunked(into: safeMtu)
+            for chunk in chunks {
+                peripheral.writeValue(chunk, for: rxChar, type: writeType)
             }
+            completion?(nil)
         }
     }
 
@@ -409,7 +426,7 @@ public final class BLETransport: Transport {
     /// Called by BLEDelegateWrapper when a peripheral is discovered.
     func handleDiscoveredPeripheral(_ peripheral: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
         let name = peripheral.name ?? "Unknown"
-        logger.debug("Discovered peripheral: \(name, privacy: .public) (RSSI: \(rssi, privacy: .public))")
+        logger.error("[BLETRANS] Discovered: '\(name, privacy: .public)' RSSI=\(rssi, privacy: .public)")
 
         // Notify UI callback (if set)
         DispatchQueue.main.async { [weak self] in
@@ -423,12 +440,11 @@ public final class BLETransport: Transport {
 
         // Filter by device name
         guard peripheral.name == targetName else {
-            logger.debug("Skipping peripheral (name mismatch: \(name, privacy: .public) != \(targetName, privacy: .public))")
             return
         }
 
         // Stop scanning and connect
-        logger.info("Connecting to peripheral: \(name, privacy: .public)")
+        logger.error("[BLETRANS] Name match! Connecting to '\(name, privacy: .public)'")
         centralManager?.stopScan()
         self.peripheral = peripheral
         centralManager?.connect(peripheral, options: nil)
@@ -510,7 +526,7 @@ public final class BLETransport: Transport {
             return
         }
 
-        logger.info("Found Nordic UART Service, discovering characteristics...")
+        logger.error("[BLETRANS] Found NUS service, discovering characteristics...")
 
         // Discover TX and RX characteristics
         let txUUID = CBUUID(string: BLEConstants.NUS_TX_CHAR_UUID)
@@ -538,7 +554,7 @@ public final class BLETransport: Transport {
         let txUUID = CBUUID(string: BLEConstants.NUS_TX_CHAR_UUID)
         if let tx = characteristics.first(where: { $0.uuid == txUUID }) {
             txCharacteristic = tx
-            logger.info("Found TX characteristic, enabling notifications...")
+            logger.error("[BLETRANS] Found TX char, enabling notifications...")
             peripheral.setNotifyValue(true, for: tx)
         }
 
@@ -546,7 +562,7 @@ public final class BLETransport: Transport {
         let rxUUID = CBUUID(string: BLEConstants.NUS_RX_CHAR_UUID)
         if let rx = characteristics.first(where: { $0.uuid == rxUUID }) {
             rxCharacteristic = rx
-            logger.info("Found RX characteristic")
+            logger.error("[BLETRANS] Found RX char")
         }
 
         // Check if both characteristics are present
@@ -557,7 +573,7 @@ public final class BLETransport: Transport {
         }
 
         // Connection fully established
-        logger.info("BLE connection ready")
+        logger.error("[BLETRANS] BLE connection ready — NUS TX+RX found")
         connectionTimeoutWork?.cancel()
         connectionTimeoutWork = nil
         reconnectAttempt = 0
@@ -568,7 +584,7 @@ public final class BLETransport: Transport {
     ///
     /// Called by BLEDelegateWrapper when notifications arrive.
     func handleReceivedData(_ data: Data) {
-        logger.debug("Received \(data.count, privacy: .public) bytes")
+        logger.error("[BLETRANS] RX \(data.count, privacy: .public) bytes: \(data.prefix(20).map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public)")
 
         DispatchQueue.main.async { [weak self] in
             self?.onDataReceived?(data)

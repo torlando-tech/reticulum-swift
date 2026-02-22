@@ -1685,6 +1685,42 @@ public actor ReticuLumTransport {
             to: destHash
         )
         print("[LXMF_INBOUND] callbackManager.deliver() returned")
+
+        // Send proof back for SINGLE destination opportunistic packets.
+        // Python Transport calls packet.prove() after local delivery for SINGLE destinations.
+        // Proof format: HEADER_1 / PROOF / BROADCAST / PLAIN
+        //   destination = packet.getTruncatedHash() (16 bytes)
+        //   data        = identity.sign(packet.getFullHash()) (64 bytes)
+        if packet.header.destinationType == .single,
+           let identity = destination.identity,
+           identity.hasPrivateKeys {
+            do {
+                let signature = try identity.sign(packet.getFullHash())
+                let proofHeader = PacketHeader(
+                    headerType: .header1,
+                    hasContext: false,
+                    hasIFAC: false,
+                    transportType: .broadcast,
+                    destinationType: .plain,
+                    packetType: .proof,
+                    hopCount: 0
+                )
+                let proofPacket = Packet(
+                    header: proofHeader,
+                    destination: packet.getTruncatedHash(),
+                    transportAddress: nil,
+                    context: 0x00,
+                    data: signature
+                )
+                let encoded = proofPacket.encode()
+                if let iface = interfaces[interfaceId] {
+                    try await iface.send(encoded)
+                    print("[LXMF_INBOUND] Proof sent for packet \(hexPrefix), sig=\(signature.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+                }
+            } catch {
+                print("[LXMF_INBOUND] Failed to send proof: \(error)")
+            }
+        }
     }
 
     /// Process an announce packet via the announce handler.

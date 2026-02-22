@@ -8,6 +8,7 @@
 
 #if canImport(CoreBluetooth)
 import Foundation
+import os
 
 // MARK: - RNodeInterface
 
@@ -57,6 +58,9 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
 
     /// Unique identifier for this interface
     public let id: String
+
+    /// Logger for RNode interface events
+    private let logger = Logger(subsystem: "com.columba.core", category: "RNodeInterface")
 
     /// Configuration used to create this interface
     public let config: InterfaceConfig
@@ -161,6 +165,35 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// Battery percentage (0-100)
     private var rBatteryPercent: UInt8?
 
+    // MARK: - Channel time / airtime stats (from CMD_STAT_CHTM)
+
+    /// Short-term airtime usage (%), updated by CMD_STAT_CHTM
+    private var rAirtimeShort: Double = 0.0
+
+    /// Long-term airtime usage (%), updated by CMD_STAT_CHTM
+    private var rAirtimeLong: Double = 0.0
+
+    /// Short-term channel load (%), updated by CMD_STAT_CHTM
+    private var rChannelLoadShort: Double = 0.0
+
+    /// Long-term channel load (%), updated by CMD_STAT_CHTM
+    private var rChannelLoadLong: Double = 0.0
+
+    /// Current ambient RSSI reading (dBm), updated by CMD_STAT_CHTM
+    private var rCurrentRssi: Int?
+
+    /// Noise floor (dBm), updated by CMD_STAT_CHTM
+    private var rNoiseFloor: Int?
+
+    /// Interference level (dBm), nil if no interference, updated by CMD_STAT_CHTM
+    private var rInterference: Int?
+
+    /// Echoed short-term airtime limit (%), reported back by RNode after CMD_ST_ALOCK
+    private var rStAlock: Double?
+
+    /// Echoed long-term airtime limit (%), reported back by RNode after CMD_LT_ALOCK
+    private var rLtAlock: Double?
+
     // MARK: - Delegate
 
     /// Weak reference wrapper for delegate to work within actor
@@ -219,8 +252,12 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// to connecting, then to connected on success. If connection fails,
     /// automatic reconnection begins.
     public func connect() async throws {
-        guard state == .disconnected else { return }
+        guard state == .disconnected else {
+            logger.error("[RNODE] connect() called but state=\(String(describing: self.state), privacy: .public), ignoring")
+            return
+        }
 
+        logger.error("[RNODE] connect() starting, host='\(self.config.host, privacy: .public)'")
         autoReconnect = true
         await transitionState(to: .connecting)
         await setupTransport()
@@ -282,18 +319,29 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
             throw InterfaceError.notConnected
         }
 
+        logger.error("[RNODE] send() online=\(self.online, privacy: .public) interfaceReady=\(self.interfaceReady, privacy: .public) queueDepth=\(self.packetQueue.count, privacy: .public) bytes=\(data.count, privacy: .public)")
+
         if interfaceReady {
             // Lock flow control
             interfaceReady = false
 
+            logger.error("[RNODE] Sending directly via transport (\(data.count, privacy: .public) bytes)")
             // KISS-frame and send through transport
             try await sendViaTransport(data)
+            logger.error("[RNODE] sendViaTransport completed OK")
             bytesSent += UInt64(data.count)
+
+            // BLE write-with-response provides flow control: the write completes only
+            // when the firmware has received the data. The RNode BLE firmware does NOT
+            // send CMD_READY (used for UART flow control) after TX. Re-enable here so
+            // queued packets can be sent and subsequent sends aren't permanently blocked.
+            processQueue()
         } else {
             // Queue if not ready
             guard packetQueue.count < maxQueueDepth else {
                 throw RNodeError.interfaceQueueFull
             }
+            logger.error("[RNODE] Queuing packet (\(data.count, privacy: .public) bytes), interfaceReady=false, queueDepth=\(self.packetQueue.count, privacy: .public)")
             packetQueue.append(data)
         }
     }
@@ -319,6 +367,7 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// Set up the KISS-framed BLE transport and wire callbacks.
     private func setupTransport() async {
         // Create BLE transport targeting device name from config.host
+        logger.error("[RNODE] setupTransport: targeting device '\(self.config.host, privacy: .public)'")
         let bleTransport = BLETransport(deviceName: config.host)
 
         // Wrap in KISS framing layer
@@ -353,6 +402,7 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
 
     /// Handle transport state changes.
     private func handleTransportStateChange(_ transportState: TransportState) async {
+        logger.error("[RNODE] Transport state: \(String(describing: transportState), privacy: .public)")
         switch transportState {
         case .disconnected:
             // Transport disconnected - reset online/ready and trigger reconnection if we were connected
@@ -393,36 +443,91 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// 5. If radioConfig set: initialize radio and validate
     /// 6. Transition to connected state
     private func configureDevice() async {
-        // Reset radio state
+        logger.error("[RNODE] configureDevice() starting")
+
+        // Wait for RNode firmware to initialize after BLE connection.
+        // Python RNodeInterface does time.sleep(2.0) after serial open.
+        // The BLE probe (wizard) may have already set detected=true from its
+        // own detect command during this delay. We reset AFTER the delay.
+        logger.error("[RNODE] Waiting 2s for firmware init...")
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+
+        // Reset state AFTER the delay to clear any stale probe responses
         resetRadioState()
 
-        // Send detect handshake
+        // Send CMD_LEAVE to reset any stale host session from a previous connection.
+        // If the app was force-killed (low memory, user force-quit), our disconnect()
+        // never ran and the RNode stayed in "host mode." In host mode the display
+        // shows the last framebuffer (not the waterfall) and TX may be blocked.
+        // CMD_LEAVE with 0xFF tells the firmware to return to standalone mode.
+        // Safe to send even if no previous host was connected — it's a no-op then.
         do {
-            try await detect()
+            try await sendKISSCommand(RNodeConstants.CMD_LEAVE, payload: Data([0xFF]))
+            logger.error("[RNODE] CMD_LEAVE sent to reset any stale host session")
         } catch {
-            lastErrorDescription = "Detect handshake failed: \(error.localizedDescription)"
-            notifyError(RNodeError.detectFailed)
-            await disconnect()
-            return
+            logger.error("[RNODE] CMD_LEAVE failed (OK if fresh connect): \(error.localizedDescription, privacy: .public)")
+        }
+        try? await Task.sleep(nanoseconds: 100_000_000) // 100ms for firmware to process
+
+        // Send detect handshake (with retry)
+        var detectAttempt = 0
+        let maxDetectAttempts = 3
+        while detectAttempt < maxDetectAttempts {
+            detectAttempt += 1
+            logger.error("[RNODE] Sending detect handshake (attempt \(detectAttempt, privacy: .public)/\(maxDetectAttempts, privacy: .public))...")
+
+            do {
+                try await detect()
+                logger.error("[RNODE] Detect handshake sent OK")
+            } catch {
+                logger.error("[RNODE] Detect handshake FAILED: \(error.localizedDescription, privacy: .public)")
+                if detectAttempt >= maxDetectAttempts {
+                    lastErrorDescription = "Detect handshake failed: \(error.localizedDescription)"
+                    notifyError(RNodeError.detectFailed)
+                    await disconnect()
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                continue
+            }
+
+            // Wait up to 5 seconds for ALL handshake responses:
+            // CMD_DETECT (sets detected=true), CMD_FW_VERSION (sets majVersion+minVersion),
+            // CMD_PLATFORM (sets platform), CMD_MCU (sets mcu)
+            let startTime = Date()
+            while Date().timeIntervalSince(startTime) < 5.0 {
+                if detected && majVersion > 0 {
+                    // Got detect response AND firmware version
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            }
+
+            if detected && majVersion > 0 {
+                break
+            }
+
+            logger.error("[RNODE] Detect attempt \(detectAttempt, privacy: .public): detected=\(self.detected, privacy: .public) fw=\(self.majVersion, privacy: .public).\(self.minVersion, privacy: .public), \(detectAttempt < maxDetectAttempts ? "retrying..." : "giving up", privacy: .public)")
+            if detectAttempt < maxDetectAttempts {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
         }
 
-        // Wait up to 5 seconds for detected flag
-        let startTime = Date()
-        while !detected && Date().timeIntervalSince(startTime) < 5.0 {
-            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-        }
-
-        if !detected {
+        if !detected || majVersion == 0 {
+            logger.error("[RNODE] Detect FAILED after \(maxDetectAttempts, privacy: .public) attempts: detected=\(self.detected, privacy: .public) fw=\(self.majVersion, privacy: .public).\(self.minVersion, privacy: .public)")
             lastErrorDescription = "RNode did not respond to detect handshake"
             notifyError(RNodeError.detectFailed)
             await disconnect()
             return
         }
 
+        logger.error("[RNODE] Detected! FW \(self.majVersion, privacy: .public).\(self.minVersion, privacy: .public), platform=\(self.platform, privacy: .public), mcu=\(self.mcu, privacy: .public)")
+
         // Validate firmware version
         if majVersion < RNodeConstants.REQUIRED_FW_VER_MAJ ||
            (majVersion == RNodeConstants.REQUIRED_FW_VER_MAJ && minVersion < RNodeConstants.REQUIRED_FW_VER_MIN) {
             let error = RNodeError.firmwareVersionTooOld(major: majVersion, minor: minVersion)
+            logger.error("[RNODE] Firmware too old: \(self.majVersion, privacy: .public).\(self.minVersion, privacy: .public)")
             lastErrorDescription = error.localizedDescription
             notifyError(error)
             await disconnect()
@@ -432,21 +537,28 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         firmwareOk = true
 
         // If radio config is set, initialize radio
-        if radioConfig != nil {
+        if let rc = radioConfig {
+            logger.error("[RNODE] Initializing radio: freq=\(rc.frequency, privacy: .public) bw=\(rc.bandwidth, privacy: .public) sf=\(rc.spreadingFactor, privacy: .public) tx=\(rc.txPower, privacy: .public)")
             do {
                 try await initRadio()
+                logger.error("[RNODE] Radio init done, validating...")
                 try await validateRadioState()
+                logger.error("[RNODE] Radio validation passed, going ONLINE")
                 interfaceReady = true
                 online = true
             } catch {
+                logger.error("[RNODE] Radio config FAILED: \(error.localizedDescription, privacy: .public)")
                 lastErrorDescription = "Radio configuration failed: \(error.localizedDescription)"
                 notifyError(error)
                 await disconnect()
                 return
             }
+        } else {
+            logger.error("[RNODE] No radioConfig set, skipping radio init")
         }
 
         // Success!
+        logger.error("[RNODE] configureDevice() SUCCESS, transitioning to connected")
         await transitionState(to: .connected)
     }
 
@@ -463,6 +575,15 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         rStatSnr = nil
         rBatteryState = nil
         rBatteryPercent = nil
+        rAirtimeShort = 0.0
+        rAirtimeLong = 0.0
+        rChannelLoadShort = 0.0
+        rChannelLoadLong = 0.0
+        rCurrentRssi = nil
+        rNoiseFloor = nil
+        rInterference = nil
+        rStAlock = nil
+        rLtAlock = nil
         detected = false
         firmwareOk = false
         online = false
@@ -479,12 +600,13 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// - CMD_MCU query
     private func detect() async throws {
         // Build detect command sequence
-        // Note: trailing FEND of one command IS the leading FEND of the next
+        // Each command needs its own FEND..FEND pair (no shared FENDs).
+        // Over BLE, shared FENDs cause the firmware to miss subsequent commands.
         let detectCommand = Data([
             KISS.FEND, RNodeConstants.CMD_DETECT, RNodeConstants.DETECT_REQ, KISS.FEND,
-            RNodeConstants.CMD_FW_VERSION, 0x00, KISS.FEND,
-            RNodeConstants.CMD_PLATFORM, 0x00, KISS.FEND,
-            RNodeConstants.CMD_MCU, 0x00, KISS.FEND
+            KISS.FEND, RNodeConstants.CMD_FW_VERSION, 0x00, KISS.FEND,
+            KISS.FEND, RNodeConstants.CMD_PLATFORM, 0x00, KISS.FEND,
+            KISS.FEND, RNodeConstants.CMD_MCU, 0x00, KISS.FEND
         ])
 
         guard let transport = transport else {
@@ -549,6 +671,13 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
 
         try await setRadioState(RNodeConstants.RADIO_STATE_ON)
         try await Task.sleep(nanoseconds: configDelay)
+
+        // Extra BLE settling time after radio ON.
+        // Python Android RNodeInterface does time.sleep(1) here over BLE.
+        // Without this, the LoRa radio can still be initialising its calibration
+        // when we call validateRadioState(), leading to display artifacts (5 solid
+        // vertical lines on the waterfall) and blocked TX.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
     }
 
     /// Validate radio state by comparing echoed values to requested values.
@@ -723,6 +852,7 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// Dispatches based on command byte to appropriate handler.
     /// Matches Python readLoop command dispatch (lines 781-1131).
     private func handleCommand(_ command: UInt8, _ payload: Data) {
+        logger.error("[RNODE] CMD 0x\(String(format: "%02X", command), privacy: .public) payload=\(payload.map { String(format: "%02x", $0) }.joined(separator: " "), privacy: .public)")
         // Guard all payload access with bounds checks
         switch command {
         case RNodeConstants.CMD_DETECT:
@@ -758,6 +888,15 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         case RNodeConstants.CMD_RADIO_LOCK:
             handleCmdRadioLock(payload)
 
+        case RNodeConstants.CMD_ST_ALOCK:
+            handleCmdStAlock(payload)
+
+        case RNodeConstants.CMD_LT_ALOCK:
+            handleCmdLtAlock(payload)
+
+        case RNodeConstants.CMD_STAT_CHTM:
+            handleCmdStatChtm(payload)
+
         case RNodeConstants.CMD_STAT_RSSI:
             handleCmdStatRssi(payload)
 
@@ -777,14 +916,12 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
             handleCmdReset(payload)
 
         // Commands not relevant to v1.1 (log and ignore)
-        case RNodeConstants.CMD_STAT_CHTM,
-             RNodeConstants.CMD_STAT_PHYPRM,
+        case RNodeConstants.CMD_STAT_PHYPRM,
              RNodeConstants.CMD_STAT_CSMA,
              RNodeConstants.CMD_STAT_TEMP,
              RNodeConstants.CMD_FB_READ,
              RNodeConstants.CMD_DISP_READ,
              RNodeConstants.CMD_RANDOM:
-            // Log and ignore
             break
 
         default:
@@ -796,10 +933,15 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     // MARK: - Command Handlers
 
     private func handleCmdDetect(_ payload: Data) {
-        guard !payload.isEmpty else { return }
+        guard !payload.isEmpty else {
+            logger.error("[RNODE] CMD_DETECT with empty payload")
+            return
+        }
         if payload[0] == RNodeConstants.DETECT_RESP {
+            logger.error("[RNODE] CMD_DETECT: DETECTED (0x46 received)")
             detected = true
         } else {
+            logger.error("[RNODE] CMD_DETECT: unexpected response 0x\(String(format: "%02X", payload[0]), privacy: .public)")
             detected = false
         }
     }
@@ -860,6 +1002,43 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     private func handleCmdRadioLock(_ payload: Data) {
         guard !payload.isEmpty else { return }
         rLock = payload[0]
+    }
+
+    /// CMD_ST_ALOCK (0x0B): RNode echoes back the configured short-term airtime limit.
+    /// Python: r_st_alock = (data[0]<<8 | data[1]) / 100.0
+    private func handleCmdStAlock(_ payload: Data) {
+        guard payload.count >= 2 else { return }
+        let raw = UInt16(payload[0]) << 8 | UInt16(payload[1])
+        rStAlock = Double(raw) / 100.0
+    }
+
+    /// CMD_LT_ALOCK (0x0C): RNode echoes back the configured long-term airtime limit.
+    /// Python: r_lt_alock = (data[0]<<8 | data[1]) / 100.0
+    private func handleCmdLtAlock(_ payload: Data) {
+        guard payload.count >= 2 else { return }
+        let raw = UInt16(payload[0]) << 8 | UInt16(payload[1])
+        rLtAlock = Double(raw) / 100.0
+    }
+
+    /// CMD_STAT_CHTM (0x25): Channel time monitoring stats, sent ~every 1s when radio is online.
+    ///
+    /// Python field mapping (11 bytes):
+    ///   [0-1] ats: short-term airtime usage (per 100 = %)
+    ///   [2-3] atl: long-term airtime usage (per 100 = %)
+    ///   [4-5] cus: short-term channel load (per 100 = %)
+    ///   [6-7] cul: long-term channel load (per 100 = %)
+    ///   [8]   crs: current RSSI (crs - RSSI_OFFSET)
+    ///   [9]   nfl: noise floor (nfl - RSSI_OFFSET)
+    ///   [10]  ntf: interference (0xFF = none, else ntf - RSSI_OFFSET)
+    private func handleCmdStatChtm(_ payload: Data) {
+        guard payload.count >= 11 else { return }
+        rAirtimeShort     = Double(UInt16(payload[0]) << 8 | UInt16(payload[1])) / 100.0
+        rAirtimeLong      = Double(UInt16(payload[2]) << 8 | UInt16(payload[3])) / 100.0
+        rChannelLoadShort = Double(UInt16(payload[4]) << 8 | UInt16(payload[5])) / 100.0
+        rChannelLoadLong  = Double(UInt16(payload[6]) << 8 | UInt16(payload[7])) / 100.0
+        rCurrentRssi      = Int(payload[8]) - 157
+        rNoiseFloor       = Int(payload[9]) - 157
+        rInterference     = payload[10] == 0xFF ? nil : Int(payload[10]) - 157
     }
 
     private func handleCmdStatRssi(_ payload: Data) {
