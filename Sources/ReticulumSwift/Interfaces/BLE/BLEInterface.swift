@@ -577,6 +577,41 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
         Array(peers.keys)
     }
 
+    /// Get snapshot of all peer connection info for UI display.
+    public func getConnectionInfos() async -> [BLEConnectionInfo] {
+        var infos: [BLEConnectionInfo] = []
+        for (identityHex, peer) in peers {
+            let rssi = await peer.rssi
+            let lastActivity = await peer.lastActivity
+            let connectedAt = await peer.connectedAt
+            let bytesSent = await peer.bytesSent
+            let bytesReceived = await peer.bytesReceived
+            let packetsSent = await peer.packetsSent
+            let packetsReceived = await peer.packetsReceived
+            let mtu = await peer.mtu
+            let isOutgoing = await peer.isOutgoing
+
+            infos.append(BLEConnectionInfo(
+                identityHash: identityHex,
+                isOutgoing: isOutgoing,
+                rssi: rssi,
+                mtu: mtu,
+                connectedAt: connectedAt,
+                lastActivity: lastActivity,
+                bytesSent: bytesSent,
+                bytesReceived: bytesReceived,
+                packetsSent: packetsSent,
+                packetsReceived: packetsReceived
+            ))
+        }
+        return infos
+    }
+
+    /// Disconnect a specific peer by identity hash.
+    public func disconnectPeer(identityHex: String) async {
+        await removePeer(identityHex: identityHex)
+    }
+
     // MARK: - Timeout Helper
 
     private func withTimeout<T: Sendable>(

@@ -44,6 +44,26 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
     /// Last time we received any data (fragment or keepalive)
     public private(set) var lastActivity: Date = Date()
 
+    /// When this peer connection was established
+    public let connectedAt: Date = Date()
+
+    /// Total bytes sent to this peer
+    public private(set) var bytesSent: Int = 0
+
+    /// Total bytes received from this peer
+    public private(set) var bytesReceived: Int = 0
+
+    /// Total packets sent to this peer
+    public private(set) var packetsSent: Int = 0
+
+    /// Total packets received from this peer
+    public private(set) var packetsReceived: Int = 0
+
+    /// Current MTU for this connection
+    public var mtu: Int {
+        connection.mtu
+    }
+
     // MARK: - Internal
 
     private var connection: any BLEPeerConnection
@@ -110,6 +130,8 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
         for fragment in fragments {
             try await connection.sendFragment(fragment)
         }
+        bytesSent += data.count
+        packetsSent += 1
     }
 
     public func setDelegate(_ delegate: InterfaceDelegate) async {
@@ -219,6 +241,7 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
 
     private func handleFragment(_ fragment: Data) {
         lastActivity = Date()
+        bytesReceived += fragment.count
 
         // Filter keepalives (single 0x00 byte)
         if fragment.count == 1 && fragment[fragment.startIndex] == BLEMeshConstants.keepaliveByte {
@@ -232,6 +255,7 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
 
         do {
             if let packet = try reassembler.receiveFragment(fragment, senderId: peerIdentityHex) {
+                packetsReceived += 1
                 delegateRef?.delegate?.interface(id: id, didReceivePacket: packet)
             }
         } catch {
