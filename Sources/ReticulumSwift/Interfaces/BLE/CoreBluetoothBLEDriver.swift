@@ -139,7 +139,6 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
 
         peripheralManager.startAdvertising([
             CBAdvertisementDataServiceUUIDsKey: [BLEMeshConstants.serviceUUID],
-            CBAdvertisementDataLocalNameKey: "Reticulum"
         ])
 
         lock.lock()

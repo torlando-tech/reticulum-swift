@@ -182,6 +182,15 @@ public actor ReticuLumTransport {
     /// Safe because this actor processes packets sequentially.
     private var lastReceivedInterfaceId: String?
 
+    /// Called when a new sub-interface is added (e.g., BLE peer connects).
+    /// The app layer hooks this to trigger a full announce (with display name, ratchet, etc.).
+    private var onInterfaceAdded: (@Sendable (String) async -> Void)?
+
+    /// Set the callback for when a new sub-interface is added.
+    public func setOnInterfaceAdded(_ callback: (@Sendable (String) async -> Void)?) {
+        self.onInterfaceAdded = callback
+    }
+
     // MARK: - Initialization
 
     /// Create a new transport with optional dependency injection.
@@ -309,6 +318,7 @@ public actor ReticuLumTransport {
                 guard let self = self else { return }
                 Task {
                     try? await self.addInterface(peer)
+                    await self.onInterfaceAdded?(peer.id)
                 }
             },
             onPeerRemoved: { [weak self] peerId in
