@@ -154,11 +154,12 @@ public final class BLETransport: Transport {
                     options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
                 )
             } else {
-                // Targeted mode: filter by NUS service for efficient connection
-                self.logger.info("Scanning for RNode peripherals with NUS service...")
-                let serviceUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
+                // Targeted mode: scan without service filter because many RNodes
+                // don't advertise the NUS service UUID in BLE advertisement packets.
+                // We filter by peripheral name instead (in handleDiscoveredPeripheral).
+                self.logger.info("Scanning for RNode peripheral named '\(self.targetDeviceName ?? "")'...")
                 manager.scanForPeripherals(
-                    withServices: [serviceUUID],
+                    withServices: nil,
                     options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
                 )
             }
