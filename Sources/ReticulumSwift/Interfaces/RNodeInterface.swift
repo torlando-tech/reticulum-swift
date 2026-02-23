@@ -86,6 +86,11 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// Current reconnection attempt (0 when not reconnecting)
     private var reconnectAttempt: Int = 0
 
+    /// True while configureDevice() is running on this actor.
+    /// Used by the reconnect loop to wait for configure to complete before retrying,
+    /// preventing a new BLETransport from being created mid-configure.
+    private var isConfiguring: Bool = false
+
     /// Total bytes sent through this interface
     public private(set) var bytesSent: UInt64 = 0
 
@@ -405,10 +410,13 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         logger.error("[RNODE] Transport state: \(String(describing: transportState), privacy: .public)")
         switch transportState {
         case .disconnected:
-            // Transport disconnected - reset online/ready and trigger reconnection if we were connected
-            if state == .connected || state == .connecting {
-                online = false
-                interfaceReady = false
+            // Transport disconnected - reset online/ready.
+            online = false
+            interfaceReady = false
+            // isConfiguring will be cleared by configureDevice()'s defer block if it was running.
+            // The reconnect loop polls isConfiguring, so it will detect the change and retry.
+            // If not in a reconnect loop (e.g. mid-session BLE drop), start one.
+            if !isConfiguring && autoReconnect {
                 await startReconnectLoop()
             }
 
@@ -417,17 +425,25 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
             break
 
         case .connected:
-            // BLE connected - now run firmware detect and config
+            // BLE connected - now run firmware detect and config.
             reconnectAttempt = 0
             lastErrorDescription = nil
             await configureDevice()
+            // If configure didn't succeed (BLE dropped mid-configure, or detect failed),
+            // start the reconnect loop now that isConfiguring has been cleared by defer.
+            if state != .connected && autoReconnect {
+                await startReconnectLoop()
+            }
 
         case .failed(let error):
             // Capture error description for UI display
             lastErrorDescription = error.localizedDescription
-            // Connection failed - notify delegate and start reconnection
             notifyError(error)
-            await startReconnectLoop()
+            // isConfiguring will be cleared by configureDevice()'s defer if it was running.
+            // If not in a reconnect cycle, start one.
+            if !isConfiguring && autoReconnect {
+                await startReconnectLoop()
+            }
         }
     }
 
@@ -443,6 +459,8 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// 5. If radioConfig set: initialize radio and validate
     /// 6. Transition to connected state
     private func configureDevice() async {
+        isConfiguring = true
+        defer { isConfiguring = false }
         logger.error("[RNODE] configureDevice() starting")
 
         // Wait for RNode firmware to initialize after BLE connection.
@@ -543,9 +561,7 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
                 try await initRadio()
                 logger.error("[RNODE] Radio init done, validating...")
                 try await validateRadioState()
-                logger.error("[RNODE] Radio validation passed, going ONLINE")
-                interfaceReady = true
-                online = true
+                logger.error("[RNODE] Radio validation passed")
             } catch {
                 logger.error("[RNODE] Radio config FAILED: \(error.localizedDescription, privacy: .public)")
                 lastErrorDescription = "Radio configuration failed: \(error.localizedDescription)"
@@ -557,7 +573,9 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
             logger.error("[RNODE] No radioConfig set, skipping radio init")
         }
 
-        // Send Columba logo to the RNode display
+        // Send Columba logo to the RNode display BEFORE going online.
+        // Must happen before interfaceReady=true to prevent data packets
+        // from interleaving with framebuffer writes on the BLE queue.
         do {
             try await displayFramebufferLogo()
             logger.error("[RNODE] Framebuffer logo sent OK")
@@ -565,6 +583,10 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
             // Non-fatal — RNode may not have a display, or display may not support framebuffer
             logger.error("[RNODE] Framebuffer logo failed (non-fatal): \(error.localizedDescription, privacy: .public)")
         }
+
+        // Go online now that display is set up
+        interfaceReady = true
+        online = true
 
         // Success!
         logger.error("[RNODE] configureDevice() SUCCESS, transitioning to connected")
@@ -579,15 +601,23 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     ///
     /// Protocol:
     /// 1. Write 64 lines via CMD_FB_WRITE (0x43): payload = [line(1)] + [8 pixel bytes]
-    ///    - 15ms between writes to avoid BLE write throttling
-    /// 2. Wait 50ms for firmware to process all writes
-    /// 3. Enable external framebuffer via CMD_FB_EXT (0x41) with payload 0x01
+    /// 2. Enable external framebuffer via CMD_FB_EXT (0x41) with payload 0x01
+    ///
+    /// No sleep between writes: CoreBluetooth's internal FIFO queue guarantees delivery
+    /// order regardless of write-without-response or write-with-response. We used to
+    /// sleep 15ms between writes (matching Python's serial-port delay), but for async BLE
+    /// the completion fires immediately (before ACK), so the sleeps never actually throttled
+    /// anything — they just added unreliable delays. CMD_FB_EXT is queued last, so it
+    /// arrives at the firmware after all 64 FB writes.
     private func displayFramebufferLogo() async throws {
         let imageData = columbaFramebufferData
 
         // 64 lines x 8 bytes/line = 512 bytes total
         let bytesPerLine = 8
         let lineCount = imageData.count / bytesPerLine
+
+        logger.error("[RNODE] FB: writing \(lineCount, privacy: .public) lines to framebuffer")
+        fbLog("FB: writing \(lineCount) lines")
 
         for line in 0..<lineCount {
             let lineStart = line * bytesPerLine
@@ -596,15 +626,37 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
             // Payload: [line_number(1)] + [8 pixel bytes]
             let payload = Data([UInt8(line)]) + linePixels
             try await sendKISSCommand(RNodeConstants.CMD_FB_WRITE, payload: payload)
-            // 15ms between writes matches Python's time.sleep(0.015) for BLE throttling
-            try await Task.sleep(nanoseconds: 15_000_000)
         }
 
-        // 50ms settling time before enabling the framebuffer (matches Python's time.sleep(0.05))
-        try await Task.sleep(nanoseconds: 50_000_000)
+        logger.error("[RNODE] FB: all \(lineCount, privacy: .public) lines queued, sending CMD_FB_EXT")
+        fbLog("FB: \(lineCount) lines queued, sending CMD_FB_EXT(0x01)")
 
-        // Enable external framebuffer mode (shows our image instead of RNode's default UI)
+        // Enable external framebuffer mode (shows our image instead of RNode's default UI).
+        // CoreBluetooth FIFO ordering guarantees this arrives after all 64 CMD_FB_WRITE frames.
         try await sendKISSCommand(RNodeConstants.CMD_FB_EXT, payload: Data([0x01]))
+
+        logger.error("[RNODE] FB: CMD_FB_EXT sent OK")
+        fbLog("FB: CMD_FB_EXT sent OK ✓")
+    }
+
+    /// Append a timestamped message to the framebuffer debug log file.
+    ///
+    /// Writes to /tmp/columba_rnode_fb.txt so diagnostics can be read
+    /// without needing to capture syslog from the start of the session.
+    private func fbLog(_ message: String) {
+        let timestamp = Date().timeIntervalSince1970
+        let line = "[\(String(format: "%.3f", timestamp))] \(message)\n"
+        let path = "/tmp/columba_rnode_fb.txt"
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: path),
+               let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            } else {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+        }
     }
 
     /// Reset all radio echo state variables.
@@ -1209,17 +1261,40 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
                 // Check if cancelled during sleep
                 if Task.isCancelled { return }
 
-                // Attempt reconnection
+                // Attempt reconnection (starts BLE scan, returns immediately)
                 await self.attemptReconnect()
 
-                // Check if we connected successfully
+                // Wait for the full connect+configure cycle to finish before retrying.
+                // configureDevice() takes ~12s; without this wait we would create a new
+                // BLETransport while the old one is still running configureDevice(), orphaning
+                // the active BLE connection and preventing the framebuffer logo from being sent.
+                //
+                // Phase 1: Wait for BLE to connect and configure to start (isConfiguring=true).
+                // This has a max timeout matching the BLE scan timeout (~20s).
+                var scanWait = 0
+                while !Task.isCancelled && scanWait < 200 { // 200 × 100ms = 20s
+                    if await self.isConfiguring { break }
+                    if await self.state == .connected { break }
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                    scanWait += 1
+                }
+                if Task.isCancelled { return }
+
+                // Phase 2: Wait for configure to complete (isConfiguring → false).
+                while !Task.isCancelled {
+                    if !(await self.isConfiguring) { break }
+                    try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+                }
+                if Task.isCancelled { return }
+
+                // Check if configure succeeded
                 let currentState = await self.state
                 if currentState == .connected {
                     await self.clearReconnectTask()
                     return // Success!
                 }
 
-                // Increment attempt and continue
+                // Configure failed or timed out — retry
                 await self.incrementReconnectAttempt()
             }
         }
@@ -1237,7 +1312,11 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
 
     /// Attempt a single reconnection.
     private func attemptReconnect() async {
-        // Clean up old transport
+        // Nil out old transport callbacks BEFORE disconnecting so stale .disconnected
+        // events from the old transport don't interfere with the new connection attempt.
+        transport?.onStateChange = nil
+        transport?.onDataReceived = nil
+        transport?.onCommandReceived = nil
         transport?.disconnect()
         transport = nil
 

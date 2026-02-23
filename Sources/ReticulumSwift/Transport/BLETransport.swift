@@ -387,9 +387,10 @@ public final class BLETransport: Transport {
                         options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
                     )
                 } else {
-                    let serviceUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
+                    // Scan without service UUID filter — RNodes don't advertise NUS in their
+                    // advertisement packets. We filter by peripheral name in handleDiscoveredPeripheral.
                     centralManager?.scanForPeripherals(
-                        withServices: [serviceUUID],
+                        withServices: nil,
                         options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
                     )
                     startConnectionTimeout()
