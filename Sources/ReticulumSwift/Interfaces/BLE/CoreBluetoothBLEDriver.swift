@@ -79,7 +79,11 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
         self.identityHash = identityHash
         super.init()
 
-        centralManager = CBCentralManager(delegate: self, queue: bleQueue)
+        centralManager = CBCentralManager(
+            delegate: self,
+            queue: bleQueue,
+            options: [CBCentralManagerOptionRestoreIdentifierKey: "com.columba.bleMeshCentral"]
+        )
         peripheralManager = CBPeripheralManager(delegate: self, queue: bleQueue)
     }
 
@@ -318,6 +322,17 @@ extension CoreBluetoothBLEDriver: CBCentralManagerDelegate {
         }
         bleDiag("Central manager state: \(stateStr)")
         logger.info("[BLE_DIAG] Central manager state: \(stateStr, privacy: .public)")
+    }
+
+    public func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        guard let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey]
+                as? [CBPeripheral] else { return }
+        for peripheral in peripherals {
+            // Re-register delegate so we get callbacks
+            peripheral.delegate = self
+            // Attempt reconnect — if already connected, CBCentralManager calls didConnect immediately
+            central.connect(peripheral, options: nil)
+        }
     }
 
     public func centralManager(
