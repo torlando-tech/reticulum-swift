@@ -1512,16 +1512,20 @@ public actor ReticuLumTransport {
         // Everything here is regular encrypted link data (context 0x00 = NONE).
         do {
             let plaintext = try await link.decrypt(packet.data)
-            let hexDump = plaintext.prefix(32).map { String(format: "%02x", $0) }.joined()
-            print("[LINK_DATA] Decrypted \(plaintext.count) bytes, data=\(hexDump)")
+            let first4 = plaintext.prefix(4).map { String(format: "%02x", $0) }.joined()
+            let hasCB = await link.hasPacketCallback
+            print("[LINK_DATA] Decrypted \(plaintext.count) bytes, data=\(first4)")
+            logger.error("[LINK_DATA] Decrypted \(plaintext.count, privacy: .public) bytes, first4=\(first4, privacy: .public), hasCB=\(hasCB, privacy: .public)")
 
             // Try generic packet callback first (Python: link.set_packet_callback)
             // LXST and other protocols use this for raw per-link data delivery
             let delivered = await link.deliverToPacketCallback(data: plaintext, packet: packet)
             if delivered {
                 print("[LINK_DATA] Delivered to packet callback")
+                logger.error("[LINK_DATA] Delivered to packetCallback, dataLen=\(plaintext.count, privacy: .public)")
                 return
             }
+            logger.error("[LINK_DATA] No packetCallback — fell through to LXMF routing, dataLen=\(plaintext.count, privacy: .public)")
 
             // Regular data packet - deliver via callback
             // For LXMF direct delivery, the plaintext is a complete LXMF message:

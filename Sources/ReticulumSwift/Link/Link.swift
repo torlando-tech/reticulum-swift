@@ -178,6 +178,19 @@ public actor Link {
 
     // MARK: - Identity
 
+    // MARK: - Close Callback
+
+    /// Callback invoked when the link closes (remote hangup, timeout, or local close).
+    /// Receives the TeardownReason explaining why the link was closed.
+    private var closeCallback: (@Sendable (TeardownReason) async -> Void)?
+
+    /// Set a callback to be notified when this link closes.
+    ///
+    /// - Parameter callback: Async callback receiving the close reason, or nil to clear
+    public func setCloseCallback(_ callback: (@Sendable (TeardownReason) async -> Void)?) {
+        self.closeCallback = callback
+    }
+
     // MARK: - Packet Callback
 
     /// Generic per-link packet callback matching Python's link.set_packet_callback().
@@ -967,6 +980,12 @@ public actor Link {
 
         transitionState(to: .closed(reason: reason))
         stateContinuation?.finish()
+
+        // Fire close callback asynchronously so callers of close() aren't blocked
+        if let cb = closeCallback {
+            closeCallback = nil  // clear to prevent double-fire
+            Task { await cb(reason) }
+        }
     }
 
     // MARK: - Resource Management
