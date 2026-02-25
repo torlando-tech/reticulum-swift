@@ -377,14 +377,14 @@ private func readUInt64(from data: Data, at offset: inout Int) throws -> UInt64 
     guard offset + 8 <= data.count else {
         throw MessagePackError.decodingFailed("Unexpected end of data")
     }
-    let value = UInt64(data[offset]) << 56 |
-                UInt64(data[offset + 1]) << 48 |
-                UInt64(data[offset + 2]) << 40 |
-                UInt64(data[offset + 3]) << 32 |
-                UInt64(data[offset + 4]) << 24 |
-                UInt64(data[offset + 5]) << 16 |
-                UInt64(data[offset + 6]) << 8 |
-                UInt64(data[offset + 7])
+    var value = UInt64(data[offset]) << 56
+    value |= UInt64(data[offset + 1]) << 48
+    value |= UInt64(data[offset + 2]) << 40
+    value |= UInt64(data[offset + 3]) << 32
+    value |= UInt64(data[offset + 4]) << 24
+    value |= UInt64(data[offset + 5]) << 16
+    value |= UInt64(data[offset + 6]) << 8
+    value |= UInt64(data[offset + 7])
     offset += 8
     return value
 }
