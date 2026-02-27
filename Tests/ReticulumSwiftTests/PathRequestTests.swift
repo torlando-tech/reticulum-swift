@@ -146,7 +146,7 @@ final class PathRequestTests: XCTestCase {
     // MARK: - Path Request Dedup
 
     func testPathRequestDedup() async {
-        let transport = ReticuLumTransport()
+        let transport = ReticulumTransport()
 
         // Register the path request handler so the destination is set up
         await transport.registerPathRequestHandler()
@@ -219,7 +219,7 @@ final class PathRequestTests: XCTestCase {
 
     func testAwaitPathFoundImmediately() async throws {
         let pathTable = try PathTable()
-        let transport = ReticuLumTransport(pathTable: pathTable)
+        let transport = ReticulumTransport(pathTable: pathTable)
 
         let destHash = Data(repeating: 0xAA, count: 16)
 
@@ -239,7 +239,7 @@ final class PathRequestTests: XCTestCase {
 
     func testAwaitPathTimeout() async throws {
         let pathTable = try PathTable()
-        let transport = ReticuLumTransport(pathTable: pathTable)
+        let transport = ReticulumTransport(pathTable: pathTable)
 
         let destHash = Data(repeating: 0xFF, count: 16)
 

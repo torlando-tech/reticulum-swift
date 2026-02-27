@@ -2,7 +2,7 @@
 //  TransportSendTests.swift
 //  ReticulumSwift
 //
-//  Tests for ReticuLumTransport.send(packet:) verifying that ANNOUNCE packets
+//  Tests for ReticulumTransport.send(packet:) verifying that ANNOUNCE packets
 //  are never converted to HEADER_2, matching Python RNS Transport.py behavior.
 //
 //  Python reference: RNS/Transport.py outbound() (line 939)
@@ -71,12 +71,12 @@ final class TransportSendTests: XCTestCase {
 
     /// Build test fixtures used across multiple tests.
     ///
-    /// Sets up a ReticuLumTransport with:
+    /// Sets up a ReticulumTransport with:
     /// - A mock interface (connected)
     /// - A path table entry for `destHash` with hopCount=3 and a nextHop,
     ///   simulating what happens when our own announce is echoed back through
     ///   a relay (the scenario that triggered the bug).
-    private func makeTransportWithPath() async throws -> (ReticuLumTransport, MockInterface, Data, Data) {
+    private func makeTransportWithPath() async throws -> (ReticulumTransport, MockInterface, Data, Data) {
         let destHash = Data(repeating: 0x07, count: 16)      // Target destination
         let nextHop  = Data(repeating: 0xD7, count: 16)      // Transport node address
 
@@ -91,7 +91,7 @@ final class TransportSendTests: XCTestCase {
         )
         await pathTable.record(entry: entry)
 
-        let transport = ReticuLumTransport(pathTable: pathTable)
+        let transport = ReticulumTransport(pathTable: pathTable)
         let mockInterface = MockInterface()
         try await transport.addInterface(mockInterface)
 
@@ -240,7 +240,7 @@ final class TransportSendTests: XCTestCase {
     /// (the normal first-announce case).
     func testAnnounceSentAsHeader1WithoutPathEntry() async throws {
         let pathTable = PathTable()
-        let transport = ReticuLumTransport(pathTable: pathTable)
+        let transport = ReticulumTransport(pathTable: pathTable)
         let mockInterface = MockInterface()
         try await transport.addInterface(mockInterface)
 

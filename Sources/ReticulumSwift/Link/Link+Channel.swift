@@ -29,7 +29,7 @@ extension Link {
 
     /// Handle inbound channel data (decrypted plaintext from transport).
     ///
-    /// Called by ReticuLumTransport.handleLinkData() for context 0x0E.
+    /// Called by ReticulumTransport.handleLinkData() for context 0x0E.
     /// The transport layer decrypts the packet data before passing it here.
     ///
     /// - Parameter plaintext: Decrypted channel envelope data

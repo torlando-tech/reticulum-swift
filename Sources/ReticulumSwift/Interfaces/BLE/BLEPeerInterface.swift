@@ -17,7 +17,7 @@ import OSLog
 /// A sub-interface representing a single connected BLE mesh peer.
 ///
 /// BLEInterface spawns one of these for each peer that completes the
-/// handshake. Each peer interface is registered with ReticuLumTransport
+/// handshake. Each peer interface is registered with ReticulumTransport
 /// independently, allowing the transport layer to route packets to
 /// specific peers.
 ///

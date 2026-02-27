@@ -3,7 +3,7 @@
 //  ReticulumSwift
 //
 //  Error types for transport operations.
-//  Used by ReticuLumTransport for routing and dispatch errors.
+//  Used by ReticulumTransport for routing and dispatch errors.
 //
 
 import Foundation

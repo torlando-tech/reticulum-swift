@@ -15,7 +15,7 @@ import OSLog
 /// A sub-interface representing a single discovered LAN peer.
 ///
 /// AutoInterface spawns one of these for each peer found via multicast
-/// discovery. Each peer interface is registered with ReticuLumTransport
+/// discovery. Each peer interface is registered with ReticulumTransport
 /// independently, allowing the transport layer to route packets to
 /// specific peers.
 ///

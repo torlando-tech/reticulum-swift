@@ -40,7 +40,7 @@ public let ReticulumProtocolVersion = "0.8.0"
 // - Constants: Protocol constants
 //
 // Transport:
-// - ReticuLumTransport: Central routing engine
+// - ReticulumTransport: Central routing engine
 // - NetworkInterface: Interface protocol
 // - TCPInterface: TCP network interface
 // - FramedTransport: HDLC-framed transport helper

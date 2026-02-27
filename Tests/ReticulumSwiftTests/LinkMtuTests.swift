@@ -123,7 +123,7 @@ final class LinkMtuTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tmpDir) }
 
         let pathTable = try PathTable(databasePath: tmpDir.appendingPathComponent("paths.db").path)
-        let transport = ReticuLumTransport(pathTable: pathTable)
+        let transport = ReticulumTransport(pathTable: pathTable)
 
         // Create and register an AutoInterfacePeer (simulating what addAutoInterface does)
         let peer = AutoInterfacePeer(
@@ -165,7 +165,7 @@ final class LinkMtuTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tmpDir) }
 
         let pathTable = try PathTable(databasePath: tmpDir.appendingPathComponent("paths.db").path)
-        let transport = ReticuLumTransport(pathTable: pathTable)
+        let transport = ReticulumTransport(pathTable: pathTable)
 
         // Create a TCP interface (won't actually connect)
         let config = InterfaceConfig(
@@ -204,7 +204,7 @@ final class LinkMtuTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tmpDir) }
 
         let pathTable = try PathTable(databasePath: tmpDir.appendingPathComponent("paths.db").path)
-        let transport = ReticuLumTransport(pathTable: pathTable)
+        let transport = ReticulumTransport(pathTable: pathTable)
 
         // Store a path with an interface ID that doesn't exist in transport
         let destHash = Data(repeating: 0xCC, count: 16)

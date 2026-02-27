@@ -1,5 +1,5 @@
 //
-//  ReticuLumTransport.swift
+//  ReticulumTransport.swift
 //  ReticulumSwift
 //
 //  Central transport actor for Reticulum packet routing.
@@ -35,7 +35,7 @@ private func transportDebugLog(_ message: String) {
 
 /// Protocol for network interfaces that can send and receive packets.
 ///
-/// This protocol abstracts the interface layer so ReticuLumTransport
+/// This protocol abstracts the interface layer so ReticulumTransport
 /// can work with any interface type (TCP, UDP, etc.).
 ///
 /// TCPInterface (created in Plan 04-03) will implement this protocol.
@@ -71,11 +71,11 @@ extension NetworkInterface {
     public var hwMtu: Int { 500 }
 }
 
-// MARK: - ReticuLumTransport Actor
+// MARK: - ReticulumTransport Actor
 
 /// Central transport actor for Reticulum packet routing.
 ///
-/// ReticuLumTransport is the core routing engine that:
+/// ReticulumTransport is the core routing engine that:
 /// - Dispatches outbound broadcast packets (HEADER_1) to all interfaces
 /// - Dispatches outbound routed packets (HEADER_2) via path table lookup
 /// - Routes inbound packets to registered local destinations
@@ -84,7 +84,7 @@ extension NetworkInterface {
 ///
 /// Example usage:
 /// ```swift
-/// let transport = ReticuLumTransport()
+/// let transport = ReticulumTransport()
 ///
 /// // Add an interface
 /// let interface = await TCPInterface(config: config)
@@ -97,7 +97,7 @@ extension NetworkInterface {
 /// // Send a packet
 /// try await transport.send(packet: myPacket)
 /// ```
-public actor ReticuLumTransport {
+public actor ReticulumTransport {
 
     // MARK: - Properties
 
@@ -214,7 +214,7 @@ public actor ReticuLumTransport {
         self.pathTable = pathTable
         self.callbackManager = callbackManager
         self.announceHandler = AnnounceHandler(pathTable: pathTable)
-        self.logger = Logger(subsystem: "com.columba.core", category: "ReticuLumTransport")
+        self.logger = Logger(subsystem: "com.columba.core", category: "ReticulumTransport")
     }
 
     // MARK: - Interface Management
@@ -2426,7 +2426,7 @@ public actor ReticuLumTransport {
 
 // MARK: - Internal Handlers
 
-extension ReticuLumTransport {
+extension ReticulumTransport {
     /// Internal handler for state changes (actor-isolated).
     func handleInterfaceStateChange(id: String, state: InterfaceState) {
         logger.info("Interface \(id, privacy: .public) state: \(String(describing: state), privacy: .public)")
@@ -2479,14 +2479,14 @@ extension ReticuLumTransport {
 
 // MARK: - Delegate Wrapper
 
-/// Wrapper class that bridges InterfaceDelegate protocol to ReticuLumTransport actor.
+/// Wrapper class that bridges InterfaceDelegate protocol to ReticulumTransport actor.
 ///
 /// Since actors cannot directly conform to @MainActor protocols, this wrapper
 /// receives delegate callbacks and forwards them to the actor asynchronously.
 public final class TransportDelegateWrapper: InterfaceDelegate, @unchecked Sendable {
-    private weak var transport: ReticuLumTransport?
+    private weak var transport: ReticulumTransport?
 
-    public init(transport: ReticuLumTransport) {
+    public init(transport: ReticulumTransport) {
         self.transport = transport
     }
 
