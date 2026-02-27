@@ -55,6 +55,9 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
     /// Current connection state
     public private(set) var state: InterfaceState = .disconnected
 
+    /// Hardware MTU — TCP has no practical limit, matches Python TCPInterface.HW_MTU
+    public var hwMtu: Int { 262144 }
+
     /// Underlying framed transport
     private var transport: FramedTransport?
 

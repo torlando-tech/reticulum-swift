@@ -71,6 +71,9 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// Current connection state
     public private(set) var state: InterfaceState = .disconnected
 
+    /// Hardware MTU — matches Python RNodeInterface.HW_MTU
+    public var hwMtu: Int { 508 }
+
     /// Underlying KISS-framed transport (wraps BLETransport)
     private var transport: KISSFramedTransport?
 

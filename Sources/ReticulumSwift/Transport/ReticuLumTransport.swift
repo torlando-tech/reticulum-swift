@@ -49,6 +49,10 @@ public protocol NetworkInterface: AnyObject, Sendable {
     /// Current connection state
     var state: InterfaceState { get }
 
+    /// Hardware MTU for this interface (default 500).
+    /// Used during link MTU discovery to negotiate larger payloads.
+    var hwMtu: Int { get }
+
     /// Connect to the interface
     func connect() async throws
 
@@ -60,6 +64,11 @@ public protocol NetworkInterface: AnyObject, Sendable {
 
     /// Set the delegate for receiving events
     func setDelegate(_ delegate: InterfaceDelegate) async
+}
+
+/// Default hwMtu for interfaces that don't override it.
+extension NetworkInterface {
+    public var hwMtu: Int { 500 }
 }
 
 // MARK: - ReticuLumTransport Actor
@@ -521,6 +530,18 @@ public actor ReticuLumTransport {
 
     // MARK: - Link Management
 
+    /// Look up the HW_MTU of the next-hop interface for a destination.
+    /// Matches Python Transport.next_hop_interface_hw_mtu().
+    public func nextHopInterfaceHwMtu(for destinationHash: Data) async -> Int? {
+        guard let pathEntry = await pathTable.lookup(destinationHash: destinationHash) else {
+            return nil
+        }
+        guard let iface = interfaces[pathEntry.interfaceId] else {
+            return nil
+        }
+        return await iface.hwMtu
+    }
+
     /// Initiate a link to a destination.
     ///
     /// Creates a new outbound Link, registers it as pending, and sends the
@@ -537,8 +558,23 @@ public actor ReticuLumTransport {
             throw TransportError.noPathAvailable(destinationHash: destination.hash)
         }
 
-        // Create link
-        let link = Link(destination: destination, identity: identity)
+        // Query next-hop interface HW_MTU for link MTU discovery
+        let hwMtu = await nextHopInterfaceHwMtu(for: destination.hash)
+        let destHex = destination.hash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        logger.info("[MTU_DISCOVERY] dest=\(destHex, privacy: .public), hwMtu=\(String(describing: hwMtu), privacy: .public)")
+        if hwMtu == nil {
+            // Debug: log why lookup failed
+            if let pathEntry = await pathTable.lookup(destinationHash: destination.hash) {
+                let ifaceId = pathEntry.interfaceId
+                let registered = Array(interfaces.keys)
+                logger.info("[MTU_DISCOVERY] pathEntry.interfaceId='\(ifaceId, privacy: .public)', registered=\(registered.joined(separator: ","), privacy: .public)")
+            } else {
+                logger.info("[MTU_DISCOVERY] No path entry found (despite hasPath check)")
+            }
+        }
+
+        // Create link with interface HW_MTU for MTU negotiation
+        let link = Link(destination: destination, identity: identity, hwMtu: hwMtu)
 
         // Set send callback - sends raw packet bytes to all interfaces
         // The Link builds complete packets (with header, context, etc.)
@@ -1933,6 +1969,11 @@ public actor ReticuLumTransport {
     /// Used for testing and advanced routing operations.
     public func getPathTable() -> PathTable {
         return pathTable
+    }
+
+    /// List all registered interface IDs (for debugging).
+    public func listInterfaceIds() -> [String] {
+        return Array(interfaces.keys)
     }
 
     /// Get the callback manager for registering packet callbacks.

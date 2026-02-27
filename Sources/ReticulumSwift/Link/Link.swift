@@ -108,6 +108,25 @@ public actor Link {
         return req.requestData
     }
 
+    // MARK: - MTU
+
+    /// Negotiated link MTU (default 500, updated during handshake if MTU discovery succeeds)
+    public private(set) var mtu: Int = 500
+
+    /// Max usable plaintext payload for link-encrypted packets.
+    /// Recalculated when MTU changes via updateMdu().
+    public private(set) var mdu: Int = LinkConstants.LINK_MDU  // 431 at default MTU
+
+    /// Recalculate MDU from current MTU.
+    /// Python: floor((mtu - IFAC_MIN - HEADER_MIN - TOKEN_OVERHEAD) / AES_BLOCK) * AES_BLOCK - 1
+    private func updateMdu() {
+        let ifacMin = 1       // IFAC_MIN_SIZE
+        let headerMin = 19    // HEADER_MINSIZE (2 header + 16 dest + 1 context)
+        let tokenOverhead = 48 // Identity.TOKEN_OVERHEAD (16 IV + 32 HMAC)
+        let aesBlock = 16     // AES128_BLOCKSIZE
+        mdu = ((mtu - ifacMin - headerMin - tokenOverhead) / aesBlock) * aesBlock - 1
+    }
+
     // MARK: - State
 
     /// Current link state
@@ -249,11 +268,19 @@ public actor Link {
     /// - Parameters:
     ///   - destination: Target destination for the link
     ///   - identity: Local identity for authentication
-    public init(destination: Destination, identity: Identity) {
+    ///   - hwMtu: Hardware MTU of the next-hop interface (signals MTU in LINKREQUEST)
+    public init(destination: Destination, identity: Identity, hwMtu: Int? = nil) {
         self.destination = destination
         self.localIdentity = identity
         self.initiator = true
-        self.request = LinkRequest(destination: destination)
+
+        let signaledMtu = hwMtu ?? 500
+        linkLogger.info("[LINK_INIT] hwMtu=\(String(describing: hwMtu), privacy: .public), signaling MTU=\(signaledMtu, privacy: .public)")
+        let signaling = IncomingLinkRequest.encodeSignaling(
+            mtu: UInt32(signaledMtu),
+            mode: LinkConstants.MODE_DEFAULT
+        )
+        self.request = LinkRequest(destination: destination, signaling: signaling)
     }
 
     /// Create link with known ephemeral keys (for testing).
@@ -314,6 +341,10 @@ public actor Link {
         // Generate our ephemeral keypair for ECDH
         self.responderEphemeralEncryptionPrivateKey = Curve25519.KeyAgreement.PrivateKey()
 
+        // Store negotiated MTU from incoming request and compute MDU
+        self.mtu = Int(incomingRequest.mtu)
+        self.mdu = ((self.mtu - 1 - 19 - 48) / 16) * 16 - 1
+
         // Start in handshake state (awaiting LRRTT to complete)
         self.state = .handshake
     }
@@ -344,12 +375,16 @@ public actor Link {
             throw LinkError.keyDerivationFailed
         }
 
-        // Create PROOF data
+        // Create PROOF data — echo the negotiated MTU back to initiator
+        let signaling = IncomingLinkRequest.encodeSignaling(
+            mtu: UInt32(self.mtu),
+            mode: LinkConstants.MODE_DEFAULT
+        )
         let proofData = try LinkProof.create(
             linkId: linkId,
             ephemeralEncryptionPublicKey: ephemeralKey.publicKey,
             destinationIdentity: localIdentity,
-            signaling: LinkConstants.DEFAULT_MTU_SIGNALING
+            signaling: signaling
         )
 
         // Build PROOF packet
@@ -542,6 +577,15 @@ public actor Link {
         print("[LINK_PROOF] Validating PROOF signature against destination identity...")
         try proof.validate(linkId: linkId, destinationIdentity: destIdentity)
         print("[LINK_PROOF] PROOF signature validated!")
+
+        // Extract confirmed MTU from PROOF signaling
+        let (confirmedMtu, _) = IncomingLinkRequest.decodeSignaling(proof.signaling)
+        if confirmedMtu > 0 {
+            self.mtu = Int(confirmedMtu)
+            updateMdu()
+            linkLogger.info("[LINK_PROOF] MTU negotiated: \(self.mtu, privacy: .public), MDU=\(self.mdu, privacy: .public)")
+            print("[LINK_PROOF] MTU negotiated: \(self.mtu), MDU=\(self.mdu)")
+        }
 
         // Store peer's ephemeral key
         peerEncryptionPublicKey = proof.peerEncryptionPublicKey

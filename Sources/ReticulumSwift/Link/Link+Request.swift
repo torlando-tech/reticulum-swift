@@ -70,11 +70,10 @@ extension Link {
             requestValue
         ]))
 
-        // Choose send method based on size
-        // Link MDU is ~500 bytes, minus encryption overhead (16 for IV)
-        let mdu = 500 - 16
+        // Choose send method based on size (use negotiated MDU)
+        let linkMdu = self.mdu
 
-        if packed.count <= mdu {
+        if packed.count <= linkMdu {
             // Small request: send as DATA packet
             // Python: request_id = packet_receipt.truncated_hash (packet hashable part hash)
             // We must compute request_id from the SENT packet, not the plaintext data
@@ -206,10 +205,10 @@ extension Link {
             .binary(data)
         ]))
 
-        // Link MDU minus encryption overhead
-        let mdu = 500 - 16
+        // Use negotiated link MDU
+        let linkMdu = self.mdu
 
-        if packedResponse.count <= mdu {
+        if packedResponse.count <= linkMdu {
             // Small response: send as DATA packet with RESPONSE context
             guard let send = sendCallback else {
                 throw LinkError.notActive

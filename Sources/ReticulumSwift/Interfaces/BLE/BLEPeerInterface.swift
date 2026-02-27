@@ -59,6 +59,9 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
     /// Total packets received from this peer
     public private(set) var packetsReceived: Int = 0
 
+    /// Hardware MTU — matches Python RNodeInterface.HW_MTU for BLE radio
+    public var hwMtu: Int { 508 }
+
     /// Current MTU for this connection
     public var mtu: Int {
         connection.mtu

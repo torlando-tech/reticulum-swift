@@ -31,6 +31,9 @@ public actor AutoInterfacePeer: @preconcurrency NetworkInterface {
     /// Interface configuration
     public let config: InterfaceConfig
 
+    /// Hardware MTU — matches Python AutoInterface.HW_MTU (inherited by peers)
+    public var hwMtu: Int { 1196 }
+
     /// Current state (connected while peer is alive)
     public private(set) var state: InterfaceState = .connected
 

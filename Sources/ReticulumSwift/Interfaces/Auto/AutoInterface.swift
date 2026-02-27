@@ -68,6 +68,9 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
     public let config: InterfaceConfig
     public private(set) var state: InterfaceState = .disconnected
 
+    /// Hardware MTU — matches Python AutoInterface.HW_MTU
+    public var hwMtu: Int { 1196 }
+
     // MARK: - Configuration
 
     /// Group ID for discovery (from config.host, default "reticulum")
