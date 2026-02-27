@@ -200,6 +200,14 @@ public actor ReticulumTransport {
         self.onInterfaceAdded = callback
     }
 
+    /// Diagnostic callback for packet receive events (set by app layer).
+    public var onDiagnostic: (@Sendable (String) -> Void)?
+
+    /// Set the diagnostic callback (actor-isolated setter for cross-actor access).
+    public func setOnDiagnostic(_ callback: @escaping @Sendable (String) -> Void) {
+        self.onDiagnostic = callback
+    }
+
     // MARK: - Initialization
 
     /// Create a new transport with optional dependency injection.
@@ -287,6 +295,7 @@ public actor ReticulumTransport {
                 guard let self = self else { return }
                 Task {
                     try? await self.addInterface(peer)
+                    await self.onInterfaceAdded?(peer.id)
                 }
             },
             onPeerRemoved: { [weak self] peerId in
@@ -476,6 +485,21 @@ public actor ReticulumTransport {
     /// delivered via the callback manager.
     ///
     /// - Parameter destination: Destination to register
+    /// Check if a destination hash is registered.
+    public func isDestinationRegistered(_ hash: Data) -> Bool {
+        destinations[hash] != nil
+    }
+
+    /// Return hex hashes of all registered destinations (for diagnostics).
+    public func registeredDestinationHashes() -> [String] {
+        destinations.keys.map { $0.map { String(format: "%02x", $0) }.joined() }
+    }
+
+    /// Return hex hashes of all registered link callbacks (for diagnostics).
+    public func registeredLinkCallbackHashes() -> [String] {
+        destinationLinkCallbacks.keys.map { $0.map { String(format: "%02x", $0) }.joined() }
+    }
+
     public func registerDestination(_ destination: Destination) {
         let hash = destination.hash
         destinations[hash] = destination
@@ -1129,17 +1153,22 @@ public actor ReticulumTransport {
     ///   - interfaceId: ID of interface that received the packet
     public func receive(packet: Packet, from interfaceId: String) async {
         let destHash = packet.destination
+        let destHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        onDiagnostic?("[RECV] type=\(packet.header.packetType) dest=\(destHex) from=\(interfaceId) len=\(packet.data.count)")
 
         // Route based on packet type
         switch packet.header.packetType {
         case .announce:
+            // Log full dest hash for announce to help debug telephony announce reception
+            let fullDestHex = destHash.map { String(format: "%02x", $0) }.joined()
+            onDiagnostic?("[RECV_ANNOUNCE] fullDest=\(fullDestHex) from=\(interfaceId)")
             print("[TRANSPORT] Processing ANNOUNCE packet from interface \(interfaceId)")
             logger.info("Received announce packet from interface \(interfaceId, privacy: .public)")
             await processAnnounce(packet: packet, from: interfaceId)
 
         case .linkRequest:
             // LINKREQUEST goes to registered destination (if we're the target)
-            logger.error("[RECV] LINKREQUEST packet from \(interfaceId)")
+            onDiagnostic?("[RECV] LINKREQUEST for dest=\(destHex)")
             await handleLinkRequest(packet, from: interfaceId)
 
         case .proof:
@@ -1213,9 +1242,10 @@ public actor ReticulumTransport {
 
         // Check if we have this destination registered
         guard let destination = destinations[packet.destination] else {
-            // Not our destination - ignore
+            onDiagnostic?("[LINKREQUEST] dest \(hexPrefix) NOT registered, ignoring")
             return
         }
+        onDiagnostic?("[LINKREQUEST] dest \(hexPrefix) found, processing")
 
         // Parse the incoming LINKREQUEST
         let incomingRequest: IncomingLinkRequest
@@ -1258,18 +1288,29 @@ public actor ReticulumTransport {
         // and is processed before the LRRTT completes. Without this, the resource
         // strategy is still .acceptNone when the advertisement is checked, causing
         // the resource to be rejected and the link to close prematurely.
-        // This is the actor-concurrency equivalent of Python's single-threaded
-        // guarantee that callbacks fire before the next packet is processed.
+        // NOTE: Callbacks should only CONFIGURE the link here (set strategy,
+        // handlers). Do NOT send data — encryption keys aren't derived yet.
         if let destCallback = destinationLinkCallbacks[packet.destination] {
             await destCallback(link)
             print("[LINK_RESPONDER] Pre-configured link \(linkIdHex) with destination callbacks")
         }
 
-        // Set link established callback (for logging and any post-establishment work)
+        // Chain any established callback set by destCallback with transport logging.
+        let existingEstablishedCallback = await link.linkEstablishedCallback
+        let diagCallback = self.onDiagnostic
         await link.setLinkEstablishedCallback { [weak self] (establishedLink: Link) async -> Void in
-            guard let self = self else { return }
             let linkIdHex = await establishedLink.linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
+            diagCallback?("[LINK] \(linkIdHex) established (responder)")
             print("[LINK_RESPONDER] Link \(linkIdHex) established (responder)")
+            // Invoke any callback set by the destination (e.g., LXST telephony)
+            if existingEstablishedCallback != nil {
+                diagCallback?("[LINK] invoking dest established callback for \(linkIdHex)")
+                await existingEstablishedCallback?(establishedLink)
+                diagCallback?("[LINK] dest established callback done for \(linkIdHex)")
+            } else {
+                diagCallback?("[LINK] no dest established callback for \(linkIdHex)")
+            }
+            _ = self // prevent unused warning
         }
 
         // Create and send PROOF

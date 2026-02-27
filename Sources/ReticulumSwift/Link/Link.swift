@@ -85,7 +85,7 @@ public actor Link {
     private var peerEncryptionPublicKeyBytes: Data?
 
     /// Link establishment callback for responders
-    private var linkEstablishedCallback: ((Link) async -> Void)?
+    public private(set) var linkEstablishedCallback: ((Link) async -> Void)?
 
     // MARK: - Link Properties
 
@@ -251,8 +251,9 @@ public actor Link {
     /// Remote peer's identity (after LINKIDENTIFY received)
     public private(set) var remoteIdentity: Identity?
 
-    /// Identity callbacks delegate for remote identification notifications
-    private weak var identifyCallbacks: (any IdentifyCallbacks)?
+    /// Identity callbacks delegate for remote identification notifications.
+    /// Strong reference: the Link owns the handler for its lifetime.
+    private var identifyCallbacks: (any IdentifyCallbacks)?
 
     /// Whether the remote peer has identified themselves
     public var isRemoteIdentified: Bool {
@@ -828,6 +829,8 @@ public actor Link {
     /// keep-alive packets to maintain link liveness.
     private func startKeepalive() {
         keepaliveTask?.cancel()
+        let linkHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
+        linkLogger.error("[KEEPALIVE] Starting keepalive for \(linkHex, privacy: .public), interval=\(self.keepaliveInterval, privacy: .public)s, initiator=\(self.initiator, privacy: .public)")
 
         keepaliveTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -853,9 +856,13 @@ public actor Link {
     /// Sends a single-byte keep-alive marker (0xFF for initiator,
     /// 0xFE for responder) to the peer. NOT encrypted, matching Python RNS.
     /// Python Packet.pack() treats KEEPALIVE context as passthrough (no encryption).
+    private var keepaliveSendCount: Int = 0
     private func sendKeepalive() async {
         guard state.isEstablished else { return }
-        guard let send = sendCallback else { return }
+        guard let send = sendCallback else {
+            linkLogger.error("[KEEPALIVE] No sendCallback, can't send keepalive")
+            return
+        }
 
         // Keep-alive content: 0xFF for initiator, 0xFE for responder
         // NOT encrypted - Python RNS sends keepalive as raw bytes
@@ -879,11 +886,15 @@ public actor Link {
                 data: keepaliveData
             )
 
-            try await send(packet.encode())
+            let encoded = packet.encode()
+            try await send(encoded)
+            keepaliveSendCount += 1
             lastOutbound = Date()
+            let linkHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
+            linkLogger.error("[KEEPALIVE] Sent #\(self.keepaliveSendCount, privacy: .public) for \(linkHex, privacy: .public), byte=0x\(String(format: "%02x", keepaliveData[0]), privacy: .public), pktLen=\(encoded.count, privacy: .public)")
         } catch {
-            // Keep-alive send failure - log but don't close link
-            // Watchdog will handle stale detection
+            let linkHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
+            linkLogger.error("[KEEPALIVE] FAILED for \(linkHex, privacy: .public): \(error)")
         }
     }
 
