@@ -133,6 +133,21 @@ public struct PathEntry: Codable, Sendable, Equatable {
         return Hashing.truncatedHash(combined) == destinationHash
     }
 
+    /// Whether this destination is an LXST telephony (voice call) endpoint.
+    public var isLXSTTelephony: Bool {
+        guard publicKeys.count >= 64 else { return false }
+        let identityHash = Hashing.truncatedHash(publicKeys)
+        let nameHash = Hashing.destinationNameHash(appName: "lxst", aspects: ["telephony"])
+        var combined = nameHash
+        combined.append(identityHash)
+        return Hashing.truncatedHash(combined) == destinationHash
+    }
+
+    /// Whether this destination matches any known aspect (LXMF, LXST, NomadNet).
+    public var isKnownDestination: Bool {
+        detectedAspect != nil
+    }
+
     /// Detected aspect name for this destination.
     ///
     /// Tries known Reticulum aspects against the stored public keys and
@@ -143,6 +158,7 @@ public struct PathEntry: Codable, Sendable, Equatable {
         let knownAspects: [(String, [String])] = [
             ("lxmf", ["delivery"]),
             ("lxmf", ["propagation"]),
+            ("lxst", ["telephony"]),
             ("nomadnetwork", ["node"]),
         ]
         for (appName, aspects) in knownAspects {
