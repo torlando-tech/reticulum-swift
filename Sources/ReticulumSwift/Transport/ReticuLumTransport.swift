@@ -2269,13 +2269,16 @@ public actor ReticulumTransport {
 
         let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         let receivingInterfaceId = lastReceivedInterfaceId
+        onDiagnostic?("[PATH_REQ] for \(destHex) from interface \(receivingInterfaceId ?? "unknown")")
 
         // 1. Check local destinations
         if let localDest = destinations[destinationHash] {
+            onDiagnostic?("[PATH_REQ] \(destHex) is LOCAL, responding with announce")
             logger.info("Answering path request for \(destHex, privacy: .public): destination is local")
             respondWithAnnounce(destination: localDest, pathResponse: true, attachedInterfaceId: receivingInterfaceId)
             return
         }
+        onDiagnostic?("[PATH_REQ] \(destHex) NOT local (registered: \(destinations.keys.count) dests)")
 
         // 2. Check path table for known path
         if transportEnabled, let pathEntry = await pathTable.lookup(destinationHash: destinationHash) {
@@ -2471,6 +2474,18 @@ extension ReticulumTransport {
     /// Internal handler for state changes (actor-isolated).
     func handleInterfaceStateChange(id: String, state: InterfaceState) {
         logger.info("Interface \(id, privacy: .public) state: \(String(describing: state), privacy: .public)")
+        onDiagnostic?("[IFACE] \(id) → \(state)")
+
+        // When any interface transitions to connected, fire onInterfaceAdded
+        // so the app layer can send announces over the newly-available link.
+        // AutoInterface/BLE peers fire this via their onPeerAdded callbacks,
+        // but TCP interfaces only reach .connected asynchronously via this
+        // delegate method — without this, TCP connections never trigger announces.
+        if case .connected = state {
+            Task {
+                await self.onInterfaceAdded?(id)
+            }
+        }
     }
 
     /// Internal handler for received data (actor-isolated).
