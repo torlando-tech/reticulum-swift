@@ -158,6 +158,12 @@ public actor ReticulumTransport {
     /// On timeout, resumed with `false`.
     private var pendingPacketProofs: [Data: CheckedContinuation<Bool, Never>] = [:]
 
+    /// Proof callbacks for sent packets (key = truncated packet hash, 16 bytes).
+    /// When a PROOF arrives matching a registered hash, the callback is invoked
+    /// to notify the sender (e.g., LXMF delivery proof → message state = delivered).
+    /// Entries expire after 5 minutes.
+    private var pendingProofCallbacks: [Data: (callback: @Sendable () async -> Void, registeredAt: Date)] = [:]
+
     // MARK: - Path Request Properties
 
     /// Timestamps of recent path requests for throttling
@@ -738,6 +744,26 @@ public actor ReticulumTransport {
         return pendingPacketProofs.removeValue(forKey: hash)
     }
 
+    /// Register a callback to be invoked when a delivery proof arrives for a sent packet.
+    ///
+    /// Used by LXMF to receive delivery confirmations for opportunistic messages.
+    /// The callback is invoked once when a matching proof arrives, then removed.
+    /// Callbacks expire after 5 minutes if no proof arrives.
+    ///
+    /// - Parameters:
+    ///   - truncatedHash: Truncated packet hash (16 bytes) used as proof destination
+    ///   - callback: Closure to invoke when proof arrives
+    public func registerProofCallback(truncatedHash: Data, callback: @Sendable @escaping () async -> Void) {
+        let hex = truncatedHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        print("[PROOF_CB] Registered proof callback for \(hex), total=\(pendingProofCallbacks.count + 1)")
+        pendingProofCallbacks[truncatedHash] = (callback: callback, registeredAt: Date())
+    }
+
+    /// Remove a pending proof callback (e.g., on send failure).
+    public func removeProofCallback(truncatedHash: Data) {
+        pendingProofCallbacks.removeValue(forKey: truncatedHash)
+    }
+
     /// Handle a DATA packet proof on an active link.
     ///
     /// The proof data contains (NOT encrypted — Python Packet.pack() special-cases
@@ -1201,11 +1227,25 @@ public actor ReticulumTransport {
                     print("[PROOF_RECV] DATA proof on active link \(proofDestHex)")
                     await handleDataProof(packet, link: link)
                 }
+            } else if let entry = pendingProofCallbacks.removeValue(forKey: destHash) {
+                // Delivery proof for a sent packet (e.g., LXMF opportunistic)
+                print("[PROOF_RECV] Matched delivery proof callback for \(proofDestHex)")
+                logger.error("[PROOF] DELIVERY proof matched for \(proofDestHex, privacy: .public), invoking callback")
+                Task {
+                    await entry.callback()
+                }
             } else {
                 // Announce PROOF or path request response - existing handling
-                print("[PROOF_RECV] No link match, treating as announce PROOF")
+                let cbCount = pendingProofCallbacks.count
+                let cbKeys = pendingProofCallbacks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
+                print("[PROOF_RECV] No match for \(proofDestHex), pendingCallbacks=\(cbCount), keys=\(cbKeys)")
+                logger.error("[PROOF] UNMATCHED proof dest=\(proofDestHex, privacy: .public), pendingCBs=\(cbCount, privacy: .public), keys=\(cbKeys, privacy: .public)")
                 await handleAnnounceProof(packet, from: interfaceId)
             }
+
+            // Clean up expired proof callbacks (older than 5 minutes)
+            let now = Date()
+            pendingProofCallbacks = pendingProofCallbacks.filter { now.timeIntervalSince($0.value.registeredAt) < 300 }
 
         case .data:
             lastReceivedInterfaceId = interfaceId  // Track for path request handler
