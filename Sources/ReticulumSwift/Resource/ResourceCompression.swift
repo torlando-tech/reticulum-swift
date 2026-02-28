@@ -119,15 +119,17 @@ public enum ResourceCompression {
         }
 
         // BZ2 worst case: output can be ~1% larger than input + 600 bytes overhead
-        var destLen = UInt32(data.count + data.count / 100 + 600)
-        var destBuffer = [UInt8](repeating: 0, count: Int(destLen))
+        let destCapacity = data.count + data.count / 100 + 600
+        var destLen = UInt32(destCapacity)
+        let destBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: destCapacity)
+        defer { destBuffer.deallocate() }
 
         let result = data.withUnsafeBytes { sourceBuffer -> Int32 in
             guard let sourcePointer = sourceBuffer.baseAddress else {
                 return BZ_PARAM_ERROR
             }
             return BZ2_bzBuffToBuffCompress(
-                &destBuffer,
+                destBuffer,
                 &destLen,
                 UnsafeMutableRawPointer(mutating: sourcePointer).assumingMemoryBound(to: CChar.self),
                 UInt32(data.count),
@@ -173,14 +175,15 @@ public enum ResourceCompression {
 
         for attempt in 0..<maxAttempts {
             var destLen = UInt32(bufferSize)
-            var destBuffer = [UInt8](repeating: 0, count: bufferSize)
+            let destBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: bufferSize)
 
             let result = data.withUnsafeBytes { sourceBuffer -> Int32 in
                 guard let sourcePointer = sourceBuffer.baseAddress else {
+                    destBuffer.deallocate()
                     return BZ_PARAM_ERROR
                 }
                 return BZ2_bzBuffToBuffDecompress(
-                    &destBuffer,
+                    destBuffer,
                     &destLen,
                     UnsafeMutableRawPointer(mutating: sourcePointer).assumingMemoryBound(to: CChar.self),
                     UInt32(data.count),
@@ -190,12 +193,16 @@ public enum ResourceCompression {
             }
 
             if result == BZ_OK {
-                return Data(bytes: destBuffer, count: Int(destLen))
+                let resultData = Data(bytes: destBuffer, count: Int(destLen))
+                destBuffer.deallocate()
+                return resultData
             } else if result == BZ_OUTBUFF_FULL && attempt < maxAttempts - 1 {
                 // Double buffer and retry
+                destBuffer.deallocate()
                 bufferSize *= 2
                 continue
             } else {
+                destBuffer.deallocate()
                 throw BZ2Error.decompressFailed(code: result)
             }
         }
