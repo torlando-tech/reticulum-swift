@@ -195,7 +195,14 @@ public enum UDPSocketHelper {
         destAddr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
         destAddr.sin6_family = sa_family_t(AF_INET6)
         destAddr.sin6_port = port.bigEndian
-        destAddr.sin6_scope_id = interfaceIndex
+
+        // Only set scope_id for link-local unicast (fe80::).
+        // For multicast (ff__::), the outgoing interface is already set via
+        // IPV6_MULTICAST_IF socket option — setting scope_id on multicast
+        // destinations causes EHOSTUNREACH on iOS.
+        if address.hasPrefix("fe80") {
+            destAddr.sin6_scope_id = interfaceIndex
+        }
 
         guard inet_pton(AF_INET6, address, &destAddr.sin6_addr) == 1 else {
             throw SocketError.addressResolutionFailed(address)
