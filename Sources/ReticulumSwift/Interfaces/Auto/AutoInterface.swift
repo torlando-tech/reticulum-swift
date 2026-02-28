@@ -339,15 +339,27 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
         }
     }
 
+    /// Interfaces where multicast sends have failed consecutively.
+    /// After `maxConsecutiveFailures` failures, the interface is muted until
+    /// `muteRetryInterval` elapses, avoiding log spam from non-routable
+    /// system interfaces (utun*, anpi*, nan0, etc.).
+    private var sendFailureCounts: [String: Int] = [:]
+    private var mutedUntil: [String: Date] = [:]
+    private let maxConsecutiveFailures = 3
+    private let muteRetryInterval: TimeInterval = 60
+
     /// Send discovery beacons on all adopted interfaces.
     private func sendAnnounces() {
+        let now = Date()
         for (ifname, address) in adoptedInterfaces {
             guard let mcastFd = multicastSockets[ifname] else { continue }
+
+            // Skip muted interfaces until retry time
+            if let unmute = mutedUntil[ifname], now < unmute { continue }
 
             let token = AutoInterfaceConstants.discoveryToken(groupId: groupId, address: address)
 
             do {
-                // Find interface index
                 let ifIndex = if_nametoindex(ifname)
                 try UDPSocketHelper.sendTo(
                     mcastFd,
@@ -356,8 +368,18 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
                     port: discoveryPort,
                     interfaceIndex: ifIndex
                 )
+                // Reset on success
+                sendFailureCounts[ifname] = 0
+                mutedUntil.removeValue(forKey: ifname)
             } catch {
-                logger.debug("Announce send failed on \(ifname, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                let count = (sendFailureCounts[ifname] ?? 0) + 1
+                sendFailureCounts[ifname] = count
+                if count <= maxConsecutiveFailures {
+                    logger.debug("Announce send failed on \(ifname, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                } else if count == maxConsecutiveFailures + 1 {
+                    logger.debug("Muting \(ifname, privacy: .public) for \(self.muteRetryInterval)s after \(count) consecutive failures")
+                    mutedUntil[ifname] = now.addingTimeInterval(muteRetryInterval)
+                }
             }
         }
     }

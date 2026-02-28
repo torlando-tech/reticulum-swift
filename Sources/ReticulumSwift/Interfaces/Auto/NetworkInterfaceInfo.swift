@@ -33,8 +33,16 @@ extension NetworkInterfaceInfo {
     /// Default ignore list for Darwin platforms.
     /// Matches Python AutoInterface: awdl (Apple Wireless Direct Link),
     /// llw (Low Latency WLAN), lo (loopback), en5 (Thunderbolt bridge).
+    /// Also filters iOS-specific interfaces that have link-local IPv6
+    /// but can't route multicast (VPN tunnels, NAN, ANPI).
     public static let darwinIgnoredInterfaces: Set<String> = [
         "awdl0", "llw0", "lo0", "en5"
+    ]
+
+    /// Prefixes for interfaces that should never be adopted for multicast.
+    /// utun = VPN/system tunnels, anpi = Apple Network Proxy, nan = Nearby Area Network.
+    public static let darwinIgnoredPrefixes: [String] = [
+        "utun", "anpi", "nan"
     ]
 
     /// Enumerate all network interfaces with IPv6 link-local addresses.
@@ -69,6 +77,7 @@ extension NetworkInterfaceInfo {
 
             let name = String(cString: ifa.pointee.ifa_name)
             guard !ignoredInterfaces.contains(name) else { continue }
+            guard !darwinIgnoredPrefixes.contains(where: { name.hasPrefix($0) }) else { continue }
             guard !seen.contains(name) else { continue }
 
             // Extract IPv6 address
