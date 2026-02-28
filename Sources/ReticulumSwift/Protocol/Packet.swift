@@ -35,6 +35,9 @@ public struct Packet: Sendable, Equatable {
     /// Packet payload data
     public let data: Data
 
+    /// Human-readable name of the interface that received this packet (set by Transport, not part of wire format)
+    public var receivingInterface: String?
+
     // MARK: - Initialization
 
     /// Parse packet from raw bytes.

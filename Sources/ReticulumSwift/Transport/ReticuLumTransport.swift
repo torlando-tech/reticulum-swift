@@ -1798,11 +1798,19 @@ public actor ReticulumTransport {
             }
         }
 
+        // Attach resolved interface name to packet before delivery
+        var deliveryPacket = packet
+        if let name = await getInterfaceName(for: interfaceId) {
+            deliveryPacket.receivingInterface = name
+        } else {
+            deliveryPacket.receivingInterface = interfaceId
+        }
+
         // Deliver decrypted data via callback manager
         print("[LXMF_INBOUND] Calling callbackManager.deliver() for destHash=\(hexPrefix)")
         await callbackManager.deliver(
             data: deliveryData,
-            packet: packet,
+            packet: deliveryPacket,
             to: destHash
         )
         print("[LXMF_INBOUND] callbackManager.deliver() returned")
