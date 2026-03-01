@@ -109,6 +109,29 @@ extension NetworkInterface {
 /// // Send a packet
 /// try await transport.send(packet: myPacket)
 /// ```
+/// Entry in the per-interface announce bandwidth queue.
+/// Matches Python's announce_queue entry format (Interface.py:~246).
+/// Supports destination dedup (update-only-if-newer) and min-hop-first drain priority.
+struct AnnounceQueueEntry {
+    let destination: Data       // 16-byte destination hash
+    let time: Date              // Arrival time
+    let hops: UInt8             // Hop count at time of queuing
+    let emitted: UInt64         // Emission timestamp from random blob bytes[5:10]
+    let encoded: Data           // Full encoded packet bytes
+
+    /// Extract emission timestamp from an announce packet's data payload.
+    /// Python: Transport.announce_emitted(packet) reads random_blob at
+    /// data[KEYSIZE//8 + NAME_HASH_LENGTH//8 : +10], then extracts bytes[5:10]
+    /// as a big-endian timestamp.
+    static func announceEmitted(from packetData: Data) -> UInt64 {
+        // random_blob is at offset 80 (64 pubkeys + 16 name hash), length 10
+        let blobOffset = 80
+        guard packetData.count >= blobOffset + 10 else { return 0 }
+        let blob = packetData.subdata(in: blobOffset..<(blobOffset + 10))
+        return PathEntry.emissionTimestamp(from: blob)
+    }
+}
+
 public actor ReticulumTransport {
 
     // MARK: - Properties
@@ -202,8 +225,10 @@ public actor ReticulumTransport {
     /// Low priority for iOS single-interface client.
     private var heldAnnounces: [Data: Packet] = [:]
 
-    /// E5: Per-interface announce queues for when bandwidth cap blocks immediate send
-    private var announceQueues: [String: [(time: Date, encoded: Data)]] = [:]
+    /// E5: Per-interface announce queues for when bandwidth cap blocks immediate send.
+    /// Python (Interface.py:246) drains min-hop first, deduplicates by destination
+    /// (updating only if newer emission timestamp).
+    private var announceQueues: [String: [AnnounceQueueEntry]] = [:]
 
     /// E11: Per-interface announce ingress timestamps for storm detection
     private var announceIngressTimestamps: [String: [Date]] = [:]
@@ -1075,9 +1100,16 @@ public actor ReticulumTransport {
     ) async throws {
         try await send(packet: packet)
 
-        // Register receipt for proof-based delivery confirmation
-        // Python creates PacketReceipt for all non-PLAIN destinations
-        if packet.header.destinationType != .plain {
+        // Register receipt for proof-based delivery confirmation.
+        // Python (Transport.py:947-958) only creates receipts when ALL conditions hold:
+        //   1. packet_type == DATA
+        //   2. destination.type != PLAIN
+        //   3. context NOT in KEEPALIVE..LRPROOF (link-control range)
+        //   4. context NOT in RESOURCE..RESOURCE_RCL (resource range)
+        if packet.header.packetType == .data,
+           packet.header.destinationType != .plain,
+           !PacketContext.isLinkContext(packet.context),
+           !PacketContext.isResourceContext(packet.context) {
             let packetHash = packet.getTruncatedHash()
             registerReceipt(hash: packetHash, timeout: receiptTimeout, callback: receiptCallback)
         }
@@ -1284,13 +1316,24 @@ public actor ReticulumTransport {
 
             // Per-interface announce bandwidth cap (C14)
             if let allowedAt = announceAllowedAt[id], now < allowedAt {
-                // Queue announce for later delivery (E5)
+                // Queue announce for later delivery (E5) with dedup by destination
                 var queue = announceQueues[id] ?? []
-                if queue.count < TransportConstants.MAX_QUEUED_ANNOUNCES {
-                    queue.append((time: now, encoded: encoded))
-                    announceQueues[id] = queue
-                    print("[SEND_ANNOUNCE] Bandwidth-capped, queued announce for \(destHex) on '\(id)'")
+                let emitted = AnnounceQueueEntry.announceEmitted(from: packet.data)
+                if let existingIdx = queue.firstIndex(where: { $0.destination == packet.destination }) {
+                    // Python: only update if newer emission timestamp
+                    if emitted > queue[existingIdx].emitted {
+                        queue[existingIdx] = AnnounceQueueEntry(
+                            destination: packet.destination, time: now,
+                            hops: packet.header.hopCount, emitted: emitted, encoded: encoded
+                        )
+                    }
+                } else if queue.count < TransportConstants.MAX_QUEUED_ANNOUNCES {
+                    queue.append(AnnounceQueueEntry(
+                        destination: packet.destination, time: now,
+                        hops: packet.header.hopCount, emitted: emitted, encoded: encoded
+                    ))
                 }
+                announceQueues[id] = queue
                 continue
             }
 
@@ -1543,8 +1586,8 @@ public actor ReticulumTransport {
                     await handleDataProof(packet, link: link)
                 }
             } else {
-                // C10: Sequential proof routing — forward via reverse table AND check local callbacks
-                // (not exclusive: both can apply)
+                // C10: Sequential proof routing — forward via reverse table AND check local callbacks.
+                // Python checks reverse_table AND receipts non-exclusively (both can match).
                 var handled = false
 
                 // Forward via reverse table (C11: works even without transportEnabled)
@@ -1562,13 +1605,11 @@ public actor ReticulumTransport {
                     handled = true
                 }
 
-                // E13: Check receipts
-                if !handled {
-                    if let idx = receipts.firstIndex(where: { $0.hash == destHash }) {
-                        let receipt = receipts.remove(at: idx)
-                        Task { await receipt.callback() }
-                        handled = true
-                    }
+                // E13: Check receipts — Python checks ALL receipts regardless of reverse table match
+                if let idx = receipts.firstIndex(where: { $0.hash == destHash }) {
+                    let receipt = receipts.remove(at: idx)
+                    Task { await receipt.callback() }
+                    handled = true
                 }
 
                 if !handled {
@@ -1837,10 +1878,13 @@ public actor ReticulumTransport {
             return
         }
 
-        // H2: Validate that link DATA arrives on the same interface it was established on
+        // H2: Validate that link DATA arrives on the same interface it was established on.
+        // Python (Transport.py:1993-1994): On interface mismatch, REMOVE the packet hash
+        // from the hashlist so it can be re-accepted when it arrives on the correct interface.
         let attachedId = await link.attachedInterfaceId
         if let attachedId, attachedId != interfaceId {
             print("[LINK_DATA] Dropping packet for \(linkHex): wrong interface (expected=\(attachedId), got=\(interfaceId))")
+            await packetHashlist.remove(packet.getFullHash())
             return
         }
 
@@ -2502,12 +2546,23 @@ public actor ReticulumTransport {
 
                 // C14: Per-interface announce bandwidth cap
                 if let allowedAt = announceAllowedAt[id], Date() < allowedAt {
-                    // E5: Queue announce for later delivery instead of dropping
+                    // E5: Queue announce with dedup by destination
                     var queue = announceQueues[id] ?? []
-                    if queue.count < TransportConstants.MAX_QUEUED_ANNOUNCES {
-                        queue.append((time: Date(), encoded: encoded))
-                        announceQueues[id] = queue
+                    let emitted = AnnounceQueueEntry.announceEmitted(from: action.packet.data)
+                    if let existingIdx = queue.firstIndex(where: { $0.destination == action.destinationHash }) {
+                        if emitted > queue[existingIdx].emitted {
+                            queue[existingIdx] = AnnounceQueueEntry(
+                                destination: action.destinationHash, time: Date(),
+                                hops: action.hops, emitted: emitted, encoded: encoded
+                            )
+                        }
+                    } else if queue.count < TransportConstants.MAX_QUEUED_ANNOUNCES {
+                        queue.append(AnnounceQueueEntry(
+                            destination: action.destinationHash, time: Date(),
+                            hops: action.hops, emitted: emitted, encoded: encoded
+                        ))
                     }
+                    announceQueues[id] = queue
                     continue
                 }
 
@@ -2554,7 +2609,8 @@ public actor ReticulumTransport {
         }
         heldAnnounces.removeAll()
 
-        // E5: Process announce queues (one per interface per cycle)
+        // E5: Process announce queues (one per interface per cycle).
+        // Python (Interface.py:246): drain min-hop first, then oldest arrival.
         let now = Date()
         for (id, _) in interfaces {
             guard var queue = announceQueues[id], !queue.isEmpty else { continue }
@@ -2566,9 +2622,13 @@ public actor ReticulumTransport {
                 announceQueues[id] = queue
                 continue
             }
-            // Send first queued
-            if let entry = queue.first {
-                queue.removeFirst()
+            // Select min-hop entry; among equal hops, pick oldest (earliest arrival)
+            if !queue.isEmpty {
+                let minHops = queue.min(by: { $0.hops < $1.hops })!.hops
+                let candidates = queue.enumerated().filter { $0.element.hops == minHops }
+                let oldest = candidates.min(by: { $0.element.time < $1.element.time })!
+                let entry = oldest.element
+                queue.remove(at: oldest.offset)
                 do {
                     try await interfaces[id]?.send(entry.encoded)
                     let bitrate = interfaces[id]?.config.bitrate ?? 0

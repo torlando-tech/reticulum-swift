@@ -35,4 +35,16 @@ public enum PacketContext {
     public static let LINKCLOSE: UInt8 = 0xFC
     public static let LRRTT: UInt8 = 0xFE
     public static let LRPROOF: UInt8 = 0xFF
+
+    /// Whether a context is in the link-control range (KEEPALIVE..LRPROOF, 0xFA-0xFF).
+    /// Python: `context >= Packet.KEEPALIVE and context <= Packet.LRPROOF`
+    public static func isLinkContext(_ context: UInt8) -> Bool {
+        context >= KEEPALIVE && context <= LRPROOF
+    }
+
+    /// Whether a context is in the resource range (RESOURCE..RESOURCE_RCL, 0x01-0x07).
+    /// Python: `context >= Packet.RESOURCE and context <= Packet.RESOURCE_RCL`
+    public static func isResourceContext(_ context: UInt8) -> Bool {
+        context >= RESOURCE && context <= RESOURCE_RCL
+    }
 }
