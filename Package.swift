@@ -22,8 +22,13 @@ let package = Package(
             path: "Sources/CBZ2"
         ),
         .target(
+            name: "CEd25519",
+            path: "Sources/CEd25519",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "ReticulumSwift",
-            dependencies: ["CryptoSwift", "CBZ2"],
+            dependencies: ["CryptoSwift", "CBZ2", "CEd25519"],
             path: "Sources/ReticulumSwift"
         ),
         .testTarget(
