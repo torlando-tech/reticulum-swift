@@ -163,6 +163,12 @@ public actor Link {
     /// Last outbound traffic timestamp
     private var lastOutbound: Date?
 
+    /// Last proof received timestamp (for stale detection, L10)
+    private var lastProof: Date?
+
+    /// Interface ID this link is attached to (H2: validates DATA delivery source)
+    public private(set) var attachedInterfaceId: String?
+
     // MARK: - Tasks
 
     /// Task for periodic keep-alive sending
@@ -607,6 +613,7 @@ public actor Link {
 
         // Transition to active
         lastInbound = Date()
+        lastProof = Date() // L10: Track proof receipt for stale detection
         print("[LINK_PROOF] Transitioning to active state...")
         transitionState(to: .active)
 
@@ -821,6 +828,12 @@ public actor Link {
         self.sendCallback = callback
     }
 
+    /// Set the interface this link is attached to (H2).
+    /// Called by transport when link is established (request or proof).
+    public func setAttachedInterface(_ id: String) {
+        attachedInterfaceId = id
+    }
+
     // MARK: - Keep-Alive
 
     /// Start the keep-alive task.
@@ -829,6 +842,8 @@ public actor Link {
     /// keep-alive packets to maintain link liveness.
     private func startKeepalive() {
         keepaliveTask?.cancel()
+        // H1: Only initiator sends periodic keepalives. Responder echoes on receipt.
+        guard initiator else { return }
         let linkHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
         linkLogger.error("[KEEPALIVE] Starting keepalive for \(linkHex, privacy: .public), interval=\(self.keepaliveInterval, privacy: .public)s, initiator=\(self.initiator, privacy: .public)")
 
@@ -920,6 +935,11 @@ public actor Link {
                 transitionState(to: .active)
             }
         }
+
+        // H1: Responder echoes 0xFE when receiving initiator's 0xFF
+        if !initiator && byte == LinkConstants.KEEPALIVE_INITIATOR {
+            Task { [weak self] in await self?.sendKeepalive() }
+        }
     }
 
     /// Stop keep-alive task.
@@ -972,14 +992,16 @@ public actor Link {
             return
         }
 
-        let elapsed = Date().timeIntervalSince(lastIn)
+        // L10: Consider lastProof as activity alongside lastInbound
+        let lastActivity = [lastInbound, lastProof].compactMap { $0 }.max() ?? lastIn
+        let elapsed = Date().timeIntervalSince(lastActivity)
         let staleTime = keepaliveInterval * 2.0
 
         if state == .active && elapsed > staleTime {
             // Transition to stale
             transitionState(to: .stale)
-        } else if state == .stale && elapsed > (staleTime + LinkConstants.STALE_GRACE) {
-            // Stale grace period expired - close link
+        } else if state == .stale && elapsed > (staleTime + rtt * LinkConstants.KEEPALIVE_TIMEOUT_FACTOR + LinkConstants.STALE_GRACE) {
+            // M8: Stale grace includes RTT-proportional timeout (Python: rtt * KEEPALIVE_TIMEOUT_FACTOR + STALE_GRACE)
             close(reason: .timeout)
         }
     }

@@ -164,6 +164,13 @@ public actor PathTable {
         return pathStates[destinationHash] == TransportConstants.PATH_STATE_UNRESPONSIVE
     }
 
+    /// Mark a path as responsive after successful communication (M10).
+    /// Called after link establishment confirms the path is alive.
+    public func markPathResponsive(_ destinationHash: Data) {
+        guard paths[destinationHash] != nil else { return }
+        pathStates[destinationHash] = TransportConstants.PATH_STATE_RESPONSIVE
+    }
+
     // MARK: - Record (Python 5-path decision tree)
 
     /// Record a path entry using Python-compatible acceptance logic.
@@ -692,6 +699,62 @@ public actor PathTable {
         return entry
     }
 
+    // MARK: - Touch
+
+    /// Update the timestamp of an existing path entry (e.g., after transport forwarding).
+    /// Also extends the expiration time (M7).
+    /// Python reference: Transport.py line 1504
+    ///
+    /// - Parameter destinationHash: 16-byte destination hash
+    public func touch(destinationHash: Data) {
+        guard let entry = paths[destinationHash] else { return }
+        // M7: Refresh both timestamp and expiration
+        let newExpires = Date().addingTimeInterval(PathEntry.standardExpiration)
+        let touched = PathEntry(
+            destinationHash: entry.destinationHash,
+            publicKeys: entry.publicKeys,
+            interfaceId: entry.interfaceId,
+            hopCount: entry.hopCount,
+            timestamp: Date(),
+            expires: newExpires,
+            randomBlob: entry.randomBlob,
+            randomBlobs: entry.randomBlobs,
+            pathState: entry.pathState,
+            ratchet: entry.ratchet,
+            appData: entry.appData,
+            nextHop: entry.nextHop,
+            announceData: entry.announceData
+        )
+        paths[destinationHash] = touched
+        saveToDatabase(touched)
+    }
+
+    /// M6: Force-expire a path to trigger rediscovery.
+    /// Called when a link to a non-transport destination is closed.
+    /// Python reference: Transport.py:699
+    ///
+    /// - Parameter destinationHash: 16-byte destination hash
+    public func expirePath(destinationHash: Data) {
+        guard let entry = paths[destinationHash] else { return }
+        let expired = PathEntry(
+            destinationHash: entry.destinationHash,
+            publicKeys: entry.publicKeys,
+            interfaceId: entry.interfaceId,
+            hopCount: entry.hopCount,
+            timestamp: entry.timestamp,
+            expires: Date(timeIntervalSince1970: 0),
+            randomBlob: entry.randomBlob,
+            randomBlobs: entry.randomBlobs,
+            pathState: entry.pathState,
+            ratchet: entry.ratchet,
+            appData: entry.appData,
+            nextHop: entry.nextHop,
+            announceData: entry.announceData
+        )
+        paths[destinationHash] = expired
+        saveToDatabase(expired)
+    }
+
     // MARK: - Removal
 
     /// Remove a path from the table.
@@ -716,18 +779,33 @@ public actor PathTable {
 
     // MARK: - Cleanup
 
-    /// Remove all expired entries from memory and database.
+    /// Remove expired entries and paths for dead interfaces from memory and database.
     ///
+    /// - Parameter activeInterfaceIds: Optional set of currently-active interface IDs.
+    ///   If provided, paths referencing interfaces not in this set are also removed (H4).
     /// - Returns: Number of entries removed
     @discardableResult
-    public func cleanup() -> Int {
+    public func cleanup(activeInterfaceIds: Set<String>? = nil) -> Int {
         let beforeCount = paths.count
-        let expiredKeys = paths.filter { $0.value.isExpired }.map { $0.key }
-        paths = paths.filter { !$0.value.isExpired }
 
-        // Remove expired entries from database
+        // Remove expired entries
+        let expiredKeys = paths.filter { $0.value.isExpired }.map { $0.key }
         for key in expiredKeys {
+            paths.removeValue(forKey: key)
+            pathStates.removeValue(forKey: key)
             removeFromDatabase(key)
+        }
+
+        // H4: Remove paths for dead interfaces
+        if let activeIds = activeInterfaceIds {
+            let deadKeys = paths.filter {
+                !$0.value.interfaceId.isEmpty && !activeIds.contains($0.value.interfaceId)
+            }.map { $0.key }
+            for key in deadKeys {
+                paths.removeValue(forKey: key)
+                pathStates.removeValue(forKey: key)
+                removeFromDatabase(key)
+            }
         }
 
         return beforeCount - paths.count

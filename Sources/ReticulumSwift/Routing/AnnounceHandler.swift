@@ -14,7 +14,6 @@
 //
 
 import Foundation
-import CryptoKit
 
 // MARK: - Process Result
 
@@ -234,17 +233,15 @@ public actor AnnounceHandler {
 
     /// Compute announce hash for deduplication.
     ///
-    /// The hash is computed as SHA256(destination || data) to uniquely
-    /// identify this specific announce.
+    /// C4: Uses the packet's full hash (SHA256 of wire-format hashable part),
+    /// matching Python's `packet.packet_hash`. This allows announces via
+    /// different relay hops (different transport address, incremented hop count)
+    /// to produce different hashes, letting potentially better paths through.
     ///
     /// - Parameter packet: Packet to hash
-    /// - Returns: SHA256 hash of destination and data
+    /// - Returns: 32-byte SHA256 packet hash
     private func computeAnnounceHash(_ packet: Packet) -> Data {
-        var hashInput = Data()
-        hashInput.append(packet.destination)
-        hashInput.append(packet.data)
-        let digest = SHA256.hash(data: hashInput)
-        return Data(digest)
+        return packet.getFullHash()
     }
 
     /// Add an announce hash to the seen set, pruning if needed.

@@ -89,6 +89,21 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
     /// Reference: Python Interface.announce_rate_penalty
     public var announceRatePenalty: TimeInterval
 
+    /// C14: Estimated bitrate (bits/second) for announce bandwidth cap calculation.
+    /// 0 means unknown/unlimited (no cap applied).
+    /// Reference: Python Interface.bitrate
+    public var bitrate: Int
+
+    /// E8: IFAC (Interface Access Code) signature size in bytes.
+    /// 0 means no IFAC validation on this interface.
+    /// Reference: Python Interface.ifac_size
+    public var ifacSize: Int
+
+    /// E8: IFAC key material for HKDF-derived authentication.
+    /// nil means no IFAC on this interface.
+    /// Reference: Python Interface.ifac_key
+    public var ifacKey: Data?
+
     // MARK: - Initialization
 
     /// Create a new interface configuration.
@@ -116,7 +131,10 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         ifac: Data? = nil,
         announceRateTarget: TimeInterval? = nil,
         announceRateGrace: Int = 0,
-        announceRatePenalty: TimeInterval = 0
+        announceRatePenalty: TimeInterval = 0,
+        bitrate: Int = 0,
+        ifacSize: Int = 0,
+        ifacKey: Data? = nil
     ) {
         self.id = id
         self.name = name
@@ -129,6 +147,9 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         self.announceRateTarget = announceRateTarget
         self.announceRateGrace = announceRateGrace
         self.announceRatePenalty = announceRatePenalty
+        self.bitrate = bitrate
+        self.ifacSize = ifacSize
+        self.ifacKey = ifacKey
     }
 
     // MARK: - Codable backward compatibility
@@ -147,11 +168,15 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         announceRateTarget = try container.decodeIfPresent(TimeInterval.self, forKey: .announceRateTarget)
         announceRateGrace = try container.decodeIfPresent(Int.self, forKey: .announceRateGrace) ?? 0
         announceRatePenalty = try container.decodeIfPresent(TimeInterval.self, forKey: .announceRatePenalty) ?? 0
+        bitrate = try container.decodeIfPresent(Int.self, forKey: .bitrate) ?? 0
+        ifacSize = try container.decodeIfPresent(Int.self, forKey: .ifacSize) ?? 0
+        ifacKey = try container.decodeIfPresent(Data.self, forKey: .ifacKey)
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, type, enabled, mode, host, port, ifac
         case announceRateTarget, announceRateGrace, announceRatePenalty
+        case bitrate, ifacSize, ifacKey
     }
 
     // MARK: - Persistence

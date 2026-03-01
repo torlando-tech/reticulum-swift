@@ -48,6 +48,12 @@ public enum LinkConstants {
     /// allowed for traffic to resume before the link is closed.
     public static let STALE_GRACE: TimeInterval = 5.0
 
+    /// RTT multiplier for stale grace period (M8).
+    ///
+    /// Python: `rtt * KEEPALIVE_TIMEOUT_FACTOR + STALE_GRACE` determines
+    /// the total grace period before closing a stale link.
+    public static let KEEPALIVE_TIMEOUT_FACTOR: Double = 4.0
+
     /// Maximum sleep time for link watchdog.
     ///
     /// The watchdog timer will wake at least this frequently
