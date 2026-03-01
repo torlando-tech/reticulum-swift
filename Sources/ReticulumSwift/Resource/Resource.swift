@@ -443,18 +443,71 @@ public actor Resource {
         return true
     }
 
+    /// Send hashmap update for a specific wire segment (0-based).
+    ///
+    /// Used when computing the segment from `last_map_hash` in the exhaustion
+    /// request (matches Python RNS behavior). Python computes:
+    ///   `segment = part_index // HASHMAP_MAX_LEN`
+    /// where `part_index` is looked up from the receiver's `last_map_hash`.
+    /// The next segment (segment + 1) is then sent as the HMU.
+    ///
+    /// This is more robust than the sequential counter approach because it
+    /// handles duplicate exhaustion requests, retransmissions, and packet loss
+    /// correctly — the sender always sends the segment the receiver actually needs.
+    ///
+    /// - Parameters:
+    ///   - wireSegment: 0-based wire segment to send
+    ///   - linkMDU: Link MDU for segmentation calculation
+    /// - Returns: True if the segment was sent, false if out of range
+    public func sendHashmapForWireSegment(_ wireSegment: Int, linkMDU: Int) async throws -> Bool {
+        // Convert wire segment (0-based) to internal (1-based)
+        let internalSegment = wireSegment + 1
+        guard internalSegment <= totalHashmapSegments else {
+            return false
+        }
+        // Update tracking to match actual state
+        currentHashmapSegment = internalSegment
+        try await sendHashmapUpdate(segment: internalSegment, linkMDU: linkMDU)
+        return true
+    }
+
     /// Append a hashmap segment for large resource transfers.
     ///
     /// Called when receiving RESOURCE_HMU packets containing additional
     /// hashmap segments for resources that exceed HASHMAP_MAX_LEN parts.
     ///
-    /// - Parameter segment: Additional hashmap segment data
-    public func appendHashmapSegment(_ segment: Data) async {
+    /// Python's `hashmap_update(segment, hashmap)` uses the segment number
+    /// as a positional index: `self.hashmap[i + segment * seg_len]`.
+    /// We validate the segment matches our current position and append.
+    ///
+    /// - Parameters:
+    ///   - segmentData: Additional hashmap segment data (4-byte hashes)
+    ///   - wireSegment: 0-based wire segment number from HMU packet
+    public func appendHashmapSegment(_ segmentData: Data, wireSegment: Int) async {
+        let maxLength = ResourceHashmap.hashmapMaxLength(linkMDU: LinkConstants.LINK_MDU)
+        let currentCoverage = (hashmap?.count ?? 0) / ResourceConstants.MAPHASH_LEN
+        let segmentStartPart = wireSegment * maxLength
+
+        if segmentStartPart < currentCoverage {
+            // Duplicate HMU for a segment we already have — ignore
+            print("[RESOURCE_HMU] Ignoring duplicate segment \(wireSegment) (coverage=\(currentCoverage))")
+            waitingForHMU = false
+            if state == .transferring {
+                try? await requestNextParts()
+            }
+            return
+        }
+
+        if segmentStartPart > currentCoverage {
+            // Gap detected — segment is ahead of our current position
+            print("[RESOURCE_HMU] Warning: segment \(wireSegment) starts at part \(segmentStartPart) but coverage is \(currentCoverage)")
+        }
+
         if var existing = hashmap {
-            existing.append(segment)
+            existing.append(segmentData)
             hashmap = existing
         } else {
-            hashmap = segment
+            hashmap = segmentData
         }
         // Clear HMU wait flag and resume requesting parts
         waitingForHMU = false

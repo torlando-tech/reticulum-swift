@@ -1099,14 +1099,17 @@ public actor Link {
         guard let encryptToken = self.token else {
             throw LinkError.encryptionNotReady
         }
-        // BZ2 compression enabled: matches Python RNS bz2.compress() for full interop.
+        // BZ2 compression disabled: our BZ2 output may not decompress correctly on
+        // the Python receiver. Disable until interop is verified with E2E tests.
+        // Using global MDU (464) as partSize — this is the max unencrypted payload
+        // for resource data parts (context 0x01, not link-encrypted).
         try await resource.prepare(partSize: MDU, linkEncrypt: { plaintext in
             return try encryptToken.encrypt(plaintext)
-        }, autoCompress: true)
+        }, autoCompress: false)
         let numParts = await resource.numParts
         let transferSize = await resource.transferSize
-        linkLogger.info("[RESOURCE_SEND] Prepared: \(numParts) parts, partSize=\(MDU), transferSize=\(transferSize)")
-        print("[RESOURCE_SEND] Prepared: \(numParts) parts, partSize=\(MDU)")
+        linkLogger.info("[RESOURCE_SEND] Prepared: \(numParts) parts, partSize=\(MDU), transferSize=\(transferSize), compressed=false")
+        print("[RESOURCE_SEND] Prepared: \(numParts) parts, partSize=\(MDU), compressed=false")
 
         // Store resource (hash is available after prepare)
         let hash = await resource.hash ?? Data()
@@ -1356,23 +1359,47 @@ public actor Link {
 
             // Send all requested parts
             var offset = 0
+            var sentCount = 0
+            var missCount = 0
             while offset + mapHashLen <= requestedHashes.count {
                 let partHash = Data(requestedHashes[requestedHashes.startIndex + offset ..< requestedHashes.startIndex + offset + mapHashLen])
                 if let partIndex = ResourceHashmap.findPartIndex(for: partHash, in: hashmap) {
                     do {
                         try await resource.sendPart(at: partIndex)
-                        print("[RESOURCE_REQ] Sent part \(partIndex)")
+                        sentCount += 1
                     } catch {
-                        print("[RESOURCE_REQ] Failed to send part \(partIndex): \(error)")
+                        linkLogger.error("[RESOURCE_REQ] Failed to send part \(partIndex): \(error.localizedDescription)")
                     }
+                } else {
+                    missCount += 1
                 }
                 offset += mapHashLen
             }
+            linkLogger.info("[RESOURCE_REQ] Sent \(sentCount) parts, \(missCount) hash misses for \(resHashHex)")
 
             // Handle hashmap exhaustion (send more hashmap entries)
+            // Python RNS computes the HMU segment from last_map_hash rather than
+            // using a sequential counter. This handles retransmissions, duplicates,
+            // and packet loss correctly.
             if exhausted {
+                let lastMapHash = Data(data[data.startIndex + 1 ..< data.startIndex + 1 + mapHashLen])
+                let maxLength = ResourceHashmap.hashmapMaxLength(linkMDU: LinkConstants.LINK_MDU)
+
                 do {
-                    let sent = try await resource.sendNextHashmapSegment(linkMDU: LinkConstants.LINK_MDU)
+                    let sent: Bool
+                    if let partIndex = ResourceHashmap.findPartIndex(for: lastMapHash, in: hashmap) {
+                        // Compute next wire segment from the part that was exhausted
+                        let exhaustedSegment = partIndex / maxLength
+                        let nextWireSegment = exhaustedSegment + 1
+                        linkLogger.info("[RESOURCE_REQ] last_map_hash→part \(partIndex), exhaustedSeg=\(exhaustedSegment), nextWireSeg=\(nextWireSegment)")
+                        print("[RESOURCE_REQ] last_map_hash→part \(partIndex), sending HMU wireSeg=\(nextWireSegment)")
+                        sent = try await resource.sendHashmapForWireSegment(nextWireSegment, linkMDU: LinkConstants.LINK_MDU)
+                    } else {
+                        // Fallback to sequential counter if hash lookup fails
+                        linkLogger.warning("[RESOURCE_REQ] last_map_hash lookup failed, falling back to sequential")
+                        print("[RESOURCE_REQ] last_map_hash lookup failed, using sequential counter")
+                        sent = try await resource.sendNextHashmapSegment(linkMDU: LinkConstants.LINK_MDU)
+                    }
                     if sent {
                         linkLogger.info("[RESOURCE_REQ] Sent HMU for resource \(resHashHex)")
                         print("[RESOURCE_REQ] Sent HMU for resource \(resHashHex)")
@@ -1518,6 +1545,8 @@ public actor Link {
         let hmuPayload = Data(data.dropFirst(hashLen))
 
         // Unpack msgpack([segment, hashmap_bytes])
+        // Python: update = umsgpack.unpackb(plaintext[HASHLENGTH//8:])
+        //         self.hashmap_update(update[0], update[1])
         guard let value = try? unpackMsgPack(hmuPayload),
               case .array(let arr) = value,
               arr.count == 2,
@@ -1526,14 +1555,24 @@ public actor Link {
             return
         }
 
+        // Extract wire segment number (0-based) from msgpack
+        let wireSegment: Int
+        switch arr[0] {
+        case .int(let i): wireSegment = Int(i)
+        case .uint(let u): wireSegment = Int(u)
+        default:
+            print("[RESOURCE_HMU] Invalid segment number in HMU")
+            return
+        }
+
         let resHashHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[RESOURCE_HMU] Received HMU for \(resHashHex), \(hashmapChunk.count / 4) new hashes")
+        print("[RESOURCE_HMU] Received HMU for \(resHashHex), wireSeg=\(wireSegment), \(hashmapChunk.count / 4) new hashes")
 
         // Find matching inbound resource by hash
         for (_, resource) in inboundResources {
             let storedHash = await resource.hash
             if storedHash == resourceHash {
-                await resource.appendHashmapSegment(hashmapChunk)
+                await resource.appendHashmapSegment(hashmapChunk, wireSegment: wireSegment)
                 return
             }
         }
