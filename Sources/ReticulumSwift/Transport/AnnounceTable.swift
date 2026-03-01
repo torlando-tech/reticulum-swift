@@ -32,6 +32,9 @@ public struct RetransmitAction: Sendable {
 
     /// Optional specific interface to send on (nil = all)
     public let attachedInterfaceId: String?
+
+    /// C13: Interface ID that originally received the announce (for sourceMode filtering)
+    public let receivingInterfaceId: String?
 }
 
 // MARK: - Announce Table
@@ -75,6 +78,9 @@ public actor AnnounceTable {
 
         /// Override interface for retransmission (nil = all)
         var attachedInterfaceId: String?
+
+        /// C13: Interface ID that originally received the announce
+        var receivingInterfaceId: String?
     }
 
     // MARK: - Rate Limiting
@@ -114,6 +120,8 @@ public actor AnnounceTable {
     ///   - blockRebroadcasts: Whether to use PATH_RESPONSE context
     ///   - attachedInterfaceId: Optional specific interface to retransmit on
     ///   - isLocalClient: Whether the announce originated from a local client
+    /// - Parameters:
+    ///   - extraDelay: E6: Additional delay before retransmission (e.g., PATH_REQUEST_RG for roaming)
     public func insert(
         destinationHash: Data,
         packet: Packet,
@@ -121,7 +129,9 @@ public actor AnnounceTable {
         receivedFrom: Data,
         blockRebroadcasts: Bool = false,
         attachedInterfaceId: String? = nil,
-        isLocalClient: Bool = false
+        isLocalClient: Bool = false,
+        receivingInterfaceId: String? = nil,
+        extraDelay: TimeInterval = 0
     ) {
         let now = Date()
         var retransmitTimeout: Date
@@ -132,8 +142,9 @@ public actor AnnounceTable {
             retransmitTimeout = now
             retries = TransportConstants.PATHFINDER_R
         } else {
-            // Random jitter before first retransmission
-            retransmitTimeout = now.addingTimeInterval(Double.random(in: 0...TransportConstants.PATHFINDER_RW))
+            // Random jitter before first retransmission, plus any extra delay (E6)
+            // Python Transport.py:1764: retransmit_timeout = now + pathfinder_G + random() * pathfinder_RW
+            retransmitTimeout = now.addingTimeInterval(extraDelay + TransportConstants.PATHFINDER_G + Double.random(in: 0...TransportConstants.PATHFINDER_RW))
             retries = 0
         }
 
@@ -146,7 +157,8 @@ public actor AnnounceTable {
             packet: packet,
             localRebroadcasts: 0,
             blockRebroadcasts: blockRebroadcasts,
-            attachedInterfaceId: attachedInterfaceId
+            attachedInterfaceId: attachedInterfaceId,
+            receivingInterfaceId: receivingInterfaceId
         )
 
         entries[destinationHash] = entry
@@ -182,9 +194,10 @@ public actor AnnounceTable {
 
             // Check if retransmission is due
             if now > entry.retransmitTimeout {
-                // Schedule next retransmission
+                // L1: On retry (retries > 0), use fixed timeout without random jitter
+                // First send (retries == 0) already had jitter applied at insert time
                 entry.retransmitTimeout = now.addingTimeInterval(
-                    TransportConstants.PATHFINDER_G + Double.random(in: 0...TransportConstants.PATHFINDER_RW)
+                    TransportConstants.PATHFINDER_G + (entry.retries == 0 ? Double.random(in: 0...TransportConstants.PATHFINDER_RW) : TransportConstants.PATHFINDER_RW)
                 )
                 entry.retries += 1
                 entries[destHash] = entry
@@ -194,7 +207,8 @@ public actor AnnounceTable {
                     packet: entry.packet,
                     hops: entry.hops,
                     blockRebroadcasts: entry.blockRebroadcasts,
-                    attachedInterfaceId: entry.attachedInterfaceId
+                    attachedInterfaceId: entry.attachedInterfaceId,
+                    receivingInterfaceId: entry.receivingInterfaceId
                 ))
             }
         }
@@ -320,5 +334,17 @@ public actor AnnounceTable {
     /// Remove an entry from the table.
     public func remove(_ destinationHash: Data) {
         entries.removeValue(forKey: destinationHash)
+    }
+
+    /// E3: Remove and return an entry's packet from the table.
+    ///
+    /// Used by held_announces lifecycle: when a path request response is about to be
+    /// inserted, any existing announce for that destination is moved to heldAnnounces.
+    ///
+    /// - Parameter destinationHash: Destination hash to remove
+    /// - Returns: The packet from the removed entry, or nil if not found
+    public func removeAndReturn(_ destinationHash: Data) -> Packet? {
+        guard let entry = entries.removeValue(forKey: destinationHash) else { return nil }
+        return entry.packet
     }
 }

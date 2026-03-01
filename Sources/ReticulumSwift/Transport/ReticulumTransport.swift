@@ -69,6 +69,18 @@ public protocol NetworkInterface: AnyObject, Sendable {
 /// Default hwMtu for interfaces that don't override it.
 extension NetworkInterface {
     public var hwMtu: Int { 500 }
+
+    /// E16: Radio signal strength (RSSI) for the most recent reception.
+    /// Override in radio interfaces (e.g., RNodeInterface). Default: nil (not a radio).
+    public var radioRssi: Double? { nil }
+
+    /// E16: Radio signal-to-noise ratio for the most recent reception.
+    /// Override in radio interfaces. Default: nil.
+    public var radioSnr: Double? { nil }
+
+    /// E16: Radio link quality metric for the most recent reception.
+    /// Override in radio interfaces. Default: nil.
+    public var radioQuality: Double? { nil }
 }
 
 // MARK: - ReticulumTransport Actor
@@ -102,7 +114,7 @@ public actor ReticulumTransport {
     // MARK: - Properties
 
     /// Path table for routing lookups
-    private let pathTable: PathTable
+    let pathTable: PathTable
 
     /// Callback manager for packet delivery
     private let callbackManager: DefaultCallbackManager
@@ -113,7 +125,7 @@ public actor ReticulumTransport {
     /// Announce table for scheduled retransmissions (Python Transport.announce_table)
     private let announceTable = AnnounceTable()
 
-    /// Whether this node acts as a transport/relay node.
+    /// Whether this node acts as a transport node.
     /// When enabled, all valid announces are rebroadcast.
     /// When disabled, only announces for local destinations are rebroadcast.
     /// Reference: Python Transport.py:1741 (RNS.Reticulum.transport_enabled())
@@ -167,10 +179,11 @@ public actor ReticulumTransport {
     // MARK: - Path Request Properties
 
     /// Timestamps of recent path requests for throttling
-    private var pathRequestTimestamps: [Data: Date] = [:]
+    var pathRequestTimestamps: [Data: Date] = [:]
 
     /// Cooldown period between path requests for same destination (seconds)
-    private let pathRequestCooldown: TimeInterval = 5.0
+    /// E2: Changed from 5s to match Python Transport.PATH_REQUEST_MI = 20s
+    private let pathRequestCooldown: TimeInterval = TransportConstants.PATH_REQUEST_MI
 
     /// Packets waiting for path discovery
     private var pendingPackets: [Data: [Packet]] = [:]
@@ -180,6 +193,34 @@ public actor ReticulumTransport {
 
     /// PLAIN destination for receiving path requests from other nodes
     private var pathRequestDestination: Destination?
+
+    /// C14: Per-interface earliest time the next announce can be sent (bandwidth cap)
+    private var announceAllowedAt: [String: Date] = [:]
+
+    /// C16: Held announces — announces deferred for path request responses (stub)
+    /// Key = destination hash, Value = announce packet held until next retransmission cycle.
+    /// Low priority for iOS single-interface client.
+    private var heldAnnounces: [Data: Packet] = [:]
+
+    /// E5: Per-interface announce queues for when bandwidth cap blocks immediate send
+    private var announceQueues: [String: [(time: Date, encoded: Data)]] = [:]
+
+    /// E11: Per-interface announce ingress timestamps for storm detection
+    private var announceIngressTimestamps: [String: [Date]] = [:]
+    private let ingressDequeSize = 6
+
+    /// E12: Pending local path requests (dest hash → receiving interface ID)
+    private var pendingLocalPathRequests: [Data: String] = [:]
+
+    /// E13: Receipt-based proof validation
+    private var receipts: [(hash: Data, callback: @Sendable () async -> Void, timeout: Date)] = []
+    private let maxReceipts = 1024
+
+    /// E16: Radio stats caching
+    private var radioRssiCache: [(packetHash: Data, value: Double)] = []
+    private var radioSnrCache: [(packetHash: Data, value: Double)] = []
+    private var radioQualityCache: [(packetHash: Data, value: Double)] = []
+    private let maxRadioCacheSize = 512
 
     /// Dedup cache for path request tags (matching Python max_pr_tags=32000)
     private var discoveryPrTags: [Data] = []
@@ -196,6 +237,27 @@ public actor ReticulumTransport {
     /// Used by handlePathRequest to know which interface to avoid when forwarding.
     /// Safe because this actor processes packets sequentially.
     private var lastReceivedInterfaceId: String?
+
+    // MARK: - Transport Table Properties
+
+    /// Link transport table: link_id → entry.
+    /// Populated when forwarding LINKREQUESTs; used for PROOF routing and DATA forwarding.
+    /// Python reference: Transport.py ~line 1482
+    var linkTable: [Data: LinkTableEntry] = [:]
+
+    /// Reverse transport table: truncated_packet_hash → entry.
+    /// Populated when forwarding non-link DATA; used for PROOF routing back.
+    /// Python reference: Transport.py ~line 1551
+    var reverseTable: [Data: ReverseTableEntry] = [:]
+
+    /// Packet dedup hashlist: rotating sets of seen packet hashes.
+    /// Python reference: Transport.py ~line 1230
+    let packetHashlist = PacketHashlist()
+
+    /// E8: Cached IFAC signing seeds per interface.
+    /// Key = interface ID, Value = 32-byte Ed25519 signing seed (bytes 32-63 of ifac_key).
+    /// Uses Ed25519Pure (deterministic RFC 8032) for IFAC interop with Python.
+    private var ifacSigningSeeds: [String: Data] = [:]
 
     /// Called when a new sub-interface is added (e.g., BLE peer connects).
     /// The app layer hooks this to trigger a full announce (with display name, ratchet, etc.).
@@ -245,6 +307,14 @@ public actor ReticulumTransport {
 
         // Store the interface
         interfaces[id] = interface
+
+        // E8: Cache IFAC Ed25519 signing seed if interface has IFAC configured
+        // Python: ifac_identity = Identity.from_bytes(ifac_key) → signing key = bytes[32:64]
+        if let ifacKey = interface.config.ifacKey, interface.config.ifacSize > 0, ifacKey.count == 64 {
+            let signingSeed = ifacKey[32..<64]
+            ifacSigningSeeds[id] = Data(signingSeed)
+            logger.info("IFAC signing seed cached for interface \(id, privacy: .public), ifacSize=\(interface.config.ifacSize, privacy: .public)")
+        }
 
         // Create and store delegate wrapper to forward events to this actor
         let wrapper = TransportDelegateWrapper(transport: self)
@@ -606,11 +676,12 @@ public actor ReticulumTransport {
         // Create link with interface HW_MTU for MTU negotiation
         let link = Link(destination: destination, identity: identity, hwMtu: hwMtu)
 
-        // Set send callback - sends raw packet bytes to all interfaces
+        // Set send callback - routes via attached interface when known
         // The Link builds complete packets (with header, context, etc.)
-        await link.setSendCallback { [weak self] packetBytes in
+        await link.setSendCallback { [weak self, weak link] packetBytes in
             guard let self = self else { throw TransportError.notConnected }
-            try await self.sendRawBytes(packetBytes)
+            let ifaceId = await link?.attachedInterfaceId
+            try await self.sendRawBytes(packetBytes, interfaceId: ifaceId)
         }
 
         // Get packet FIRST so we can use it to compute link_id
@@ -800,17 +871,37 @@ public actor ReticulumTransport {
         }
     }
 
-    /// Send raw packet bytes to all connected interfaces.
+    /// Send raw packet bytes, optionally to a specific interface.
     ///
     /// Used by Link callbacks to send pre-built packets (LRRTT, keepalive, etc.)
     /// The bytes are sent directly without additional wrapping.
+    /// When interfaceId is provided, sends only on that interface (matching Python's
+    /// behavior of routing link traffic via the attached interface).
     ///
-    /// - Parameter bytes: Encoded packet bytes to send
+    /// - Parameters:
+    ///   - bytes: Encoded packet bytes to send
+    ///   - interfaceId: Optional specific interface to send on (nil = all)
     /// - Throws: TransportError if send fails
-    private func sendRawBytes(_ bytes: Data) async throws {
+    private func sendRawBytes(_ bytes: Data, interfaceId: String? = nil) async throws {
         let bytesHex = bytes.prefix(20).map { String(format: "%02x", $0) }.joined()
-        print("[TRANSPORT] sendRawBytes called with \(bytes.count) bytes: \(bytesHex)...")
-        logger.error("[SEND_RAW] \(bytes.count) bytes, header: \(bytesHex)")
+        print("[TRANSPORT] sendRawBytes called with \(bytes.count) bytes: \(bytesHex)... interfaceId=\(interfaceId ?? "all")")
+        logger.error("[SEND_RAW] \(bytes.count) bytes, header: \(bytesHex), interface=\(interfaceId ?? "all", privacy: .public)")
+
+        // If a specific interface is requested, send only on that one
+        if let targetId = interfaceId {
+            guard let interface = interfaces[targetId], interface.state == .connected else {
+                // Fall back to broadcast if the specified interface is unavailable
+                logger.warning("Specified interface \(targetId, privacy: .public) unavailable, falling back to broadcast")
+                try await sendRawBytes(bytes, interfaceId: nil)
+                return
+            }
+            // E8: Apply IFAC before transmitting
+            let transmitData = applyIFAC(raw: bytes, interfaceId: targetId)
+            try await interface.send(transmitData)
+            print("[TRANSPORT] Sent \(transmitData.count) bytes via attached interface '\(targetId)'")
+            return
+        }
+
         var successCount = 0
         var lastError: Error?
 
@@ -821,9 +912,11 @@ public actor ReticulumTransport {
             }
 
             do {
-                try await interface.send(bytes)
+                // E8: Apply IFAC per-interface before transmitting
+                let transmitData = applyIFAC(raw: bytes, interfaceId: id)
+                try await interface.send(transmitData)
                 successCount += 1
-                print("[TRANSPORT] Sent \(bytes.count) bytes via interface '\(id)'")
+                print("[TRANSPORT] Sent \(transmitData.count) bytes via interface '\(id)'")
             } catch {
                 lastError = error
                 print("[TRANSPORT] Failed to send via '\(id)': \(error)")
@@ -898,11 +991,11 @@ public actor ReticulumTransport {
         switch packet.header.transportType {
         case .broadcast:
             // ANNOUNCE packets must ALWAYS be sent as HEADER_1/BROADCAST by the originator.
-            // Only relay/transport nodes convert announces to HEADER_2 when re-broadcasting.
-            // Converting our own announce to HEADER_2 causes the relay to mishandle it.
+            // Only transport nodes convert announces to HEADER_2 when re-broadcasting.
+            // Converting our own announce to HEADER_2 causes the transport node to mishandle it.
             if packet.header.packetType == .announce {
-                print("[SEND_DEBUG] ANNOUNCE: sending as HEADER_1 (never convert announces to HEADER_2)")
-                try await sendToAllInterfaces(packet)
+                print("[SEND_DEBUG] ANNOUNCE: sending as HEADER_1 with per-interface filtering")
+                try await sendAnnounceFiltered(packet)
             } else {
                 // HEADER_1: Check if we need to convert to HEADER_2 for multi-hop routing
                 // This applies to LINKREQUEST and other packets going to remote destinations
@@ -924,25 +1017,69 @@ public actor ReticulumTransport {
                     let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
                     let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
                     print("[SEND_DEBUG] *** CONVERTING to HEADER_2 *** dest=\(destHex), nextHop=\(nextHopHex), hops=\(entry.hopCount)")
-                    try await sendToAllInterfaces(routedPacket)
+                    // M1: Send on specific interface when path is known
+                    let outboundId = entry.interfaceId.isEmpty ? nil : entry.interfaceId
+                    if let outboundId {
+                        try await sendToInterface(routedPacket.encode(), interfaceId: outboundId)
+                    } else {
+                        try await sendToAllInterfaces(routedPacket)
+                    }
                 } else {
                     // Direct delivery (single hop or no path) - send as HEADER_1
-                    // The relay/transport will handle any further routing
                     if let entry = pathEntry {
                         if entry.hopCount > 1 && entry.nextHop == nil {
-                            print("[SEND_DEBUG] WARNING: hopCount=\(entry.hopCount) but nextHop is nil! Sending as HEADER_1 (relay will route)")
+                            print("[SEND_DEBUG] WARNING: hopCount=\(entry.hopCount) but nextHop is nil! Sending as HEADER_1 (transport will route)")
                         } else if entry.hopCount == 1 {
                             print("[SEND_DEBUG] Single hop (hops=1): sending as HEADER_1")
                         }
+                        // M1: Send on specific interface when path is known
+                        let outboundId = entry.interfaceId.isEmpty ? nil : entry.interfaceId
+                        if let outboundId {
+                            print("[SEND_DEBUG] Sending as HEADER_1 via specific interface '\(outboundId)'")
+                            try await sendToInterface(packet.encode(), interfaceId: outboundId)
+                        } else {
+                            print("[SEND_DEBUG] Sending as HEADER_1 (direct broadcast)")
+                            try await sendToAllInterfaces(packet)
+                        }
+                    } else {
+                        // M2: Record outbound hash for broadcast (prevents self-reception on shared medium)
+                        let packetHash = packet.getFullHash()
+                        await packetHashlist.record(packetHash)
+                        print("[SEND_DEBUG] Sending as HEADER_1 (broadcast, no path)")
+                        try await sendToAllInterfaces(packet)
                     }
-                    print("[SEND_DEBUG] Sending as HEADER_1 (direct broadcast)")
-                    try await sendToAllInterfaces(packet)
                 }
             }
 
         case .transport:
             // HEADER_2: Route via path table
             try await sendViaPath(packet)
+        }
+    }
+
+    /// Send a packet and auto-register a receipt for proof-of-delivery.
+    ///
+    /// Matches Python Packet.send() which creates a PacketReceipt for non-PLAIN
+    /// destination types. When a PROOF matching the packet hash arrives, the
+    /// callback is invoked.
+    ///
+    /// - Parameters:
+    ///   - packet: Packet to send
+    ///   - receiptCallback: Callback invoked when delivery proof is received
+    ///   - receiptTimeout: Receipt expiry in seconds (default 300)
+    /// - Throws: TransportError if send fails
+    public func send(
+        packet: Packet,
+        receiptCallback: @escaping @Sendable () async -> Void,
+        receiptTimeout: TimeInterval = 300
+    ) async throws {
+        try await send(packet: packet)
+
+        // Register receipt for proof-based delivery confirmation
+        // Python creates PacketReceipt for all non-PLAIN destinations
+        if packet.header.destinationType != .plain {
+            let packetHash = packet.getTruncatedHash()
+            registerReceipt(hash: packetHash, timeout: receiptTimeout, callback: receiptCallback)
         }
     }
 
@@ -961,22 +1098,38 @@ public actor ReticulumTransport {
             throw TransportError.noInterfacesAvailable
         }
 
+        // M3: Check if the link has an attached interface for targeted send
+        let linkId = packet.destination
+        let attachedId = await activeLinks[linkId]?.attachedInterfaceId
+
         // Look up path using the DESTINATION hash (not the linkId)
+        // M4: Convert to HEADER_2 only when hops > 1 (Python Transport.py:~500)
         if let pathEntry = await pathTable.lookup(destinationHash: destinationHash),
-           pathEntry.hopCount > 0,
+           pathEntry.hopCount > 1,
            let nextHop = pathEntry.nextHop {
             // Convert to HEADER_2 for routed delivery
             let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
             let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-            let linkIdHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+            let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
             let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
             print("[TRANSPORT] Link DATA: converting to HEADER_2, linkId=\(linkIdHex), destHash=\(destHex), nextHop=\(nextHopHex), hops=\(pathEntry.hopCount)")
-            try await sendToAllInterfaces(routedPacket)
+            // M1/M3: Send on specific interface
+            let outboundId = attachedId ?? (pathEntry.interfaceId.isEmpty ? nil : pathEntry.interfaceId)
+            if let outboundId {
+                try await sendToInterface(routedPacket.encode(), interfaceId: outboundId)
+            } else {
+                try await sendToAllInterfaces(routedPacket)
+            }
         } else {
             // Direct delivery (no multi-hop) - send as HEADER_1
-            let linkIdHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+            let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
             print("[TRANSPORT] Link DATA: sending as HEADER_1, linkId=\(linkIdHex)")
-            try await sendToAllInterfaces(packet)
+            // M3: Use attached interface if known
+            if let attachedId {
+                try await sendToInterface(packet.encode(), interfaceId: attachedId)
+            } else {
+                try await sendToAllInterfaces(packet)
+            }
         }
     }
 
@@ -1069,9 +1222,11 @@ public actor ReticulumTransport {
             }
 
             do {
-                try await interface.send(encoded)
+                // E8: Apply IFAC per-interface before transmitting
+                let transmitData = applyIFAC(raw: encoded, interfaceId: id)
+                try await interface.send(transmitData)
                 successCount += 1
-                print("[TRANSPORT] Broadcast sent \(encoded.count) bytes via '\(id)'")
+                print("[TRANSPORT] Broadcast sent \(transmitData.count) bytes via '\(id)'")
                 logger.debug("Broadcast sent via interface: \(id, privacy: .public)")
             } catch {
                 lastError = error
@@ -1092,6 +1247,82 @@ public actor ReticulumTransport {
 
         print("[TRANSPORT] Broadcast complete: \(successCount) interface(s)")
         logger.info("Broadcast packet sent to \(successCount, privacy: .public) interface(s)")
+    }
+
+    /// Send an announce with per-interface mode filtering and bandwidth cap.
+    ///
+    /// Matches Python Transport.outbound() behavior for announces:
+    /// - Per-interface AnnounceFilter based on outgoing mode
+    /// - Per-interface announce bandwidth cap (announce_allowed_at)
+    /// - Queue announces that exceed bandwidth cap
+    ///
+    /// For outbound (originator) announces, sourceMode is nil (we are the source).
+    ///
+    /// - Parameter packet: Announce packet to send
+    /// - Throws: TransportError if all sends fail
+    private func sendAnnounceFiltered(_ packet: Packet) async throws {
+        let encoded = packet.encode()
+        let destHex = packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()
+        let isLocal = isLocalDestination(packet.destination)
+        let now = Date()
+
+        var successCount = 0
+        var lastError: Error?
+
+        for (id, interface) in interfaces {
+            guard interface.state == .connected else { continue }
+
+            // Apply AnnounceFilter: for originator announces, sourceMode is nil
+            guard AnnounceFilter.shouldForward(
+                outgoingMode: interface.config.mode,
+                sourceMode: nil,
+                isLocalDestination: isLocal
+            ) else {
+                print("[SEND_ANNOUNCE] Filtered out announce for \(destHex) on interface '\(id)' (mode=\(interface.config.mode))")
+                continue
+            }
+
+            // Per-interface announce bandwidth cap (C14)
+            if let allowedAt = announceAllowedAt[id], now < allowedAt {
+                // Queue announce for later delivery (E5)
+                var queue = announceQueues[id] ?? []
+                if queue.count < TransportConstants.MAX_QUEUED_ANNOUNCES {
+                    queue.append((time: now, encoded: encoded))
+                    announceQueues[id] = queue
+                    print("[SEND_ANNOUNCE] Bandwidth-capped, queued announce for \(destHex) on '\(id)'")
+                }
+                continue
+            }
+
+            do {
+                // E8: Apply IFAC per-interface before transmitting
+                let transmitData = applyIFAC(raw: encoded, interfaceId: id)
+                try await interface.send(transmitData)
+                successCount += 1
+
+                // Update bandwidth tracking
+                let bitrate = interface.config.bitrate
+                if bitrate > 0 {
+                    let txTime = Double(encoded.count * 8) / Double(bitrate)
+                    let waitTime = txTime / TransportConstants.ANNOUNCE_CAP
+                    announceAllowedAt[id] = now.addingTimeInterval(waitTime)
+                }
+
+                print("[SEND_ANNOUNCE] Sent announce for \(destHex) via '\(id)'")
+            } catch {
+                lastError = error
+                logger.warning("Failed to send announce on \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+
+        if successCount == 0 {
+            if let error = lastError {
+                throw TransportError.sendFailed(interfaceId: "all", underlying: error.localizedDescription)
+            } else {
+                // All interfaces were filtered — not necessarily an error for announces
+                logger.debug("Announce for \(destHex, privacy: .public) filtered on all interfaces")
+            }
+        }
     }
 
     /// Send a packet via path table lookup (routed).
@@ -1157,8 +1388,11 @@ public actor ReticulumTransport {
             throw TransportError.notConnected
         }
 
+        // E8: Apply IFAC before transmitting
+        let transmitData = applyIFAC(raw: data, interfaceId: interfaceId)
+
         do {
-            try await interface.send(data)
+            try await interface.send(transmitData)
         } catch {
             throw TransportError.sendFailed(interfaceId: interfaceId, underlying: error.localizedDescription)
         }
@@ -1182,6 +1416,83 @@ public actor ReticulumTransport {
         let destHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         onDiagnostic?("[RECV] type=\(packet.header.packetType) dest=\(destHex) from=\(interfaceId) len=\(packet.data.count)")
 
+        // C1+C2+C5: packet_filter() equivalent — runs UNCONDITIONALLY (not gated on transportEnabled)
+        // Python reference: Transport.py packet_filter()
+
+        // C5: Transport ID pre-filter: HEADER_2 non-announce packets addressed to a
+        // transport address that isn't ours should be dropped before dedup.
+        if packet.header.headerType == .header2,
+           packet.header.packetType != .announce,
+           let transportAddr = packet.transportAddress,
+           transportAddr != transportIdentityHash {
+            onDiagnostic?("[FILTER] HEADER_2 non-announce not addressed to us, dropping dest=\(destHex)")
+            return
+        }
+
+        // C1: PLAIN/GROUP hop limit filter
+        // Python: drop all plain/group announces; drop non-announce with hops > 0
+        if packet.header.destinationType == .plain || packet.header.destinationType == .group {
+            if packet.header.packetType == .announce {
+                onDiagnostic?("[FILTER] Dropping plain/group announce dest=\(destHex)")
+                return
+            }
+            if packet.header.hopCount > 0 {
+                onDiagnostic?("[FILTER] Dropping plain/group non-announce with hops>0 dest=\(destHex)")
+                return
+            }
+        }
+
+        // C2: Context bypass — skip dedup for these contexts
+        let skipDedup = (
+            packet.context == PacketContext.KEEPALIVE ||
+            packet.context == PacketContext.RESOURCE ||
+            packet.context == PacketContext.RESOURCE_REQ ||
+            packet.context == PacketContext.RESOURCE_PRF ||
+            packet.context == PacketContext.CACHE_REQUEST ||
+            packet.context == PacketContext.CHANNEL
+        )
+
+        // Packet dedup: unconditional (not gated on transportEnabled), announces bypass
+        // Python reference: Transport.py ~line 1230
+        if !skipDedup && packet.header.packetType != .announce {
+            let packetHash = packet.getFullHash()
+            let isNew = await packetHashlist.shouldAccept(packetHash)
+            if !isNew {
+                onDiagnostic?("[DEDUP] Duplicate packet dropped dest=\(destHex)")
+                return
+            }
+
+            // D5: Defer hash recording for link_table packets and LRPROOF.
+            // On shared-medium interfaces, a packet might arrive at a transport node
+            // before it reaches the actual link endpoint. If the hash were recorded
+            // immediately, the endpoint would reject it as duplicate.
+            // Python reference: Transport.py lines 1362-1369
+            let isLinkTablePacket = linkTable[destHash] != nil
+            let isLRProof = (packet.header.packetType == .proof && packet.context == PacketContext.LRPROOF)
+            let deferRecording = isLinkTablePacket || isLRProof
+
+            if !deferRecording {
+                await packetHashlist.record(packetHash)
+            }
+        }
+
+        // E16: Cache radio stats from interface (if available)
+        if let iface = interfaces[interfaceId] {
+            let ph = packet.getFullHash()
+            if let v = iface.radioRssi {
+                radioRssiCache.append((ph, v))
+                if radioRssiCache.count > maxRadioCacheSize { radioRssiCache.removeFirst() }
+            }
+            if let v = iface.radioSnr {
+                radioSnrCache.append((ph, v))
+                if radioSnrCache.count > maxRadioCacheSize { radioSnrCache.removeFirst() }
+            }
+            if let v = iface.radioQuality {
+                radioQualityCache.append((ph, v))
+                if radioQualityCache.count > maxRadioCacheSize { radioQualityCache.removeFirst() }
+            }
+        }
+
         // Route based on packet type
         switch packet.header.packetType {
         case .announce:
@@ -1198,49 +1509,73 @@ public actor ReticulumTransport {
             await handleLinkRequest(packet, from: interfaceId)
 
         case .proof:
-            // PROOF could be for announce OR for link
-            // If destination is a link ID, route to link
+            // C9+C10: Restructured proof dispatch matching Python priority order.
+            // Python checks: link_table → pending_links → active_links → reverse_table → local callbacks
             let proofDestHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             let proofFullHex = destHash.map { String(format: "%02x", $0) }.joined()
-            let pendingKeysHex = pendingLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
-            let activeKeysHex = activeLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
             print("[PROOF_RECV] ===== PROOF PACKET RECEIVED =====")
             print("[PROOF_RECV] dest=\(proofDestHex), full=\(proofFullHex)")
-            print("[PROOF_RECV] pendingLinks count=\(pendingLinks.count), keys=\(pendingKeysHex)")
-            print("[PROOF_RECV] activeLinks count=\(activeLinks.count), keys=\(activeKeysHex)")
             print("[PROOF_RECV] context=0x\(String(format: "%02x", packet.context)), dataLen=\(packet.data.count)")
             logger.error("[RECV] PROOF dest=\(proofDestHex), ctx=0x\(String(format: "%02x", packet.context)), dataLen=\(packet.data.count)")
 
-            if let link = pendingLinks[destHash] {
+            // C9: Transport link proof forwarding — check linkTable FIRST (before pendingLinks)
+            // This matches Python priority: transport forwarding takes precedence over local delivery
+            if transportEnabled, let linkEntry = linkTable[destHash] {
+                if packet.context == PacketContext.LRPROOF {
+                    // E1: LRPROOF uses validated forwarding (signature check)
+                    print("[PROOF_RECV] Forward LRPROOF for link=\(proofDestHex)")
+                    await forwardLinkProof(packet, linkEntry: linkEntry, from: interfaceId)
+                } else {
+                    // E1: Non-LRPROOF proofs use simple bidirectional forwarding (no signature validation)
+                    print("[PROOF_RECV] Forward non-LRPROOF for link=\(proofDestHex)")
+                    await forwardLinkData(packet, linkEntry: linkEntry, from: interfaceId)
+                }
+            } else if let link = pendingLinks[destHash] {
                 print("[PROOF_RECV] MATCH! Found pending link for PROOF, processing...")
-                await handleLinkProof(packet, link: link)
+                await handleLinkProof(packet, link: link, from: interfaceId)
             } else if let link = activeLinks[destHash] {
                 // PROOF on active link: could be data proof or resource proof
                 if packet.context == ResourcePacketContext.resourceProof {
-                    // Resource proof (RESOURCE_PRF) - route to link's resource handler
-                    // PROOF packets over links are NOT encrypted (Python Packet.pack():
-                    // "Packet proofs over links are not encrypted" → ciphertext = data)
                     print("[PROOF_RECV] RESOURCE proof on active link \(proofDestHex), data=\(packet.data.count) bytes")
                     await link.handleResourcePacket(context: packet.context, data: packet.data)
                 } else {
-                    // DATA packet proof (e.g., propagation node confirming delivery)
                     print("[PROOF_RECV] DATA proof on active link \(proofDestHex)")
                     await handleDataProof(packet, link: link)
                 }
-            } else if let entry = pendingProofCallbacks.removeValue(forKey: destHash) {
-                // Delivery proof for a sent packet (e.g., LXMF opportunistic)
-                print("[PROOF_RECV] Matched delivery proof callback for \(proofDestHex)")
-                logger.error("[PROOF] DELIVERY proof matched for \(proofDestHex, privacy: .public), invoking callback")
-                Task {
-                    await entry.callback()
-                }
             } else {
-                // Announce PROOF or path request response - existing handling
-                let cbCount = pendingProofCallbacks.count
-                let cbKeys = pendingProofCallbacks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
-                print("[PROOF_RECV] No match for \(proofDestHex), pendingCallbacks=\(cbCount), keys=\(cbKeys)")
-                logger.error("[PROOF] UNMATCHED proof dest=\(proofDestHex, privacy: .public), pendingCBs=\(cbCount, privacy: .public), keys=\(cbKeys, privacy: .public)")
-                await handleAnnounceProof(packet, from: interfaceId)
+                // C10: Sequential proof routing — forward via reverse table AND check local callbacks
+                // (not exclusive: both can apply)
+                var handled = false
+
+                // Forward via reverse table (C11: works even without transportEnabled)
+                if let reverseEntry = reverseTable.removeValue(forKey: destHash) {
+                    print("[PROOF_RECV] Forward DATA PROOF for \(proofDestHex)")
+                    await forwardDataProof(packet, reverseEntry: reverseEntry, from: interfaceId)
+                    handled = true
+                }
+
+                // ALSO check local proof callbacks (not exclusive with reverse table)
+                if let entry = pendingProofCallbacks.removeValue(forKey: destHash) {
+                    print("[PROOF_RECV] Matched delivery proof callback for \(proofDestHex)")
+                    logger.error("[PROOF] DELIVERY proof matched for \(proofDestHex, privacy: .public), invoking callback")
+                    Task { await entry.callback() }
+                    handled = true
+                }
+
+                // E13: Check receipts
+                if !handled {
+                    if let idx = receipts.firstIndex(where: { $0.hash == destHash }) {
+                        let receipt = receipts.remove(at: idx)
+                        Task { await receipt.callback() }
+                        handled = true
+                    }
+                }
+
+                if !handled {
+                    let cbCount = pendingProofCallbacks.count
+                    print("[PROOF_RECV] No match for \(proofDestHex), pendingCallbacks=\(cbCount)")
+                    await handleAnnounceProof(packet, from: interfaceId)
+                }
             }
 
             // Clean up expired proof callbacks (older than 5 minutes)
@@ -1248,6 +1583,12 @@ public actor ReticulumTransport {
             pendingProofCallbacks = pendingProofCallbacks.filter { now.timeIntervalSince($0.value.registeredAt) < 300 }
 
         case .data:
+            // C24: CACHE_REQUEST stub — log and drop (no cache infrastructure on iOS)
+            if packet.context == PacketContext.CACHE_REQUEST {
+                onDiagnostic?("[RECV] CACHE_REQUEST received, dropping (not supported)")
+                return
+            }
+
             lastReceivedInterfaceId = interfaceId  // Track for path request handler
             let dataDestHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             let dataFullHex = destHash.map { String(format: "%02x", $0) }.joined()
@@ -1261,7 +1602,7 @@ public actor ReticulumTransport {
                 transportDebugLog("  LINK DATA: hasActiveLink=\(hasLink) activeLinks=\(activeKeysHex) isResource=\(ResourcePacketContext.isResourceContext(packet.context))")
                 print("[LXMF_INBOUND] Routing to handleLinkData()")
                 logger.error("[RECV] Routing to handleLinkData()")
-                await handleLinkData(packet)
+                await handleLinkData(packet, from: interfaceId)
             } else {
                 // Regular data - deliver to local destination
                 print("[LXMF_INBOUND] Routing to handleRegularData()")
@@ -1282,7 +1623,12 @@ public actor ReticulumTransport {
 
         // Check if we have this destination registered
         guard let destination = destinations[packet.destination] else {
-            onDiagnostic?("[LINKREQUEST] dest \(hexPrefix) NOT registered, ignoring")
+            // Not a local destination — try forwarding if transport is enabled
+            if transportEnabled {
+                await forwardLinkRequest(packet, from: interfaceId)
+            } else {
+                onDiagnostic?("[LINKREQUEST] dest \(hexPrefix) NOT registered, ignoring")
+            }
             return
         }
         onDiagnostic?("[LINKREQUEST] dest \(hexPrefix) found, processing")
@@ -1317,10 +1663,11 @@ public actor ReticulumTransport {
             identity: identity
         )
 
-        // Set up send callback for the link
-        await link.setSendCallback { [weak self] (data: Data) async throws -> Void in
+        // Set up send callback for the link - routes via attached interface when known
+        await link.setSendCallback { [weak self, weak link] (data: Data) async throws -> Void in
             guard let self = self else { return }
-            try await self.sendRawBytes(data)
+            let ifaceId = await link?.attachedInterfaceId
+            try await self.sendRawBytes(data, interfaceId: ifaceId)
         }
 
         // Configure link with destination callbacks IMMEDIATELY (before LRRTT).
@@ -1378,6 +1725,8 @@ public actor ReticulumTransport {
 
             // Store link as pending (waiting for LRRTT to complete establishment)
             activeLinks[incomingRequest.linkId] = link
+            // H2: Track which interface the link was established on
+            await link.setAttachedInterface(interfaceId)
             print("[LINK_RESPONDER] Link \(linkIdHex) stored in activeLinks, awaiting LRRTT")
 
             logger.info("LINKREQUEST accepted for \(hexPrefix, privacy: .public)..., PROOF sent, awaiting LRRTT")
@@ -1400,12 +1749,19 @@ public actor ReticulumTransport {
     /// - Parameters:
     ///   - packet: PROOF packet
     ///   - link: The pending link that this proof is for
-    private func handleLinkProof(_ packet: Packet, link: Link) async {
+    ///   - interfaceId: ID of interface that received the PROOF (H2)
+    private func handleLinkProof(_ packet: Packet, link: Link, from interfaceId: String) async {
         let proofDestHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
         print("[PROOF_PROC] Processing PROOF for dest=\(proofDestHex)")
         print("[PROOF_PROC] PROOF data length: \(packet.data.count) bytes")
         let proofDataHex = packet.data.prefix(20).map { String(format: "%02x", $0) }.joined()
         print("[PROOF_PROC] PROOF data: \(proofDataHex)...")
+
+        // C12: LRPROOF hop count check on local delivery
+        // Python checks post-incremented hops against expected_hops from path table.
+        // We don't currently track expected_hops on Link, so this is a no-op when
+        // expectedHops defaults to PATHFINDER_M (always accepted). Implement when
+        // Link gains an expectedHops property.
 
         do {
             print("[PROOF_PROC] Calling link.processProof...")
@@ -1416,6 +1772,16 @@ public actor ReticulumTransport {
             let linkId = await link.linkId
             pendingLinks.removeValue(forKey: linkId)
             activeLinks[linkId] = link
+
+            // H2: Track which interface the link was established on
+            await link.setAttachedInterface(interfaceId)
+
+            // M10: Mark path as responsive after successful link establishment
+            let destHash = await link.destinationHash
+            await pathTable.markPathResponsive(destHash)
+
+            // L5: Record LRPROOF hash to prevent re-processing on shared-medium interfaces
+            await packetHashlist.record(packet.getFullHash())
 
             let hexPrefix = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
             print("[PROOF_PROC] Link \(hexPrefix) moved to activeLinks, total=\(activeLinks.count)")
@@ -1454,16 +1820,27 @@ public actor ReticulumTransport {
     /// 4. Otherwise treat as LXMF user data
     ///
     /// - Parameter packet: Link DATA packet
-    private func handleLinkData(_ packet: Packet) async {
+    private func handleLinkData(_ packet: Packet, from interfaceId: String) async {
         let linkHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
         let activeKeysList = activeLinks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
         print("[LINK_DATA] handleLinkData called for dest=\(linkHex), context=0x\(String(format: "%02x", packet.context)), activeLinks=\(activeKeysList)")
         logger.error("[LINK_DATA] dest=\(linkHex), ctx=0x\(String(format: "%02x", packet.context)), activeLinks=\(activeKeysList), dataLen=\(packet.data.count)")
 
         guard let link = activeLinks[packet.destination] else {
-            // Unknown link - ignore
-            print("[LINK_DATA] No active link found for \(linkHex), ignoring packet")
-            logger.error("[LINK_DATA] No active link for \(linkHex)")
+            // Not a local link — try forwarding if transport is enabled
+            if transportEnabled, let linkEntry = linkTable[packet.destination] {
+                await forwardLinkData(packet, linkEntry: linkEntry, from: interfaceId)
+            } else {
+                print("[LINK_DATA] No active link found for \(linkHex), ignoring packet")
+                logger.error("[LINK_DATA] No active link for \(linkHex)")
+            }
+            return
+        }
+
+        // H2: Validate that link DATA arrives on the same interface it was established on
+        let attachedId = await link.attachedInterfaceId
+        if let attachedId, attachedId != interfaceId {
+            print("[LINK_DATA] Dropping packet for \(linkHex): wrong interface (expected=\(attachedId), got=\(interfaceId))")
             return
         }
 
@@ -1736,9 +2113,16 @@ public actor ReticulumTransport {
 
         // Check if destination is local
         guard let destination = destinations[destHash] else {
-            // Destination not local - could forward in gateway mode
-            print("[LXMF_INBOUND] Destination \(hexPrefix) NOT registered locally, dropping packet")
-            logger.debug("Received packet for non-local destination \(hexPrefix, privacy: .public)...")
+            // Not local — try forwarding if transport is enabled and this is a HEADER_2 addressed to us
+            if transportEnabled,
+               packet.header.headerType == .header2,
+               let transportAddr = packet.transportAddress,
+               transportAddr == transportIdentityHash {
+                await forwardDataPacket(packet, from: interfaceId)
+            } else {
+                print("[LXMF_INBOUND] Destination \(hexPrefix) NOT registered locally, dropping packet")
+                logger.debug("Received packet for non-local destination \(hexPrefix, privacy: .public)...")
+            }
             return
         }
 
@@ -1865,22 +2249,28 @@ public actor ReticulumTransport {
     ///   - packet: Announce packet to process
     ///   - interfaceId: ID of interface that received the announce
     private func processAnnounce(packet: Packet, from interfaceId: String) async {
+        // L6: Apply ingress storm detection only for unknown destinations
+        // Known destinations are legitimate updates and should not be rate-limited
+        let hasPath = await pathTable.hasPath(for: packet.destination)
+        if !hasPath {
+            recordAnnounceIngress(interfaceId: interfaceId)
+            if shouldIngressLimit(interfaceId: interfaceId) {
+                onDiagnostic?("[ANNOUNCE] Ingress limit reached for interface \(interfaceId)")
+                return
+            }
+        }
+
+        // C3: Drop announces for our own destinations to prevent path table corruption
+        // Python reference: Transport.py received_announce() checks destination in local_client_interfaces
+        if isLocalDestination(packet.destination) {
+            onDiagnostic?("[ANNOUNCE] Ignoring announce for own destination")
+            return
+        }
+
         // Get interface mode
         let mode = getInterfaceMode(for: interfaceId)
 
-        // Local rebroadcast detection (Transport.py:1581-1597)
-        // For HEADER_2 announces, check if this is our own rebroadcast heard back
-        if packet.header.headerType == .header2, packet.transportAddress != nil {
-            let destHash = packet.destination
-            let detected = await announceTable.recordLocalRebroadcast(
-                destinationHash: destHash,
-                incomingHops: packet.header.hopCount
-            )
-            if detected {
-                let hexPrefix = destHash.prefix(4).map { String(format: "%02x", $0) }.joined()
-                logger.debug("Local rebroadcast detected for \(hexPrefix, privacy: .public)...")
-            }
-        }
+        // L2: Rebroadcast detection moved to after validation (inside .recordedAndRebroadcast case)
 
         // Process via announce handler
         let result = await announceHandler.process(
@@ -1896,6 +2286,34 @@ public actor ReticulumTransport {
             logger.debug("Announce ignored (\(String(describing: reason), privacy: .public)) for \(hexPrefix, privacy: .public)...")
 
         case .recorded(let destHash):
+            // C17: Check pending discovery path requests on announce arrival
+            if transportEnabled, let prEntry = discoveryPathRequests.removeValue(forKey: destHash) {
+                if let prInterfaceId = prEntry.requestingInterfaceId {
+                    let transportId = transportIdentityHash ?? Data(repeating: 0, count: 16)
+                    let pathResponsePacket = Packet(
+                        header: PacketHeader(
+                            headerType: .header2,
+                            hasContext: packet.header.hasContext,
+                            hasIFAC: false,
+                            transportType: .transport,
+                            destinationType: packet.header.destinationType,
+                            packetType: .announce,
+                            hopCount: packet.header.hopCount
+                        ),
+                        destination: packet.destination,
+                        transportAddress: transportId,
+                        context: PacketContext.PATH_RESPONSE,
+                        data: packet.data
+                    )
+                    let encoded = pathResponsePacket.encode()
+                    do {
+                        try await sendToInterface(encoded, interfaceId: prInterfaceId)
+                        onDiagnostic?("[TRANSPORT] Sent PATH_RESPONSE for \(destHash.prefix(4).map { String(format: "%02x", $0) }.joined()) to \(prInterfaceId)")
+                    } catch {
+                        onDiagnostic?("[TRANSPORT] Failed to send PATH_RESPONSE: \(error)")
+                    }
+                }
+            }
             let hexPrefix = destHash.prefix(4).map { String(format: "%02x", $0) }.joined()
             logger.info("Path recorded for destination \(hexPrefix, privacy: .public)...")
             await processPendingPackets(for: destHash)
@@ -1904,11 +2322,54 @@ public actor ReticulumTransport {
             let hexPrefix = destHash.prefix(4).map { String(format: "%02x", $0) }.joined()
             let isLocal = isLocalDestination(destHash)
 
+            // L2: Local rebroadcast detection (moved here, after validation)
+            // For HEADER_2 announces, check if this is our own rebroadcast heard back
+            if packet.header.headerType == .header2, packet.transportAddress != nil {
+                let detected = await announceTable.recordLocalRebroadcast(
+                    destinationHash: destHash,
+                    incomingHops: packet.header.hopCount
+                )
+                if detected {
+                    logger.debug("Local rebroadcast detected for \(hexPrefix, privacy: .public)...")
+                }
+            }
+
+            // C17: Check pending discovery path requests on announce arrival
+            if transportEnabled, let prEntry = discoveryPathRequests.removeValue(forKey: destHash) {
+                if let prInterfaceId = prEntry.requestingInterfaceId {
+                    let transportId = transportIdentityHash ?? Data(repeating: 0, count: 16)
+                    let pathResponsePacket = Packet(
+                        header: PacketHeader(
+                            headerType: .header2,
+                            hasContext: rebroadcastPacket.header.hasContext,
+                            hasIFAC: false,
+                            transportType: .transport,
+                            destinationType: rebroadcastPacket.header.destinationType,
+                            packetType: .announce,
+                            hopCount: rebroadcastPacket.header.hopCount
+                        ),
+                        destination: rebroadcastPacket.destination,
+                        transportAddress: transportId,
+                        context: PacketContext.PATH_RESPONSE,
+                        data: rebroadcastPacket.data
+                    )
+                    let encoded = pathResponsePacket.encode()
+                    do {
+                        try await sendToInterface(encoded, interfaceId: prInterfaceId)
+                        onDiagnostic?("[TRANSPORT] Sent PATH_RESPONSE for \(hexPrefix) to \(prInterfaceId)")
+                    } catch {
+                        onDiagnostic?("[TRANSPORT] Failed to send PATH_RESPONSE: \(error)")
+                    }
+                }
+            }
+
             // Transport.py:1741: Only rebroadcast if transport_enabled or local destination
             if transportEnabled || isLocal {
+                // C18: PATH_RESPONSE bypasses rate limiting (Python Transport.py)
                 // Rate limiting check (Transport.py:1691-1720)
                 let sourceInterface = interfaces[interfaceId]
-                if let rateTarget = sourceInterface?.config.announceRateTarget {
+                if packet.context != PacketContext.PATH_RESPONSE,
+                   let rateTarget = sourceInterface?.config.announceRateTarget {
                     let blocked = await announceTable.isRateBlocked(
                         destinationHash: destHash,
                         rateTarget: rateTarget,
@@ -1922,21 +2383,61 @@ public actor ReticulumTransport {
                     }
                 }
 
-                // Queue for retransmission via AnnounceTable instead of immediate send
+                // M5: PATH_RESPONSE bypasses announce table — send immediately
+                if packet.context == PacketContext.PATH_RESPONSE {
+                    let transportId = transportIdentityHash ?? Data(repeating: 0, count: 16)
+                    let prHeader = PacketHeader(
+                        headerType: .header2,
+                        hasContext: rebroadcastPacket.header.hasContext,
+                        hasIFAC: false,
+                        transportType: .transport,
+                        destinationType: rebroadcastPacket.header.destinationType,
+                        packetType: .announce,
+                        hopCount: rebroadcastPacket.header.hopCount
+                    )
+                    let prPacket = Packet(
+                        header: prHeader,
+                        destination: rebroadcastPacket.destination,
+                        transportAddress: transportId,
+                        context: PacketContext.PATH_RESPONSE,
+                        data: rebroadcastPacket.data
+                    )
+                    try? await sendToAllInterfaces(prPacket)
+                    logger.info("PATH_RESPONSE for \(hexPrefix, privacy: .public)... sent immediately")
+                } else {
+                    // Queue for retransmission via AnnounceTable
+                    let receivedFrom: Data
+                    if let transportId = rebroadcastPacket.transportAddress {
+                        receivedFrom = transportId
+                    } else {
+                        receivedFrom = destHash
+                    }
+
+                    await announceTable.insert(
+                        destinationHash: destHash,
+                        packet: rebroadcastPacket,
+                        hops: rebroadcastPacket.header.hopCount,
+                        receivedFrom: receivedFrom,
+                        receivingInterfaceId: interfaceId
+                    )
+                    logger.info("Announce for \(hexPrefix, privacy: .public)... queued for retransmission")
+                }
+            } else if let _ = pendingLocalPathRequests.removeValue(forKey: destHash) {
+                // E12: Retransmit for pending local path request
                 let receivedFrom: Data
                 if let transportId = rebroadcastPacket.transportAddress {
                     receivedFrom = transportId
                 } else {
                     receivedFrom = destHash
                 }
-
                 await announceTable.insert(
                     destinationHash: destHash,
                     packet: rebroadcastPacket,
                     hops: rebroadcastPacket.header.hopCount,
-                    receivedFrom: receivedFrom
+                    receivedFrom: receivedFrom,
+                    isLocalClient: true,
+                    receivingInterfaceId: interfaceId
                 )
-                logger.info("Announce for \(hexPrefix, privacy: .public)... queued for retransmission")
             } else {
                 logger.debug("Transport disabled, not rebroadcasting \(hexPrefix, privacy: .public)...")
             }
@@ -1981,16 +2482,34 @@ public actor ReticulumTransport {
             let encoded = retransmitPacket.encode()
             let destHex = action.destinationHash.prefix(4).map { String(format: "%02x", $0) }.joined()
 
-            // Determine source interface mode for filtering
-            // Use the interface the announce was originally received on
-            let sourceMode: InterfaceMode? = nil // Source mode not tracked in current entry
+            // C13: Determine source interface mode from the receiving interface
+            let sourceMode: InterfaceMode?
+            if let recvIfId = action.receivingInterfaceId {
+                sourceMode = getInterfaceMode(for: recvIfId)
+            } else {
+                sourceMode = nil
+            }
 
             for (id, interface) in interfaces {
                 // Skip disconnected interfaces
                 guard interface.state == .connected else { continue }
 
+                // C13: Skip the interface the announce was received from (Python behavior)
+                if let recvIfId = action.receivingInterfaceId, id == recvIfId { continue }
+
                 // Skip specific interface override
                 if let attachedId = action.attachedInterfaceId, id != attachedId { continue }
+
+                // C14: Per-interface announce bandwidth cap
+                if let allowedAt = announceAllowedAt[id], Date() < allowedAt {
+                    // E5: Queue announce for later delivery instead of dropping
+                    var queue = announceQueues[id] ?? []
+                    if queue.count < TransportConstants.MAX_QUEUED_ANNOUNCES {
+                        queue.append((time: Date(), encoded: encoded))
+                        announceQueues[id] = queue
+                    }
+                    continue
+                }
 
                 // Apply AnnounceFilter per-outgoing-interface
                 let outgoingMode = interface.config.mode
@@ -2004,17 +2523,107 @@ public actor ReticulumTransport {
                 }
 
                 do {
-                    try await interface.send(encoded)
+                    // E8: Apply IFAC per-interface before transmitting
+                    let transmitData = applyIFAC(raw: encoded, interfaceId: id)
+                    try await interface.send(transmitData)
+
+                    // C14: Update announce bandwidth tracking
+                    let bitrate = interface.config.bitrate
+                    if bitrate > 0 {
+                        let txTime = Double(encoded.count * 8) / Double(bitrate)
+                        let waitTime = txTime / TransportConstants.ANNOUNCE_CAP
+                        announceAllowedAt[id] = Date().addingTimeInterval(waitTime)
+                    }
+
                     logger.debug("Retransmitted announce for \(destHex, privacy: .public)... via \(id, privacy: .public)")
                 } catch {
                     logger.warning("Failed to retransmit announce to \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
             }
         }
+
+        // E3: Reinsert held announces after retransmission cycle
+        for (destHash, heldPacket) in heldAnnounces {
+            await announceTable.insert(
+                destinationHash: destHash,
+                packet: heldPacket,
+                hops: heldPacket.header.hopCount,
+                receivedFrom: destHash,
+                blockRebroadcasts: true
+            )
+        }
+        heldAnnounces.removeAll()
+
+        // E5: Process announce queues (one per interface per cycle)
+        let now = Date()
+        for (id, _) in interfaces {
+            guard var queue = announceQueues[id], !queue.isEmpty else { continue }
+            guard interfaces[id]?.state == .connected else { continue }
+            // Remove expired
+            queue.removeAll { now.timeIntervalSince($0.time) > TransportConstants.QUEUED_ANNOUNCE_LIFE }
+            // Check bandwidth cap
+            if let allowedAt = announceAllowedAt[id], now < allowedAt {
+                announceQueues[id] = queue
+                continue
+            }
+            // Send first queued
+            if let entry = queue.first {
+                queue.removeFirst()
+                do {
+                    try await interfaces[id]?.send(entry.encoded)
+                    let bitrate = interfaces[id]?.config.bitrate ?? 0
+                    if bitrate > 0 {
+                        let txTime = Double(entry.encoded.count * 8) / Double(bitrate)
+                        announceAllowedAt[id] = now.addingTimeInterval(txTime / TransportConstants.ANNOUNCE_CAP)
+                    }
+                } catch {
+                    logger.warning("Failed to send queued announce via \(id, privacy: .public)")
+                }
+            }
+            announceQueues[id] = queue.isEmpty ? nil : queue
+        }
     }
 
-    /// Clean up expired discovery path requests.
+    /// H3: Clean up closed links from pendingLinks and activeLinks dictionaries.
+    /// Prevents unbounded memory growth from accumulated dead links.
+    private func cleanupLinks() async {
+        for (linkId, link) in pendingLinks {
+            let linkState = await link.state
+            if linkState.isTerminal {
+                pendingLinks.removeValue(forKey: linkId)
+                // Non-transport: expire path for rediscovery (Python Transport.py:699)
+                if !transportEnabled {
+                    let destHash = await link.destinationHash
+                    await pathTable.expirePath(destinationHash: destHash)
+                }
+            }
+        }
+        for (linkId, link) in activeLinks {
+            let linkState = await link.state
+            if linkState.isTerminal {
+                activeLinks.removeValue(forKey: linkId)
+            }
+        }
+    }
+
+    /// Throttle counter for periodic cleanup in retransmission loop (H4/H3).
+    private var tableCullCounter: Int = 0
+
+    /// H3/H4: Periodic cleanup of links and paths, throttled to every ~5 seconds.
+    private func periodicTableCleanup() async {
+        tableCullCounter += 1
+        guard tableCullCounter % 5 == 0 else { return }
+        let activeIds = Set(interfaces.keys)
+        await pathTable.cleanup(activeInterfaceIds: activeIds)
+        await cleanupLinks()
+    }
+
+    /// Clean up expired discovery path requests and periodic maintenance.
     private func cleanupDiscoveryPathRequests() {
+        // E12: Cull pending local path requests for removed interfaces
+        pendingLocalPathRequests = pendingLocalPathRequests.filter { interfaces[$0.value] != nil || $0.value.isEmpty }
+        // E13: Cull expired receipts
+        receipts.removeAll { Date() > $0.timeout }
         let now = Date()
         discoveryPathRequests = discoveryPathRequests.filter { $0.value.timeout > now }
     }
@@ -2030,6 +2639,8 @@ public actor ReticulumTransport {
                 guard let self = self else { break }
                 await self.processAnnounceRetransmissions()
                 await self.cleanupDiscoveryPathRequests()
+                await self.cullTransportTables()
+                await self.periodicTableCleanup()
             }
         }
     }
@@ -2040,15 +2651,215 @@ public actor ReticulumTransport {
         retransmissionTask = nil
     }
 
+    /// Enable or disable transport mode at runtime.
+    ///
+    /// When enabled, this node rebroadcasts announces and forwards path requests
+    /// for other devices on the network.
+    ///
+    /// - Parameters:
+    ///   - enabled: Whether transport mode should be active.
+    ///   - identity: Identity whose hash is used as transport_id in HEADER_2 packets.
+    ///               Required when enabling; ignored when disabling.
+    public func setTransportEnabled(_ enabled: Bool, identity: Identity? = nil) {
+        transportEnabled = enabled
+        if enabled {
+            transportIdentityHash = identity?.hash
+            startRetransmissionLoop()
+            Task { await packetHashlist.load() }
+        } else {
+            transportIdentityHash = nil
+            stopRetransmissionLoop()
+            Task { await packetHashlist.save() }
+            linkTable.removeAll()
+            reverseTable.removeAll()
+        }
+    }
+
     /// Get the interface mode for a given interface ID.
     ///
     /// - Parameter interfaceId: Interface ID
     /// - Returns: Interface mode, defaults to .full if interface not found
-    private func getInterfaceMode(for interfaceId: String) -> InterfaceMode {
+    func getInterfaceMode(for interfaceId: String) -> InterfaceMode {
         guard let interface = interfaces[interfaceId] else {
             return .full // Default to full mode
         }
         return interface.config.mode
+    }
+
+    // MARK: - E8: IFAC Validation
+
+    /// E8: Validate IFAC on raw wire bytes.
+    ///
+    /// Matches Python Transport.py inbound() IFAC validation:
+    /// 1. If interface has no IFAC, reject packets with IFAC flag set
+    /// 2. If interface has IFAC, require IFAC flag set
+    /// 3. Extract IFAC, generate HKDF mask, unmask packet
+    /// 4. Reconstruct original packet (strip IFAC, clear flag)
+    /// 5. Re-sign and verify IFAC matches
+    ///
+    /// - Parameters:
+    ///   - raw: Raw wire bytes
+    ///   - interfaceId: ID of the receiving interface
+    /// - Returns: Validated packet data (IFAC stripped), or nil if validation failed
+    public func validateIFAC(raw: Data, interfaceId: String) -> Data? {
+        guard let interface = interfaces[interfaceId] else { return raw }
+        let config = interface.config
+
+        guard let ifacKey = config.ifacKey, config.ifacSize > 0 else {
+            // No IFAC on this interface — reject if packet has IFAC flag set
+            if raw.count >= 1, raw[0] & 0x80 == 0x80 { return nil }
+            return raw
+        }
+
+        guard let signingSeed = ifacSigningSeeds[interfaceId] else {
+            // No cached signing seed — shouldn't happen if addInterface worked
+            logger.error("IFAC signing seed not cached for \(interfaceId, privacy: .public)")
+            return nil
+        }
+
+        let ifacSize = config.ifacSize
+
+        // Require IFAC flag set
+        guard raw.count >= 1, raw[0] & 0x80 == 0x80 else {
+            // Interface requires IFAC but packet doesn't have it — drop
+            return nil
+        }
+
+        // Ensure packet is long enough: 2 header + ifacSize + at least 1 byte payload
+        guard raw.count > 2 + ifacSize else { return nil }
+
+        // Extract IFAC (not masked, readable directly)
+        let ifac = raw[2 ..< 2 + ifacSize]
+
+        // Generate mask: HKDF(derive_from=ifac, salt=ifac_key, length=raw.count)
+        let mask = KeyDerivation.deriveKey(
+            length: raw.count,
+            inputKeyMaterial: Data(ifac),
+            salt: ifacKey
+        )
+
+        // Unmask: XOR bytes 0-1 and bytes after 2+ifacSize; leave IFAC untouched
+        var unmasked = Data(count: raw.count)
+        for i in 0 ..< raw.count {
+            if i <= 1 || i > ifacSize + 1 {
+                // Unmask header and payload
+                unmasked[i] = raw[i] ^ mask[i]
+            } else {
+                // Don't unmask the IFAC itself
+                unmasked[i] = raw[i]
+            }
+        }
+
+        // Clear IFAC flag and reconstruct original packet (strip IFAC)
+        let newHeader = Data([unmasked[0] & 0x7F, unmasked[1]])
+        let newRaw = newHeader + unmasked[(2 + ifacSize)...]
+
+        // Compute expected IFAC using deterministic Ed25519: sign(original_packet)[-ifacSize:]
+        guard let signature = Ed25519Pure.sign(message: newRaw, seed: signingSeed) else {
+            logger.error("Ed25519Pure sign failed on \(interfaceId, privacy: .public)")
+            return nil
+        }
+        let expectedIfac = signature.suffix(ifacSize)
+
+        guard Data(ifac) == expectedIfac else {
+            logger.debug("IFAC validation failed on \(interfaceId, privacy: .public)")
+            return nil
+        }
+
+        return newRaw
+    }
+
+    /// E8: Apply IFAC to outbound packet bytes.
+    ///
+    /// Matches Python Transport.transmit() IFAC application:
+    /// 1. Sign the raw packet, take last ifacSize bytes as IFAC
+    /// 2. Generate HKDF mask from IFAC
+    /// 3. Set IFAC flag, insert IFAC between header and payload
+    /// 4. Mask everything except the IFAC itself
+    ///
+    /// - Parameters:
+    ///   - raw: Raw packet bytes to transmit
+    ///   - interfaceId: ID of the outgoing interface
+    /// - Returns: IFAC-protected bytes, or original bytes if no IFAC configured
+    public func applyIFAC(raw: Data, interfaceId: String) -> Data {
+        guard let config = interfaces[interfaceId]?.config,
+              let ifacKey = config.ifacKey,
+              config.ifacSize > 0,
+              let signingSeed = ifacSigningSeeds[interfaceId] else {
+            return raw
+        }
+
+        let ifacSize = config.ifacSize
+
+        // Sign the original packet with deterministic Ed25519, take last ifacSize bytes
+        guard let signature = Ed25519Pure.sign(message: raw, seed: signingSeed) else { return raw }
+        let ifac = signature.suffix(ifacSize)
+
+        // Generate mask: HKDF(derive_from=ifac, salt=ifac_key, length=raw.count+ifacSize)
+        let mask = KeyDerivation.deriveKey(
+            length: raw.count + ifacSize,
+            inputKeyMaterial: Data(ifac),
+            salt: ifacKey
+        )
+
+        // Set IFAC flag and assemble: header(2) + ifac + payload
+        let newHeader = Data([raw[0] | 0x80, raw[1]])
+        let newRaw = newHeader + ifac + raw[2...]
+
+        // Mask: XOR everything except the IFAC bytes
+        var masked = Data(count: newRaw.count)
+        for i in 0 ..< newRaw.count {
+            if i == 0 {
+                // Mask first byte, but force IFAC flag on
+                masked[i] = (newRaw[i] ^ mask[i]) | 0x80
+            } else if i == 1 || i > ifacSize + 1 {
+                // Mask second header byte and payload
+                masked[i] = newRaw[i] ^ mask[i]
+            } else {
+                // Don't mask the IFAC itself
+                masked[i] = newRaw[i]
+            }
+        }
+
+        return masked
+    }
+
+    /// Backward-compatible IFAC validation using InterfaceConfig directly.
+    /// Delegates to the interfaceId-based method by looking up the interface.
+    public func validateIFAC(raw: Data, interfaceConfig: InterfaceConfig) -> Data? {
+        return validateIFAC(raw: raw, interfaceId: interfaceConfig.id)
+    }
+
+    // MARK: - E11: Announce Ingress Tracking
+
+    /// E11: Check if announce ingress rate exceeds threshold (storm detection).
+    private func shouldIngressLimit(interfaceId: String) -> Bool {
+        guard let ts = announceIngressTimestamps[interfaceId], ts.count >= ingressDequeSize else { return false }
+        return ts.last!.timeIntervalSince(ts.first!) < 1.0  // 6 announces in <1s = storm
+    }
+
+    /// E11: Record an announce ingress event.
+    private func recordAnnounceIngress(interfaceId: String) {
+        var ts = announceIngressTimestamps[interfaceId] ?? []
+        ts.append(Date())
+        while ts.count > ingressDequeSize { ts.removeFirst() }
+        announceIngressTimestamps[interfaceId] = ts
+    }
+
+    // MARK: - E13: Receipt Registration
+
+    /// E13: Register a receipt for proof-based delivery confirmation.
+    ///
+    /// When a PROOF arrives matching the registered hash, the callback is invoked.
+    /// Receipts expire after `timeout` seconds.
+    ///
+    /// - Parameters:
+    ///   - hash: 16-byte truncated packet hash to match
+    ///   - timeout: Expiry time in seconds (default 300)
+    ///   - callback: Async callback to invoke when proof matches
+    public func registerReceipt(hash: Data, timeout: TimeInterval = 300, callback: @escaping @Sendable () async -> Void) {
+        if receipts.count >= maxReceipts { receipts.removeFirst() }
+        receipts.append((hash: hash, callback: callback, timeout: Date().addingTimeInterval(timeout)))
     }
 
     // MARK: - Path Table Access
@@ -2319,6 +3130,11 @@ public actor ReticulumTransport {
         let receivingInterfaceId = lastReceivedInterfaceId
         onDiagnostic?("[PATH_REQ] for \(destHex) from interface \(receivingInterfaceId ?? "unknown")")
 
+        // E12: Track local path requests (no transport_id = local origin)
+        if requestingTransportId == nil {
+            pendingLocalPathRequests[destinationHash] = receivingInterfaceId ?? ""
+        }
+
         // 1. Check local destinations
         if let localDest = destinations[destinationHash] {
             onDiagnostic?("[PATH_REQ] \(destHex) is LOCAL, responding with announce")
@@ -2347,6 +3163,13 @@ public actor ReticulumTransport {
 
         // 3. Forward path request to other interfaces (discovery mode)
         if transportEnabled {
+            // E7: Only forward discovery on eligible interface modes
+            let receivingMode = receivingInterfaceId.flatMap { getInterfaceMode(for: $0) } ?? .full
+            guard TransportConstants.DISCOVER_PATHS_FOR.contains(receivingMode) else {
+                logger.debug("Not forwarding path request for \(destHex, privacy: .public): mode \(String(describing: receivingMode)) not eligible")
+                return
+            }
+
             if discoveryPathRequests[destinationHash] != nil {
                 logger.debug("Already forwarding path request for \(destHex, privacy: .public)")
                 return
@@ -2411,6 +3234,13 @@ public actor ReticulumTransport {
         pathEntry: PathEntry,
         attachedInterfaceId: String?
     ) {
+        // L3: Don't answer if next hop is on the same roaming-mode interface
+        if let attachedId = attachedInterfaceId,
+           getInterfaceMode(for: attachedId) == .roaming,
+           pathEntry.interfaceId == attachedId {
+            return
+        }
+
         guard let cachedData = pathEntry.announceData, !cachedData.isEmpty else {
             let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             logger.warning("Cannot respond to path request for \(destHex, privacy: .public): no cached announce data")
@@ -2435,17 +3265,31 @@ public actor ReticulumTransport {
             data: cachedData
         )
 
+        // E6: Capture interface mode before Task (actor-isolated)
+        let isRoaming = attachedInterfaceId.flatMap { getInterfaceMode(for: $0) } == .roaming
+        let extraDelay = Self.PATH_REQUEST_GRACE + (isRoaming ? TransportConstants.PATH_REQUEST_RG : 0)
+
         Task { [weak self] in
             guard let self = self else { return }
+            // E3: Hold existing announce while path response is sent
+            if let heldPacket = await self.announceTable.removeAndReturn(destinationHash) {
+                await self.setHeldAnnounce(destinationHash: destinationHash, packet: heldPacket)
+            }
             await self.announceTable.insert(
                 destinationHash: destinationHash,
                 packet: cachedPacket,
                 hops: pathEntry.hopCount,
                 receivedFrom: destinationHash,
                 blockRebroadcasts: true,
-                attachedInterfaceId: attachedInterfaceId
+                attachedInterfaceId: attachedInterfaceId,
+                extraDelay: extraDelay
             )
         }
+    }
+
+    /// E3: Store a held announce (called from Task context).
+    private func setHeldAnnounce(destinationHash: Data, packet: Packet) {
+        heldAnnounces[destinationHash] = packet
     }
 
     /// Send a path request on a specific interface (for forwarding).
@@ -2546,9 +3390,15 @@ extension ReticulumTransport {
         // File-based log for ALL incoming packets
         transportDebugLog("RECV \(data.count)B from \(interfaceId), hex=\(hexDump)")
 
+        // E8: IFAC validation — must happen before packet parsing
+        guard let validatedData = validateIFAC(raw: data, interfaceId: interfaceId) else {
+            print("[PACKET_RECV] IFAC validation failed, dropping packet from \(interfaceId)")
+            return
+        }
+
         // Parse the data into a packet
         do {
-            let packet = try Packet(from: data)
+            let packet = try Packet(from: validatedData)
             let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
             let destFullHex = packet.destination.map { String(format: "%02x", $0) }.joined()
             let contextStr = packet.header.hasContext ? String(format: "0x%02x", packet.context) : "none"

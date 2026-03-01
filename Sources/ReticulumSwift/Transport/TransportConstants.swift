@@ -51,6 +51,60 @@ public enum TransportConstants {
     /// Maximum rate timestamps kept per destination for rate limiting
     public static let MAX_RATE_TIMESTAMPS: Int = 16
 
+    // MARK: - Transport Table Timeouts (Transport.py:86-93)
+
+    /// Reverse table entry timeout (8 minutes, Python REVERSE_TIMEOUT)
+    public static let REVERSE_TIMEOUT: TimeInterval = 480
+
+    /// Link table stale timeout (Python STALE_TIME * 1.25 ≈ 15 min)
+    public static let LINK_TIMEOUT: TimeInterval = 900
+
+    /// Maximum packet hashes tracked for deduplication (Python hashlist_maxsize)
+    public static let HASHLIST_MAXSIZE: Int = 1_000_000
+
+    // MARK: - Path Request (Transport.py:73-75)
+
+    /// Minimum interval between path requests for same destination (seconds)
+    /// Python reference: Transport.PATH_REQUEST_MI = 20
+    public static let PATH_REQUEST_MI: TimeInterval = 20.0
+
+    /// Extra grace delay for path requests on roaming interfaces (seconds)
+    /// Python reference: Transport.PATH_REQUEST_RG = 1.5
+    public static let PATH_REQUEST_RG: TimeInterval = 1.5
+
+    /// Interface modes eligible for path discovery forwarding
+    /// Python reference: Transport.DISCOVER_PATHS_FOR
+    public static let DISCOVER_PATHS_FOR: [InterfaceMode] = [.accessPoint, .gateway, .roaming, .full]
+
+    // MARK: - Announce Queue (Transport.py:94-95)
+
+    /// Maximum queued announces per interface when bandwidth capped
+    /// Python reference: Transport.MAX_QUEUED_ANNOUNCES = 16384
+    public static let MAX_QUEUED_ANNOUNCES: Int = 16384
+
+    /// Maximum age of queued announce before expiry (seconds)
+    /// Python reference: Transport.QUEUED_ANNOUNCE_LIFE = 86400
+    public static let QUEUED_ANNOUNCE_LIFE: TimeInterval = 86400
+
+    // MARK: - IFAC (Reticulum.py:151-154)
+
+    /// Minimum IFAC size in bytes
+    /// Python reference: Reticulum.IFAC_MIN_SIZE = 1
+    public static let IFAC_MIN_SIZE: Int = 1
+
+    /// Default IFAC size in bytes (128 bits)
+    /// Python reference: TCPInterface.DEFAULT_IFAC_SIZE = 16
+    public static let DEFAULT_IFAC_SIZE: Int = 16
+
+    /// IFAC salt for HKDF derivation
+    /// Python reference: Reticulum.IFAC_SALT
+    public static let IFAC_SALT: Data = Data([
+        0xad, 0xf5, 0x4d, 0x88, 0x2c, 0x9a, 0x9b, 0x80,
+        0x77, 0x1e, 0xb4, 0x99, 0x5d, 0x70, 0x2d, 0x4a,
+        0x3e, 0x73, 0x33, 0x91, 0xb2, 0xa0, 0xf5, 0x3f,
+        0x41, 0x6d, 0x9f, 0x90, 0x7e, 0x55, 0xcf, 0xf8
+    ])
+
     // MARK: - Path States (Transport.py:83-85)
 
     /// Path state unknown (default)
