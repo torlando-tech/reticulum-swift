@@ -9,6 +9,9 @@
 //
 
 import Foundation
+import os.log
+
+private let logger = Logger(subsystem: "net.reticulum", category: "AnnounceValidator")
 
 // MARK: - Validation Errors
 
@@ -119,7 +122,7 @@ public enum AnnounceValidator {
         let hasRatchet = packet.header.hasContext && !isPlain
 
         let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[ANNOUNCE_PARSE] dest=\(destHex), dataLen=\(data.count), hasContext=\(packet.header.hasContext), hasRatchet=\(hasRatchet)")
+        logger.debug("Parse: dest=\(destHex), dataLen=\(data.count), hasContext=\(packet.header.hasContext), hasRatchet=\(hasRatchet)")
 
         if isPlain {
             return try parsePlainAnnounce(data: data, destinationHash: packet.destination, nameHashLength: nameHashLength)
@@ -198,8 +201,8 @@ public enum AnnounceValidator {
         let appDataLen = parsed.appData?.count ?? 0
         let sigHex = signature.prefix(16).map { String(format: "%02x", $0) }.joined()
         let signedDataHex = signedData.prefix(32).map { String(format: "%02x", $0) }.joined()
-        print("[ANNOUNCE_VALIDATE] dest=\(destHex), signedData=\(signedData.count) bytes, hasRatchet=\(hasRatchetData), appData=\(appDataLen) bytes")
-        print("[ANNOUNCE_VALIDATE] signedData[0:32]=\(signedDataHex)... sig[0:16]=\(sigHex)...")
+        logger.debug("Validate: dest=\(destHex), signedData=\(signedData.count) bytes, hasRatchet=\(hasRatchetData), appData=\(appDataLen) bytes")
+        logger.debug("Validate: signedData[0:32]=\(signedDataHex)... sig[0:16]=\(sigHex)...")
 
         // Extract signing public key (bytes 32-63 of publicKeys)
         // Use Data() to ensure contiguous bytes starting at index 0
@@ -213,11 +216,11 @@ public enum AnnounceValidator {
         )
 
         if !isValid {
-            print("[ANNOUNCE_VALIDATE] Signature verification FAILED")
+            logger.warning("Signature verification FAILED")
             throw AnnounceValidationError.signatureInvalid
         }
 
-        print("[ANNOUNCE_VALIDATE] Signature verification PASSED")
+        logger.debug("Signature verification PASSED")
         return true
     }
 
@@ -302,7 +305,7 @@ public enum AnnounceValidator {
             }
             ratchet = Data(data[offset..<(offset + RATCHET_SIZE)])
             let ratchetHex = ratchet!.prefix(8).map { String(format: "%02x", $0) }.joined()
-            print("[ANNOUNCE_PARSE] Extracted ratchet[0:8]=\(ratchetHex)")
+            logger.debug("Extracted ratchet[0:8]=\(ratchetHex)")
             offset += RATCHET_SIZE
         }
 
@@ -323,7 +326,7 @@ public enum AnnounceValidator {
         let sigOffset = hasRatchet ? (PUBLIC_KEYS_LENGTH + actualNameHashLength + ANNOUNCE_RANDOM_HASH_LENGTH + RATCHET_SIZE) : (PUBLIC_KEYS_LENGTH + actualNameHashLength + ANNOUNCE_RANDOM_HASH_LENGTH)
         let pkHex = publicKeys.prefix(8).map { String(format: "%02x", $0) }.joined()
         let sigFirstBytes = signature.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[ANNOUNCE_PARSE_DETAIL] sigOffset=\(sigOffset), pk[0:8]=\(pkHex), sig[0:8]=\(sigFirstBytes)")
+        logger.debug("Parse detail: sigOffset=\(sigOffset), pk[0:8]=\(pkHex), sig[0:8]=\(sigFirstBytes)")
 
         return ParsedAnnounce(
             publicKeys: publicKeys,

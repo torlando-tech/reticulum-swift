@@ -20,6 +20,8 @@
 import Foundation
 import OSLog
 
+private let transportExtLogger = Logger(subsystem: "net.reticulum", category: "Transport")
+
 // MARK: - Transport Forwarding Methods
 
 extension ReticulumTransport {
@@ -173,7 +175,7 @@ extension ReticulumTransport {
             await pathTable.touch(destinationHash: packet.destination)
             let nextHopHex = pathEntry.nextHop?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "direct"
             onDiagnostic?("[TRANSPORT] Forwarded LINKREQUEST link=\(linkIdHex) → \(outboundInterfaceId) nextHop=\(nextHopHex) hops=\(newHops)")
-            print("[TRANSPORT] Forwarded LINKREQUEST link=\(linkIdHex) dest=\(destHex) via=\(outboundInterfaceId) hops=\(newHops)")
+            transportExtLogger.info("Forwarded LINKREQUEST link=\(linkIdHex) dest=\(destHex) via=\(outboundInterfaceId) hops=\(newHops)")
         } catch {
             // Failed to forward — remove link table entry
             linkTable.removeValue(forKey: linkId)
@@ -274,7 +276,7 @@ extension ReticulumTransport {
             try await sendToInterface(forwardedRaw, interfaceId: linkEntry.receivingInterfaceId)
 
             onDiagnostic?("[TRANSPORT] Forwarded LINKPROOF link=\(linkIdHex) → \(linkEntry.receivingInterfaceId) hops=\(newHops)")
-            print("[TRANSPORT] Forwarded LINKPROOF link=\(linkIdHex) via=\(linkEntry.receivingInterfaceId) hops=\(newHops)")
+            transportExtLogger.info("Forwarded LINKPROOF link=\(linkIdHex) via=\(linkEntry.receivingInterfaceId) hops=\(newHops)")
         } catch {
             onDiagnostic?("[TRANSPORT] Failed to forward LINKPROOF: \(error)")
         }
@@ -410,7 +412,7 @@ extension ReticulumTransport {
             // D12: Touch path table timestamp after successful forwarding
             await pathTable.touch(destinationHash: packet.destination)
             onDiagnostic?("[TRANSPORT] Forwarded DATA dest=\(destHex) → \(outboundInterfaceId) hops=\(newHops)")
-            print("[TRANSPORT] Forwarded DATA dest=\(destHex) via=\(outboundInterfaceId) hops=\(newHops)")
+            transportExtLogger.info("Forwarded DATA dest=\(destHex) via=\(outboundInterfaceId) hops=\(newHops)")
         } catch {
             reverseTable.removeValue(forKey: packetHash)
             onDiagnostic?("[TRANSPORT] Failed to forward DATA: \(error)")
@@ -441,7 +443,7 @@ extension ReticulumTransport {
         do {
             try await sendToInterface(forwardedRaw, interfaceId: reverseEntry.receivingInterfaceId)
             onDiagnostic?("[TRANSPORT] Forwarded DATA PROOF \(proofDestHex) → \(reverseEntry.receivingInterfaceId) hops=\(newHops)")
-            print("[TRANSPORT] Forwarded DATA PROOF \(proofDestHex) via=\(reverseEntry.receivingInterfaceId) hops=\(newHops)")
+            transportExtLogger.info("Forwarded DATA PROOF \(proofDestHex) via=\(reverseEntry.receivingInterfaceId) hops=\(newHops)")
         } catch {
             onDiagnostic?("[TRANSPORT] Failed to forward DATA PROOF: \(error)")
         }

@@ -9,6 +9,9 @@
 //
 
 import Foundation
+import os.log
+
+private let identifyLogger = Logger(subsystem: "com.columba.app", category: "Link")
 
 // MARK: - Identify Packet Context
 
@@ -115,7 +118,7 @@ extension Link {
 
         let packetBytes = packet.encode()
         let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LINK_IDENTIFY] Sending LINKIDENTIFY packet (\(packetBytes.count) bytes) for link \(linkIdHex)")
+        identifyLogger.info("Sending LINKIDENTIFY packet (\(packetBytes.count, privacy: .public) bytes) for link \(linkIdHex, privacy: .public)")
 
         try await send(packetBytes)
     }

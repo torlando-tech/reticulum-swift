@@ -6,6 +6,9 @@
 //
 
 import Foundation
+import os.log
+
+private let logger = Logger(subsystem: "net.reticulum", category: "FramedTransport")
 
 /// Transport wrapper that adds HDLC framing to an underlying transport.
 ///
@@ -113,7 +116,7 @@ public class FramedTransport: Transport {
     /// Each complete frame is delivered via onDataReceived callback.
     private func handleReceivedData(_ data: Data) {
         let hexDump = data.prefix(40).map { String(format: "%02x", $0) }.joined()
-        print("[FRAMEDTRANSPORT] Raw TCP data: \(data.count) bytes: \(hexDump)")
+        logger.debug("Raw TCP data: \(data.count, privacy: .public) bytes: \(hexDump, privacy: .public)")
 
         bufferLock.lock()
         receiveBuffer.append(data)
@@ -122,12 +125,12 @@ public class FramedTransport: Transport {
         let frames = HDLC.extractFrames(from: &receiveBuffer)
         bufferLock.unlock()
 
-        print("[FRAMEDTRANSPORT] Extracted \(frames.count) frame(s), buffer remaining: \(receiveBuffer.count) bytes")
+        logger.debug("Extracted \(frames.count, privacy: .public) frame(s), buffer remaining: \(self.receiveBuffer.count, privacy: .public) bytes")
 
         // Deliver each frame to callback
         for frame in frames {
             let frameHex = frame.prefix(20).map { String(format: "%02x", $0) }.joined()
-            print("[FRAMEDTRANSPORT] Delivering frame: \(frame.count) bytes: \(frameHex)")
+            logger.debug("Delivering frame: \(frame.count, privacy: .public) bytes: \(frameHex, privacy: .public)")
             onDataReceived?(frame)
         }
     }

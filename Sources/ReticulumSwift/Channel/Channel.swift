@@ -14,6 +14,9 @@
 //
 
 import Foundation
+import os.log
+
+private let logger = Logger(subsystem: "net.reticulum", category: "Channel")
 
 // MARK: - Envelope
 
@@ -174,7 +177,7 @@ public actor Channel {
                 inboundBuffer[envelope.sequence] = envelope
             }
         } catch {
-            print("[CHANNEL] Failed to unpack envelope: \(error)")
+            logger.error("Failed to unpack envelope: \(error)")
         }
     }
 

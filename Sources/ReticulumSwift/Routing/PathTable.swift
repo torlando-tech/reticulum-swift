@@ -9,6 +9,9 @@
 
 import Foundation
 import SQLite3
+import os.log
+
+private let logger = Logger(subsystem: "net.reticulum", category: "PathTable")
 
 // MARK: - Path Table Errors
 
@@ -125,7 +128,7 @@ public actor PathTable {
 
             // Load existing paths into memory
             loadFromDatabase()
-            print("[PATHTABLE] Loaded \(paths.count) paths from database: \(dbPath)")
+            logger.info("Loaded \(self.paths.count) paths from database: \(dbPath)")
         }
     }
 
@@ -200,7 +203,7 @@ public actor PathTable {
             pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
             saveToDatabase(entry)
             let nextHopStr = entry.nextHop?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
-            print("[PATHTABLE] Recorded NEW path to \(keyHex), hops=\(entry.hopCount), nextHop=\(nextHopStr)")
+            logger.info("Recorded NEW path to \(keyHex), hops=\(entry.hopCount), nextHop=\(nextHopStr)")
             pathUpdateContinuation?.yield(entry)
             return true
         }
@@ -219,11 +222,11 @@ public actor PathTable {
                 updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
                 paths[key] = updated
                 saveToDatabase(updated)
-                print("[PATHTABLE] Updated \(keyHex): equal/better hops (\(entry.hopCount) <= \(existing.hopCount)), fresh emit")
+                logger.info("Updated \(keyHex): equal/better hops (\(entry.hopCount) <= \(existing.hopCount)), fresh emit")
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
-            print("[PATHTABLE] Ignored \(keyHex): equal/better hops but duplicate blob or stale emit")
+            logger.debug("Ignored \(keyHex): equal/better hops but duplicate blob or stale emit")
             return false
         }
 
@@ -240,11 +243,11 @@ public actor PathTable {
                 updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
                 paths[key] = updated
                 saveToDatabase(updated)
-                print("[PATHTABLE] Updated \(keyHex): expired path replaced, hops=\(entry.hopCount)")
+                logger.info("Updated \(keyHex): expired path replaced, hops=\(entry.hopCount)")
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
-            print("[PATHTABLE] Ignored \(keyHex): expired path but duplicate blob")
+            logger.debug("Ignored \(keyHex): expired path but duplicate blob")
             return false
         }
 
@@ -258,11 +261,11 @@ public actor PathTable {
                 updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
                 paths[key] = updated
                 saveToDatabase(updated)
-                print("[PATHTABLE] Updated \(keyHex): fresher emission with worse hops (\(entry.hopCount) > \(existing.hopCount))")
+                logger.info("Updated \(keyHex): fresher emission with worse hops (\(entry.hopCount) > \(existing.hopCount))")
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
-            print("[PATHTABLE] Ignored \(keyHex): fresher emission but duplicate blob")
+            logger.debug("Ignored \(keyHex): fresher emission but duplicate blob")
             return false
         }
 
@@ -274,12 +277,12 @@ public actor PathTable {
             paths[key] = updated
             pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
             saveToDatabase(updated)
-            print("[PATHTABLE] Updated \(keyHex): same emission but path was unresponsive")
+            logger.info("Updated \(keyHex): same emission but path was unresponsive")
             pathUpdateContinuation?.yield(updated)
             return true
         }
 
-        print("[PATHTABLE] Ignored \(keyHex): worse hops, not expired, not fresher, not unresponsive")
+        logger.debug("Ignored \(keyHex): worse hops, not expired, not fresher, not unresponsive")
         return false
     }
 
@@ -320,7 +323,7 @@ public actor PathTable {
         guard hasOldColumn && !hasNewColumn else { return }
 
         // Old schema detected: add new column, migrate data, then recreate table
-        print("[PATHTABLE] Migrating random_blob → random_blobs")
+        logger.info("Migrating random_blob to random_blobs")
 
         // Read old data
         struct OldRow {
@@ -395,7 +398,7 @@ public actor PathTable {
             )
             saveToDatabase(entry)
         }
-        print("[PATHTABLE] Migration complete, \(oldRows.count) rows migrated")
+        logger.info("Migration complete, \(oldRows.count) rows migrated")
     }
 
     /// Add announce_data column if it doesn't exist (migration for existing databases).
@@ -414,7 +417,7 @@ public actor PathTable {
         }
 
         guard !hasColumn else { return }
-        print("[PATHTABLE] Migrating: adding announce_data column")
+        logger.info("Migrating: adding announce_data column")
         sqlite3_exec(db, "ALTER TABLE paths ADD COLUMN announce_data BLOB", nil, nil, nil)
     }
 
@@ -458,7 +461,7 @@ public actor PathTable {
         var stmt: OpaquePointer?
 
         guard sqlite3_prepare_v2(db, selectSQL, -1, &stmt, nil) == SQLITE_OK else {
-            print("[PATHTABLE] Failed to prepare select statement")
+            logger.error("Failed to prepare select statement")
             return
         }
         defer { sqlite3_finalize(stmt) }
@@ -542,7 +545,7 @@ public actor PathTable {
         var stmt: OpaquePointer?
 
         guard sqlite3_prepare_v2(db, upsertSQL, -1, &stmt, nil) == SQLITE_OK else {
-            print("[PATHTABLE] Failed to prepare insert statement")
+            logger.error("Failed to prepare insert statement")
             return
         }
         defer { sqlite3_finalize(stmt) }
@@ -595,7 +598,7 @@ public actor PathTable {
         }
 
         if sqlite3_step(stmt) != SQLITE_DONE {
-            print("[PATHTABLE] Failed to save path: \(String(cString: sqlite3_errmsg(db)))")
+            logger.error("Failed to save path: \(String(cString: sqlite3_errmsg(db)))")
         }
     }
 

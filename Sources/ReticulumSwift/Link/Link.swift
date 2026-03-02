@@ -282,7 +282,7 @@ public actor Link {
         self.initiator = true
 
         let signaledMtu = hwMtu ?? 500
-        linkLogger.info("[LINK_INIT] hwMtu=\(String(describing: hwMtu), privacy: .public), signaling MTU=\(signaledMtu, privacy: .public)")
+        linkLogger.info("Init: hwMtu=\(String(describing: hwMtu), privacy: .public), signaling MTU=\(signaledMtu, privacy: .public)")
         let signaling = IncomingLinkRequest.encodeSignaling(
             mtu: UInt32(signaledMtu),
             mode: LinkConstants.MODE_DEFAULT
@@ -502,12 +502,12 @@ public actor Link {
         // Note: closed is terminal, no transitions out of it
         guard !state.isTerminal else {
             let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-            print("[LINK_STATE] Link \(linkIdHex) ignoring transition \(state) -> \(newState) (terminal state)")
+            linkLogger.debug("Link \(linkIdHex, privacy: .public) ignoring transition \(String(describing: self.state), privacy: .public) -> \(String(describing: newState), privacy: .public) (terminal state)")
             return
         }
 
         let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LINK_STATE] Link \(linkIdHex) transitioning: \(state) -> \(newState)")
+        linkLogger.info("Link \(linkIdHex, privacy: .public) transitioning: \(String(describing: self.state), privacy: .public) -> \(String(describing: newState), privacy: .public)")
         state = newState
         stateContinuation?.yield(newState)
     }
@@ -562,71 +562,70 @@ public actor Link {
     /// - Throws: `LinkError.keyDerivationFailed` if ECDH fails
     public func processProof(_ proofData: Data) async throws {
         let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LINK_PROOF] processProof called for link \(linkIdHex), state=\(state)")
-        print("[LINK_PROOF] proofData length: \(proofData.count) bytes")
+        linkLogger.info("processProof called for link \(linkIdHex, privacy: .public), state=\(String(describing: self.state), privacy: .public)")
+        linkLogger.debug("proofData length: \(proofData.count, privacy: .public) bytes")
 
         guard state == .handshake else {
-            print("[LINK_PROOF] ERROR: not in handshake state, currently \(state)")
+            linkLogger.error("Not in handshake state, currently \(String(describing: self.state), privacy: .public)")
             throw LinkError.invalidState(expected: "handshake", actual: "\(state)")
         }
 
         // Parse PROOF
-        print("[LINK_PROOF] Parsing PROOF data...")
+        linkLogger.debug("Parsing PROOF data...")
         let proof = try LinkProof(from: proofData)
-        print("[LINK_PROOF] PROOF parsed successfully")
+        linkLogger.debug("PROOF parsed successfully")
 
         // Validate signature against destination's identity
         guard let destIdentity = destination.identity else {
-            print("[LINK_PROOF] ERROR: Destination has no identity")
+            linkLogger.error("Destination has no identity")
             throw LinkError.invalidProof(reason: "Destination has no identity for verification")
         }
 
-        print("[LINK_PROOF] Validating PROOF signature against destination identity...")
+        linkLogger.debug("Validating PROOF signature against destination identity...")
         try proof.validate(linkId: linkId, destinationIdentity: destIdentity)
-        print("[LINK_PROOF] PROOF signature validated!")
+        linkLogger.info("PROOF signature validated")
 
         // Extract confirmed MTU from PROOF signaling
         let (confirmedMtu, _) = IncomingLinkRequest.decodeSignaling(proof.signaling)
         if confirmedMtu > 0 {
             self.mtu = Int(confirmedMtu)
             updateMdu()
-            linkLogger.info("[LINK_PROOF] MTU negotiated: \(self.mtu, privacy: .public), MDU=\(self.mdu, privacy: .public)")
-            print("[LINK_PROOF] MTU negotiated: \(self.mtu), MDU=\(self.mdu)")
+            linkLogger.info("MTU negotiated: \(self.mtu, privacy: .public), MDU=\(self.mdu, privacy: .public)")
         }
 
         // Store peer's ephemeral key
         peerEncryptionPublicKey = proof.peerEncryptionPublicKey
         let peerKeyHex = proof.peerEncryptionPublicKey.rawRepresentation.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LINK_PROOF] Peer encryption key stored: \(peerKeyHex)...")
+        linkLogger.debug("Peer encryption key stored: \(peerKeyHex, privacy: .public)...")
 
         // Measure RTT
         if let sentAt = requestSentAt {
             rtt = Date().timeIntervalSince(sentAt)
             keepaliveInterval = LinkConstants.keepaliveInterval(forRTT: rtt)
-            print("[LINK_PROOF] RTT measured: \(String(format: "%.3f", rtt))s")
+            linkLogger.info("RTT measured: \(String(format: "%.3f", self.rtt), privacy: .public)s")
         }
 
         // Derive shared key
-        print("[LINK_PROOF] Deriving shared key...")
+        linkLogger.debug("Deriving shared key...")
         try deriveSharedKey()
-        print("[LINK_PROOF] Shared key derived successfully")
+        linkLogger.info("Shared key derived successfully")
 
         // Transition to active
         lastInbound = Date()
         lastProof = Date() // L10: Track proof receipt for stale detection
-        print("[LINK_PROOF] Transitioning to active state...")
+        linkLogger.debug("Transitioning to active state...")
         transitionState(to: .active)
 
         // Send LRRTT packet to complete handshake from responder's perspective
         // This triggers the responder's link_established callback
-        print("[LINK_PROOF] Sending LRRTT packet...")
+        linkLogger.debug("Sending LRRTT packet...")
         try await sendLRRTT()
-        print("[LINK_PROOF] LRRTT sent")
+        linkLogger.debug("LRRTT sent")
 
         // Start keep-alive and watchdog
         startKeepalive()
         startWatchdog()
-        print("[LINK_PROOF] Link \(linkIdHex) fully established!")
+        linkLogger.info("Link \(linkIdHex, privacy: .public) fully established")
     }
 
     /// Send LRRTT (Link Request RTT) packet to responder.
@@ -639,15 +638,15 @@ public actor Link {
     /// - Throws: `LinkError.encryptionFailed` if encryption fails
     private func sendLRRTT() async throws {
         let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LINK] sendLRRTT called for link \(linkIdHex), sendCallback set: \(sendCallback != nil)")
+        linkLogger.debug("sendLRRTT called for link \(linkIdHex, privacy: .public), sendCallback set: \(self.sendCallback != nil, privacy: .public)")
 
         // Encode RTT as msgpack double
         let rttData = packMsgPack(.double(rtt))
-        print("[LINK] LRRTT rttData=\(rttData.count) bytes, rtt=\(rtt)")
+        linkLogger.debug("LRRTT rttData=\(rttData.count, privacy: .public) bytes, rtt=\(self.rtt, privacy: .public)")
 
         // Encrypt the RTT data
         let encrypted = try encrypt(rttData)
-        print("[LINK] LRRTT encrypted=\(encrypted.count) bytes")
+        linkLogger.debug("LRRTT encrypted=\(encrypted.count, privacy: .public) bytes")
 
         // Build LRRTT packet
         // Header: HEADER_1, hasContext, BROADCAST, LINK destination, DATA type
@@ -668,17 +667,17 @@ public actor Link {
         )
 
         let packetBytes = packet.encode()
-        print("[LINK] LRRTT packet=\(packetBytes.count) bytes, context=0x\(String(format: "%02x", LinkConstants.CONTEXT_LRRTT))")
+        linkLogger.debug("LRRTT packet=\(packetBytes.count, privacy: .public) bytes, context=0x\(String(format: "%02x", LinkConstants.CONTEXT_LRRTT), privacy: .public)")
 
         // Send via callback if available, otherwise store for manual send
         if let send = sendCallback {
-            print("[LINK] Sending LRRTT via callback...")
+            linkLogger.debug("Sending LRRTT via callback...")
             try await send(packetBytes)
-            print("[LINK] LRRTT sent successfully")
+            linkLogger.debug("LRRTT sent successfully")
         } else {
             // If no callback, caller must handle sending manually
             // Store packet for getLRRTTPacket() to retrieve
-            print("[LINK] No sendCallback, storing LRRTT for manual retrieval")
+            linkLogger.debug("No sendCallback, storing LRRTT for manual retrieval")
             pendingLRRTTPacket = packet
         }
     }
@@ -845,7 +844,7 @@ public actor Link {
         // H1: Only initiator sends periodic keepalives. Responder echoes on receipt.
         guard initiator else { return }
         let linkHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-        linkLogger.error("[KEEPALIVE] Starting keepalive for \(linkHex, privacy: .public), interval=\(self.keepaliveInterval, privacy: .public)s, initiator=\(self.initiator, privacy: .public)")
+        linkLogger.info("Starting keepalive for \(linkHex, privacy: .public), interval=\(self.keepaliveInterval, privacy: .public)s, initiator=\(self.initiator, privacy: .public)")
 
         keepaliveTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -875,7 +874,7 @@ public actor Link {
     private func sendKeepalive() async {
         guard state.isEstablished else { return }
         guard let send = sendCallback else {
-            linkLogger.error("[KEEPALIVE] No sendCallback, can't send keepalive")
+            linkLogger.warning("No sendCallback, can't send keepalive")
             return
         }
 
@@ -906,10 +905,10 @@ public actor Link {
             keepaliveSendCount += 1
             lastOutbound = Date()
             let linkHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-            linkLogger.error("[KEEPALIVE] Sent #\(self.keepaliveSendCount, privacy: .public) for \(linkHex, privacy: .public), byte=0x\(String(format: "%02x", keepaliveData[0]), privacy: .public), pktLen=\(encoded.count, privacy: .public)")
+            linkLogger.debug("Keepalive sent #\(self.keepaliveSendCount, privacy: .public) for \(linkHex, privacy: .public), byte=0x\(String(format: "%02x", keepaliveData[0]), privacy: .public), pktLen=\(encoded.count, privacy: .public)")
         } catch {
             let linkHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-            linkLogger.error("[KEEPALIVE] FAILED for \(linkHex, privacy: .public): \(error)")
+            linkLogger.error("Keepalive failed for \(linkHex, privacy: .public): \(error, privacy: .public)")
         }
     }
 
@@ -1097,7 +1096,7 @@ public actor Link {
             throw LinkError.notActive
         }
 
-        print("[RESOURCE_SEND] Starting resource transfer: \(data.count) bytes")
+        linkLogger.info("Starting resource transfer: \(data.count, privacy: .public) bytes")
 
         // Create outbound resource
         let resource = Resource(
@@ -1130,19 +1129,17 @@ public actor Link {
         }, autoCompress: false)
         let numParts = await resource.numParts
         let transferSize = await resource.transferSize
-        linkLogger.info("[RESOURCE_SEND] Prepared: \(numParts) parts, partSize=\(MDU), transferSize=\(transferSize), compressed=false")
-        print("[RESOURCE_SEND] Prepared: \(numParts) parts, partSize=\(MDU), compressed=false")
+        linkLogger.info("Resource prepared: \(numParts, privacy: .public) parts, partSize=\(MDU, privacy: .public), transferSize=\(transferSize, privacy: .public), compressed=false")
 
         // Store resource (hash is available after prepare)
         let hash = await resource.hash ?? Data()
         outboundResources[hash] = resource
         let hashHex = hash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        linkLogger.info("[RESOURCE_SEND] Stored resource hash=\(hashHex), outboundResources count=\(self.outboundResources.count)")
+        linkLogger.info("Stored resource hash=\(hashHex, privacy: .public), outboundResources count=\(self.outboundResources.count, privacy: .public)")
 
         // Send advertisement to start transfer
         try await resource.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
-        linkLogger.info("[RESOURCE_SEND] Advertisement sent for resource \(hashHex)")
-        print("[RESOURCE_SEND] Advertisement sent for resource \(hashHex)")
+        linkLogger.info("Advertisement sent for resource \(hashHex, privacy: .public)")
 
         return resource
     }
@@ -1202,7 +1199,7 @@ public actor Link {
 
         guard let send = sendCallback else { throw LinkError.notActive }
         try await send(packet.encode())
-        print("[RESOURCE_SEND] Sent resource packet context=0x\(String(format: "%02x", resourceContext)), payload=\(wirePayload.count) bytes")
+        linkLogger.debug("Sent resource packet context=0x\(String(format: "%02x", resourceContext), privacy: .public), payload=\(wirePayload.count, privacy: .public) bytes")
     }
 
     /// Handle incoming resource packet.
@@ -1216,8 +1213,7 @@ public actor Link {
     ///   - data: Packet payload (no context byte)
     public func handleResourcePacket(context: UInt8, data: Data) async {
         resourceDebugLog("RESOURCE packet: ctx=0x\(String(format: "%02x", context)), data=\(data.count)B")
-        linkLogger.info("[RESOURCE] Received resource packet: context=0x\(String(format: "%02x", context)), data=\(data.count) bytes")
-        print("[RESOURCE_RECV] Resource packet: context=0x\(String(format: "%02x", context)), data=\(data.count) bytes")
+        linkLogger.debug("Received resource packet: context=0x\(String(format: "%02x", context), privacy: .public), data=\(data.count, privacy: .public) bytes")
 
         switch context {
         case ResourcePacketContext.resource:             // 0x01 - RESOURCE data part
@@ -1235,7 +1231,7 @@ public actor Link {
         case ResourcePacketContext.resourceReject:        // 0x07 - RESOURCE_RCL
             await handleResourceReject(data)
         default:
-            print("[RESOURCE_RECV] Unknown resource context: 0x\(String(format: "%02x", context))")
+            linkLogger.warning("Unknown resource context: 0x\(String(format: "%02x", context), privacy: .public)")
             break
         }
     }
@@ -1267,7 +1263,7 @@ public actor Link {
             if let reqId = advertisement.requestId,
                pendingRequests.contains(where: { $0.requestId == reqId }) {
                 resourceDebugLog("ADV: Auto-accepting response resource for pending request \(reqId.prefix(8).map { String(format: "%02x", $0) }.joined())")
-                print("[RESOURCE_RECV] Auto-accepting response resource for pending request \(reqId.prefix(8).map { String(format: "%02x", $0) }.joined())")
+                linkLogger.info("Auto-accepting response resource for pending request \(reqId.prefix(8).map { String(format: "%02x", $0) }.joined(), privacy: .public)")
                 shouldAccept = true
             } else {
                 switch resourceStrategy {
@@ -1290,7 +1286,7 @@ public actor Link {
                 inboundResources[hash] = resource
                 let hashHex = hash.prefix(8).map { String(format: "%02x", $0) }.joined()
                 resourceDebugLog("ACCEPT: resource \(hashHex), size=\(advertisement.dataSize), parts=\(advertisement.numParts)")
-                linkLogger.error("[RESOURCE_RECV] Accepted resource \(hashHex), size=\(advertisement.dataSize), parts=\(advertisement.numParts)")
+                linkLogger.info("Accepted resource \(hashHex, privacy: .public), size=\(advertisement.dataSize, privacy: .public), parts=\(advertisement.numParts, privacy: .public)")
 
                 // Notify callback
                 if let callbacks = resourceCallbacks {
@@ -1319,13 +1315,13 @@ public actor Link {
                 try await resource.accept()
             } else {
                 resourceDebugLog("REJECT: resource rejected (strategy=\(resourceStrategy))")
-                print("[RESOURCE_RECV] Rejected resource (strategy=\(resourceStrategy))")
+                linkLogger.warning("Rejected resource (strategy=\(String(describing: self.resourceStrategy), privacy: .public))")
                 // Reject the resource
                 try await resource.reject()
             }
         } catch {
             resourceDebugLog("ADV ERROR: Failed to parse: \(error)")
-            print("[RESOURCE_RECV] Failed to parse advertisement: \(error)")
+            linkLogger.error("Failed to parse advertisement: \(error, privacy: .public)")
         }
     }
 
@@ -1344,7 +1340,7 @@ public actor Link {
 
         // Minimum: 1 (flag) + 32 (resource hash) = 33 bytes
         guard data.count >= 1 + resourceHashLen else {
-            print("[RESOURCE_REQ] Too short: \(data.count) bytes")
+            linkLogger.warning("Resource request too short: \(data.count, privacy: .public) bytes")
             return
         }
 
@@ -1354,7 +1350,7 @@ public actor Link {
 
         // Extract resource hash for matching
         guard data.count >= pad + resourceHashLen else {
-            print("[RESOURCE_REQ] Too short for resource hash: \(data.count) bytes, pad=\(pad)")
+            linkLogger.warning("Resource request too short for resource hash: \(data.count, privacy: .public) bytes, pad=\(pad, privacy: .public)")
             return
         }
         let resourceHash = Data(data[data.startIndex + pad ..< data.startIndex + pad + resourceHashLen])
@@ -1364,8 +1360,7 @@ public actor Link {
         let requestedHashes = data.count > hashesStart ? Data(data[(data.startIndex + hashesStart)...]) : Data()
 
         let resHashHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        linkLogger.info("[RESOURCE_REQ] resourceHash=\(resHashHex), exhausted=\(exhausted), partHashCount=\(requestedHashes.count / mapHashLen)")
-        print("[RESOURCE_REQ] resourceHash=\(resHashHex)..., exhausted=\(exhausted), partHashes=\(requestedHashes.count / mapHashLen)")
+        linkLogger.info("Resource request: resourceHash=\(resHashHex, privacy: .public), exhausted=\(exhausted, privacy: .public), partHashCount=\(requestedHashes.count / mapHashLen, privacy: .public)")
 
         // Find matching outbound resource by hash
         for (storedHash, resource) in outboundResources {
@@ -1390,14 +1385,14 @@ public actor Link {
                         try await resource.sendPart(at: partIndex)
                         sentCount += 1
                     } catch {
-                        linkLogger.error("[RESOURCE_REQ] Failed to send part \(partIndex): \(error.localizedDescription)")
+                        linkLogger.error("Failed to send part \(partIndex, privacy: .public): \(error.localizedDescription, privacy: .public)")
                     }
                 } else {
                     missCount += 1
                 }
                 offset += mapHashLen
             }
-            linkLogger.info("[RESOURCE_REQ] Sent \(sentCount) parts, \(missCount) hash misses for \(resHashHex)")
+            linkLogger.info("Sent \(sentCount, privacy: .public) parts, \(missCount, privacy: .public) hash misses for \(resHashHex, privacy: .public)")
 
             // Handle hashmap exhaustion (send more hashmap entries)
             // Python RNS computes the HMU segment from last_map_hash rather than
@@ -1413,25 +1408,20 @@ public actor Link {
                         // Compute next wire segment from the part that was exhausted
                         let exhaustedSegment = partIndex / maxLength
                         let nextWireSegment = exhaustedSegment + 1
-                        linkLogger.info("[RESOURCE_REQ] last_map_hash→part \(partIndex), exhaustedSeg=\(exhaustedSegment), nextWireSeg=\(nextWireSegment)")
-                        print("[RESOURCE_REQ] last_map_hash→part \(partIndex), sending HMU wireSeg=\(nextWireSegment)")
+                        linkLogger.info("last_map_hash→part \(partIndex, privacy: .public), exhaustedSeg=\(exhaustedSegment, privacy: .public), nextWireSeg=\(nextWireSegment, privacy: .public)")
                         sent = try await resource.sendHashmapForWireSegment(nextWireSegment, linkMDU: LinkConstants.LINK_MDU)
                     } else {
                         // Fallback to sequential counter if hash lookup fails
-                        linkLogger.warning("[RESOURCE_REQ] last_map_hash lookup failed, falling back to sequential")
-                        print("[RESOURCE_REQ] last_map_hash lookup failed, using sequential counter")
+                        linkLogger.warning("last_map_hash lookup failed, falling back to sequential")
                         sent = try await resource.sendNextHashmapSegment(linkMDU: LinkConstants.LINK_MDU)
                     }
                     if sent {
-                        linkLogger.info("[RESOURCE_REQ] Sent HMU for resource \(resHashHex)")
-                        print("[RESOURCE_REQ] Sent HMU for resource \(resHashHex)")
+                        linkLogger.info("Sent HMU for resource \(resHashHex, privacy: .public)")
                     } else {
-                        linkLogger.warning("[RESOURCE_REQ] Hashmap exhausted but no more segments")
-                        print("[RESOURCE_REQ] Hashmap exhausted but no more segments to send")
+                        linkLogger.warning("Hashmap exhausted but no more segments to send")
                     }
                 } catch {
-                    linkLogger.error("[RESOURCE_REQ] Failed to send HMU: \(error.localizedDescription)")
-                    print("[RESOURCE_REQ] Failed to send HMU: \(error)")
+                    linkLogger.error("Failed to send HMU: \(error.localizedDescription, privacy: .public)")
                 }
             }
 
@@ -1439,8 +1429,7 @@ public actor Link {
         }
 
         let outboundHashes = outboundResources.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
-        linkLogger.error("[RESOURCE_REQ] No matching outbound resource. resHash=\(resHashHex), have=\(outboundHashes)")
-        print("[RESOURCE_REQ] No matching outbound resource. Have: \(outboundHashes)")
+        linkLogger.error("No matching outbound resource. resHash=\(resHashHex, privacy: .public), have=\(outboundHashes, privacy: .public)")
     }
 
     /// Handle resource data packet.
@@ -1463,13 +1452,13 @@ public actor Link {
                 let total = await resource.numParts
                 let received = await resource.receivedCount
                 resourceDebugLog("PART: \(received)/\(total), complete=\(complete), data=\(data.count)B")
-                linkLogger.error("[RESOURCE_DATA] Part received (of \(total)), complete=\(complete)")
+                linkLogger.debug("Part received (\(received, privacy: .public)/\(total, privacy: .public)), complete=\(complete, privacy: .public)")
 
                 if complete {
                     // Resource transfer complete - assemble and send proof
                     let assembledData = try await resource.assemble()
                     resourceDebugLog("COMPLETE: assembled \(assembledData.count)B, sending proof")
-                    linkLogger.error("[RESOURCE_DATA] Assembled \(assembledData.count) bytes, sending proof")
+                    linkLogger.info("Resource assembled \(assembledData.count, privacy: .public) bytes, sending proof")
                     try await resource.sendProof()
 
                     // If this resource is a response to a pending request,
@@ -1479,7 +1468,7 @@ public actor Link {
                     if let reqId = await resource.requestId {
                         let reqHex = reqId.prefix(8).map { String(format: "%02x", $0) }.joined()
                         resourceDebugLog("DELIVER: response resource for request \(reqHex), data=\(assembledData.count)B")
-                        linkLogger.error("[RESOURCE_DATA] Response resource complete for request \(reqHex), data=\(assembledData.count) bytes")
+                        linkLogger.info("Response resource complete for request \(reqHex, privacy: .public), data=\(assembledData.count, privacy: .public) bytes")
                         // Unpack msgpack([requestId, responseData]) and deliver
                         if let value = try? unpackMsgPack(assembledData),
                            case .array(let elements) = value,
@@ -1490,7 +1479,7 @@ public actor Link {
                             await handleRequestResponse(requestId: responseRequestId, data: responseData)
                         } else {
                             resourceDebugLog("DELIVER: FAILED to unpack assembled data")
-                            linkLogger.error("[RESOURCE_DATA] Failed to unpack assembled data as msgpack([requestId, response])")
+                            linkLogger.error("Failed to unpack assembled data as msgpack([requestId, response])")
                         }
                     }
 
@@ -1502,7 +1491,7 @@ public actor Link {
                 }
                 return
             } catch {
-                linkLogger.error("[RESOURCE_DATA] Part handling error: \(error)")
+                linkLogger.error("Part handling error: \(error, privacy: .public)")
             }
         }
     }
@@ -1517,7 +1506,7 @@ public actor Link {
     private func handleResourceProof(_ data: Data) async {
         // Proof should be 64 bytes: resource_hash(32) + proof(32)
         guard data.count >= 64 else {
-            print("[RESOURCE_PROOF] Proof too short: \(data.count) bytes (expected 64)")
+            linkLogger.warning("Resource proof too short: \(data.count, privacy: .public) bytes (expected 64)")
             return
         }
 
@@ -1559,7 +1548,7 @@ public actor Link {
         //   self.hashmap_update(update[0], update[1])
         let hashLen = 32
         guard data.count > hashLen else {
-            print("[RESOURCE_HMU] Data too short: \(data.count) bytes")
+            linkLogger.warning("HMU data too short: \(data.count, privacy: .public) bytes")
             return
         }
 
@@ -1573,7 +1562,7 @@ public actor Link {
               case .array(let arr) = value,
               arr.count == 2,
               case .binary(let hashmapChunk) = arr[1] else {
-            print("[RESOURCE_HMU] Failed to unpack HMU payload")
+            linkLogger.error("Failed to unpack HMU payload")
             return
         }
 
@@ -1583,12 +1572,12 @@ public actor Link {
         case .int(let i): wireSegment = Int(i)
         case .uint(let u): wireSegment = Int(u)
         default:
-            print("[RESOURCE_HMU] Invalid segment number in HMU")
+            linkLogger.error("Invalid segment number in HMU")
             return
         }
 
         let resHashHex = resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[RESOURCE_HMU] Received HMU for \(resHashHex), wireSeg=\(wireSegment), \(hashmapChunk.count / 4) new hashes")
+        linkLogger.info("Received HMU for \(resHashHex, privacy: .public), wireSeg=\(wireSegment, privacy: .public), \(hashmapChunk.count / 4, privacy: .public) new hashes")
 
         // Find matching inbound resource by hash
         for (_, resource) in inboundResources {
@@ -1598,7 +1587,7 @@ public actor Link {
                 return
             }
         }
-        print("[RESOURCE_HMU] No matching inbound resource for \(resHashHex)")
+        linkLogger.warning("No matching inbound resource for \(resHashHex, privacy: .public)")
     }
 
     /// Handle resource reject packet.

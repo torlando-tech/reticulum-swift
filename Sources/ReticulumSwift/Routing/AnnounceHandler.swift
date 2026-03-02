@@ -14,6 +14,9 @@
 //
 
 import Foundation
+import os.log
+
+private let logger = Logger(subsystem: "net.reticulum", category: "AnnounceHandler")
 
 // MARK: - Process Result
 
@@ -122,33 +125,33 @@ public actor AnnounceHandler {
         from interfaceId: String,
         interfaceMode: InterfaceMode
     ) async -> AnnounceProcessResult {
-        print("[ANNOUNCE] Processing announce from \(interfaceId), hops=\(packet.header.hopCount), data=\(packet.data.count) bytes")
+        logger.debug("Processing announce from \(interfaceId), hops=\(packet.header.hopCount), data=\(packet.data.count) bytes")
 
         // 1. Compute announce hash for deduplication
         let announceHash = computeAnnounceHash(packet)
 
         // 2. Check deduplication
         if seenAnnounces.contains(announceHash) {
-            print("[ANNOUNCE] Ignored: already seen")
+            logger.debug("Ignored: already seen")
             return .ignored(reason: .alreadySeen)
         }
 
         // 3. Check hop limit
         if packet.header.hopCount >= maxHops {
-            print("[ANNOUNCE] Ignored: hop limit exceeded (\(packet.header.hopCount) >= \(maxHops))")
+            logger.warning("Ignored: hop limit exceeded (\(packet.header.hopCount) >= \(self.maxHops))")
             return .ignored(reason: .hopLimitExceeded)
         }
 
         // 4. Parse and validate announce
         let parsed: ParsedAnnounce
         let isPlain = packet.header.destinationType == .plain
-        print("[ANNOUNCE] Parsing announce, isPlain=\(isPlain)")
+        logger.debug("Parsing announce, isPlain=\(isPlain)")
 
         do {
             parsed = try AnnounceValidator.parseAndValidate(packet: packet, isPlain: isPlain)
-            print("[ANNOUNCE] Parsed successfully: destHash=\(parsed.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined())")
+            logger.debug("Parsed successfully: destHash=\(parsed.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined())")
         } catch {
-            print("[ANNOUNCE] Parse/validate error: \(error)")
+            logger.warning("Parse/validate error: \(error)")
             // Determine if it's a format or signature error
             if error is AnnounceValidationError {
                 let validationError = error as! AnnounceValidationError
@@ -180,17 +183,16 @@ public actor AnnounceHandler {
 
         // Debug: Log announce header type and nextHop extraction
         let destHex = parsed.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[ANNOUNCE_DEBUG] ===== ANNOUNCE PROCESSING =====")
-        print("[ANNOUNCE_DEBUG] dest=\(destHex), headerType=\(packet.header.headerType), hopCount=\(packet.header.hopCount)")
+        logger.debug("Announce processing: dest=\(destHex), headerType=\(String(describing: packet.header.headerType)), hopCount=\(packet.header.hopCount)")
         if let nh = nextHop {
             let nhHex = nh.prefix(8).map { String(format: "%02x", $0) }.joined()
             if packet.header.headerType == .header2 {
-                print("[ANNOUNCE_DEBUG] HEADER_2 announce: nextHop=\(nhHex) (from transportAddress)")
+                logger.debug("HEADER_2 announce: nextHop=\(nhHex) (from transportAddress)")
             } else {
-                print("[ANNOUNCE_DEBUG] HEADER_1 announce with hops>0: nextHop=\(nhHex) (set to destHash for relay forwarding)")
+                logger.debug("HEADER_1 announce with hops>0: nextHop=\(nhHex) (set to destHash for relay forwarding)")
             }
         } else {
-            print("[ANNOUNCE_DEBUG] Direct announce (hops=0): no nextHop needed")
+            logger.debug("Direct announce (hops=0): no nextHop needed")
         }
 
         let pathRecorded = await pathTable.record(

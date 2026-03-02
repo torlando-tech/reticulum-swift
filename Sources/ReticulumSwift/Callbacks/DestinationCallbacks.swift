@@ -11,6 +11,9 @@
 //
 
 import Foundation
+import os.log
+
+private let logger = Logger(subsystem: "net.reticulum", category: "DestinationCallbacks")
 
 // MARK: - Default Callback Manager Implementation
 
@@ -80,10 +83,10 @@ public actor DefaultCallbackManager: DestinationCallbackManager {
     ///   - callback: Callback to invoke with (decrypted data, original packet)
     public func registerAsync(destinationHash: Data, callback: @escaping PacketCallback) async {
         let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        print("[LXMF_INBOUND] registerAsync: registering callback for \(destHex)")
+        logger.debug("registerAsync: registering callback for \(destHex)")
         registerInternal(destinationHash: destinationHash, callback: callback)
         let count = closureCallbacks[destinationHash]?.count ?? 0
-        print("[LXMF_INBOUND] registerAsync: callback registered, count=\(count)")
+        logger.debug("registerAsync: callback registered, count=\(count)")
     }
 
     /// Create an AsyncStream for receiving packets to a destination.
@@ -138,27 +141,27 @@ public actor DefaultCallbackManager: DestinationCallbackManager {
     public func deliver(data: Data, packet: Packet, to destinationHash: Data) {
         let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         let registeredKeys = closureCallbacks.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
-        print("[LXMF_INBOUND] DefaultCallbackManager.deliver(): destHash=\(destHex), dataLen=\(data.count)")
-        print("[LXMF_INBOUND] Registered callback keys: \(registeredKeys)")
+        logger.debug("deliver(): destHash=\(destHex), dataLen=\(data.count)")
+        logger.debug("Registered callback keys: \(registeredKeys)")
 
         // Invoke all closure callbacks
         if let callbacks = closureCallbacks[destinationHash] {
-            print("[LXMF_INBOUND] Found \(callbacks.count) callback(s) for \(destHex), invoking...")
+            logger.debug("Found \(callbacks.count) callback(s) for \(destHex), invoking...")
             for (index, callback) in callbacks.enumerated() {
-                print("[LXMF_INBOUND] Invoking callback \(index)")
+                logger.debug("Invoking callback \(index)")
                 callback(data, packet)
-                print("[LXMF_INBOUND] Callback \(index) returned")
+                logger.debug("Callback \(index) returned")
             }
         } else {
-            print("[LXMF_INBOUND] NO callbacks registered for \(destHex)!")
+            logger.warning("NO callbacks registered for \(destHex)!")
         }
 
         // Yield to AsyncStream if active
         if let continuation = streamContinuations[destinationHash] {
-            print("[LXMF_INBOUND] Yielding to AsyncStream for \(destHex)")
+            logger.debug("Yielding to AsyncStream for \(destHex)")
             continuation.yield((data, packet))
         } else {
-            print("[LXMF_INBOUND] No AsyncStream for \(destHex)")
+            logger.debug("No AsyncStream for \(destHex)")
         }
     }
 

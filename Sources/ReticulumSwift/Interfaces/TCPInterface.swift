@@ -7,6 +7,9 @@
 //
 
 import Foundation
+import os.log
+
+private let logger = Logger(subsystem: "net.reticulum", category: "TCPInterface")
 
 // MARK: - TCPInterface
 
@@ -239,7 +242,7 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
     /// Handle received data from transport.
     private func handleDataReceived(_ data: Data) {
         let hexDump = data.prefix(20).map { String(format: "%02x", $0) }.joined()
-        print("[TCPINTERFACE] handleDataReceived: \(data.count) bytes: \(hexDump)")
+        logger.debug("handleDataReceived: \(data.count, privacy: .public) bytes: \(hexDump, privacy: .public)")
 
         bytesReceived += UInt64(data.count)
         notifyPacketReceived(data)

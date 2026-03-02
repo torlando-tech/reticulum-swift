@@ -10,6 +10,9 @@
 
 import Foundation
 import CryptoKit
+import os.log
+
+private let logger = Logger(subsystem: "net.reticulum", category: "Resource")
 
 // MARK: - Resource
 
@@ -490,7 +493,7 @@ public actor Resource {
 
         if segmentStartPart < currentCoverage {
             // Duplicate HMU for a segment we already have — ignore
-            print("[RESOURCE_HMU] Ignoring duplicate segment \(wireSegment) (coverage=\(currentCoverage))")
+            logger.debug("Ignoring duplicate HMU segment \(wireSegment) (coverage=\(currentCoverage))")
             waitingForHMU = false
             if state == .transferring {
                 try? await requestNextParts()
@@ -500,7 +503,7 @@ public actor Resource {
 
         if segmentStartPart > currentCoverage {
             // Gap detected — segment is ahead of our current position
-            print("[RESOURCE_HMU] Warning: segment \(wireSegment) starts at part \(segmentStartPart) but coverage is \(currentCoverage)")
+            logger.warning("HMU segment \(wireSegment) starts at part \(segmentStartPart) but coverage is \(currentCoverage)")
         }
 
         if var existing = hashmap {

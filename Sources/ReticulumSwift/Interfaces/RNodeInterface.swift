@@ -290,13 +290,13 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
                 try await setRadioState(RNodeConstants.RADIO_STATE_OFF)
             } catch {
                 // Don't fail disconnect if RNode is already gone
-                print("[RNodeInterface] Failed to turn radio off during disconnect: \(error.localizedDescription)")
+                logger.warning("Failed to turn radio off during disconnect: \(error.localizedDescription, privacy: .public)")
             }
             do {
                 try await sendKISSCommand(RNodeConstants.CMD_LEAVE, payload: Data([0xFF]))
             } catch {
                 // Don't fail disconnect if RNode is already gone
-                print("[RNodeInterface] Failed to send LEAVE command during disconnect: \(error.localizedDescription)")
+                logger.warning("Failed to send LEAVE command during disconnect: \(error.localizedDescription, privacy: .public)")
             }
         }
 
@@ -619,8 +619,7 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         let bytesPerLine = 8
         let lineCount = imageData.count / bytesPerLine
 
-        logger.error("[RNODE] FB: writing \(lineCount, privacy: .public) lines to framebuffer")
-        fbLog("FB: writing \(lineCount) lines")
+        logger.debug("[RNODE] FB: writing \(lineCount, privacy: .public) lines to framebuffer")
 
         for line in 0..<lineCount {
             let lineStart = line * bytesPerLine
@@ -631,35 +630,13 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
             try await sendKISSCommand(RNodeConstants.CMD_FB_WRITE, payload: payload)
         }
 
-        logger.error("[RNODE] FB: all \(lineCount, privacy: .public) lines queued, sending CMD_FB_EXT")
-        fbLog("FB: \(lineCount) lines queued, sending CMD_FB_EXT(0x01)")
+        logger.debug("[RNODE] FB: all \(lineCount, privacy: .public) lines queued, sending CMD_FB_EXT")
 
         // Enable external framebuffer mode (shows our image instead of RNode's default UI).
         // CoreBluetooth FIFO ordering guarantees this arrives after all 64 CMD_FB_WRITE frames.
         try await sendKISSCommand(RNodeConstants.CMD_FB_EXT, payload: Data([0x01]))
 
-        logger.error("[RNODE] FB: CMD_FB_EXT sent OK")
-        fbLog("FB: CMD_FB_EXT sent OK ✓")
-    }
-
-    /// Append a timestamped message to the framebuffer debug log file.
-    ///
-    /// Writes to /tmp/columba_rnode_fb.txt so diagnostics can be read
-    /// without needing to capture syslog from the start of the session.
-    private func fbLog(_ message: String) {
-        let timestamp = Date().timeIntervalSince1970
-        let line = "[\(String(format: "%.3f", timestamp))] \(message)\n"
-        let path = "/tmp/columba_rnode_fb.txt"
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: path),
-               let handle = FileHandle(forWritingAtPath: path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            } else {
-                try? data.write(to: URL(fileURLWithPath: path))
-            }
-        }
+        logger.debug("[RNODE] FB: CMD_FB_EXT sent OK")
     }
 
     /// Reset all radio echo state variables.
@@ -1026,7 +1003,7 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
 
         default:
             // Unknown command
-            print("[RNodeInterface] Unknown command: 0x\(String(format: "%02X", command))")
+            logger.debug("Unknown command: 0x\(String(format: "%02X", command), privacy: .public)")
         }
     }
 
@@ -1050,7 +1027,7 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         guard payload.count >= 2 else { return }
         majVersion = payload[0]
         minVersion = payload[1]
-        print("[RNodeInterface] Firmware version: \(majVersion).\(minVersion)")
+        logger.info("Firmware version: \(self.majVersion, privacy: .public).\(self.minVersion, privacy: .public)")
     }
 
     private func handleCmdPlatform(_ payload: Data) {
@@ -1185,11 +1162,11 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
 
         case RNodeConstants.ERROR_MEMORY_LOW:
             // Log only
-            print("[RNodeInterface] Warning: RNode memory low")
+            logger.warning("RNode memory low")
 
         case RNodeConstants.ERROR_MODEM_TIMEOUT:
             // Log only
-            print("[RNodeInterface] Warning: RNode modem timeout")
+            logger.warning("RNode modem timeout")
 
         case RNodeConstants.ERROR_INVALID_CONFIG:
             lastErrorDescription = "Invalid configuration — TX power may exceed device limits"
@@ -1206,7 +1183,7 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         guard !payload.isEmpty else { return }
         // ESP32 reset detection (Python line 1127-1131)
         if payload[0] == 0xF8 && platform == RNodeConstants.PLATFORM_ESP32 && online {
-            print("[RNodeInterface] ESP32 reset detected, triggering reconnection")
+            logger.warning("ESP32 reset detected, triggering reconnection")
             Task { await startReconnectLoop() }
         }
     }
@@ -1225,7 +1202,7 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
                     try await self?.send(data)
                 } catch {
                     // Log send failure for queued packet
-                    print("[RNodeInterface] Failed to send queued packet: \(error.localizedDescription)")
+                    self?.logger.error("Failed to send queued packet: \(error.localizedDescription, privacy: .public)")
                 }
             }
         } else {
