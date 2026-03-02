@@ -250,13 +250,24 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
             discoveredPeripherals.removeAll()
             subscribedCentrals.removeAll()
             centralConnections.removeAll()
+
+            // Remove service so the next driver can add it fresh
+            peripheralManager.removeAllServices()
         }
 
         discoveredPeersContinuation?.finish()
         incomingConnectionsContinuation?.finish()
         connectionLostContinuation?.finish()
 
+        // Release managers so CoreBluetooth can clean up before a new driver
+        // creates fresh ones. Without this, the new driver's CBCentralManager
+        // sees a "resetting" state while the old one is still being torn down.
+        centralManager.delegate = nil
+        peripheralManager.delegate = nil
+
         lock.lock()
+        centralReady = false
+        peripheralReady = false
         _isRunning = false
         lock.unlock()
 
