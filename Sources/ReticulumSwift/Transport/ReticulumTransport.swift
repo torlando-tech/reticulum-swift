@@ -3441,7 +3441,7 @@ extension ReticulumTransport {
     }
 
     /// Internal handler for received data (actor-isolated).
-    func handleReceivedData(data: Data, from interfaceId: String) {
+    public func handleReceivedData(data: Data, from interfaceId: String) {
         let hexDump = data.prefix(30).map { String(format: "%02x", $0) }.joined()
         print("[PACKET_RECV] ===== PACKET RECEIVED =====")
         print("[PACKET_RECV] \(data.count) bytes from interface \(interfaceId)")
