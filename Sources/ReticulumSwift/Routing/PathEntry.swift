@@ -250,11 +250,11 @@ public struct PathEntry: Codable, Sendable, Equatable {
             }
         }
 
-        // Try NomadNet format: 97 (fixarray 7) with name in bin8 near the end
-        // Format: 97 c2 ce... c3 cd... cd... 93... 81 01 c4 XX <name>
+        // Propagation node format: 97 (fixarray 7) with name in element[6] metadata dict
+        // Element[6] is a msgpack map with key 0x01 (PN_META_NAME) → name bytes
+        // Reference: Python LXMF.py pn_name_from_app_data()
         if data.count >= 10 && data[0] == 0x97 {  // msgpack fixarray with 7 elements
-            // Scan for the last bin8 (c4) which typically contains the name
-            if let name = findLastBin8String(in: data) {
+            if let name = extractPropagationNodeName(from: data) {
                 return name
             }
         }
@@ -294,24 +294,182 @@ public struct PathEntry: Codable, Sendable, Equatable {
         return nil
     }
 
-    /// Find the last bin8 string in the data (used for NomadNet format).
-    private func findLastBin8String(in data: Data) -> String? {
-        // Scan backwards looking for c4 (bin8) marker
-        var i = data.count - 2
-        while i >= 1 {
-            if data[i] == 0xc4 {
-                let length = Int(data[i + 1])
-                if i + 2 + length <= data.count {
-                    let stringData = data[(i + 2)..<(i + 2 + length)]
-                    if let str = String(data: stringData, encoding: .utf8),
-                       str.allSatisfy({ $0.isLetter || $0.isNumber || $0.isPunctuation || $0.isWhitespace || $0 == "/" || $0 == "_" || $0 == "-" }) {
-                        return str
-                    }
-                }
-            }
-            i -= 1
+    /// Extract propagation node display name from 7-element msgpack appData.
+    ///
+    /// Skips elements [0]-[5] to reach element[6] (metadata dict),
+    /// then looks for key 0x01 (PN_META_NAME) and decodes its value as UTF-8.
+    private func extractPropagationNodeName(from data: Data) -> String? {
+        var offset = 1 // skip 0x97 array header
+
+        // Skip elements [0] through [5]
+        for _ in 0..<6 {
+            guard skipMsgpackElement(in: data, offset: &offset) else { return nil }
         }
+
+        // Element [6] should be a map — parse it to find key 0x01
+        guard offset < data.count else { return nil }
+        let mapByte = data[offset]
+        let mapCount: Int
+
+        if mapByte >= 0x80 && mapByte <= 0x8f {
+            // fixmap
+            mapCount = Int(mapByte & 0x0f)
+            offset += 1
+        } else if mapByte == 0xde && offset + 2 < data.count {
+            // map16
+            mapCount = Int(data[offset + 1]) << 8 | Int(data[offset + 2])
+            offset += 3
+        } else {
+            return nil
+        }
+
+        // Iterate map entries looking for key 0x01 (PN_META_NAME)
+        for _ in 0..<mapCount {
+            guard offset < data.count else { return nil }
+            let keyByte = data[offset]
+
+            // Check if key is uint 0x01 (positive fixint)
+            let isNameKey = keyByte == 0x01
+            guard skipMsgpackElement(in: data, offset: &offset) else { return nil }
+
+            if isNameKey {
+                // Value is the name — extract as string
+                return extractMsgpackString(from: data, startingAt: offset)
+            }
+
+            // Skip the value
+            guard skipMsgpackElement(in: data, offset: &offset) else { return nil }
+        }
+
         return nil
+    }
+
+    /// Skip one complete msgpack element, advancing offset past it.
+    /// Returns false if the data is malformed or truncated.
+    private func skipMsgpackElement(in data: Data, offset: inout Int) -> Bool {
+        guard offset < data.count else { return false }
+        let byte = data[offset]
+        offset += 1
+
+        // Positive fixint (0x00-0x7f) — already consumed
+        if byte <= 0x7f { return true }
+
+        // Fixmap (0x80-0x8f)
+        if byte >= 0x80 && byte <= 0x8f {
+            let count = Int(byte & 0x0f)
+            for _ in 0..<(count * 2) { // key + value pairs
+                guard skipMsgpackElement(in: data, offset: &offset) else { return false }
+            }
+            return true
+        }
+
+        // Fixarray (0x90-0x9f)
+        if byte >= 0x90 && byte <= 0x9f {
+            let count = Int(byte & 0x0f)
+            for _ in 0..<count {
+                guard skipMsgpackElement(in: data, offset: &offset) else { return false }
+            }
+            return true
+        }
+
+        // Fixstr (0xa0-0xbf)
+        if byte >= 0xa0 && byte <= 0xbf {
+            let length = Int(byte & 0x1f)
+            offset += length
+            return offset <= data.count
+        }
+
+        // Negative fixint (0xe0-0xff) — already consumed
+        if byte >= 0xe0 { return true }
+
+        switch byte {
+        case 0xc0, 0xc2, 0xc3: // nil, false, true
+            return true
+        case 0xc4: // bin8
+            guard offset < data.count else { return false }
+            let len = Int(data[offset])
+            offset += 1 + len
+            return offset <= data.count
+        case 0xc5: // bin16
+            guard offset + 2 <= data.count else { return false }
+            let len = Int(data[offset]) << 8 | Int(data[offset + 1])
+            offset += 2 + len
+            return offset <= data.count
+        case 0xc6: // bin32
+            guard offset + 4 <= data.count else { return false }
+            let len = Int(data[offset]) << 24 | Int(data[offset + 1]) << 16 | Int(data[offset + 2]) << 8 | Int(data[offset + 3])
+            offset += 4 + len
+            return offset <= data.count
+        case 0xca: // float32
+            offset += 4; return offset <= data.count
+        case 0xcb: // float64
+            offset += 8; return offset <= data.count
+        case 0xcc: // uint8
+            offset += 1; return offset <= data.count
+        case 0xcd: // uint16
+            offset += 2; return offset <= data.count
+        case 0xce: // uint32
+            offset += 4; return offset <= data.count
+        case 0xcf: // uint64
+            offset += 8; return offset <= data.count
+        case 0xd0: // int8
+            offset += 1; return offset <= data.count
+        case 0xd1: // int16
+            offset += 2; return offset <= data.count
+        case 0xd2: // int32
+            offset += 4; return offset <= data.count
+        case 0xd3: // int64
+            offset += 8; return offset <= data.count
+        case 0xd9: // str8
+            guard offset < data.count else { return false }
+            let len = Int(data[offset])
+            offset += 1 + len
+            return offset <= data.count
+        case 0xda: // str16
+            guard offset + 2 <= data.count else { return false }
+            let len = Int(data[offset]) << 8 | Int(data[offset + 1])
+            offset += 2 + len
+            return offset <= data.count
+        case 0xdb: // str32
+            guard offset + 4 <= data.count else { return false }
+            let len = Int(data[offset]) << 24 | Int(data[offset + 1]) << 16 | Int(data[offset + 2]) << 8 | Int(data[offset + 3])
+            offset += 4 + len
+            return offset <= data.count
+        case 0xdc: // array16
+            guard offset + 2 <= data.count else { return false }
+            let count = Int(data[offset]) << 8 | Int(data[offset + 1])
+            offset += 2
+            for _ in 0..<count {
+                guard skipMsgpackElement(in: data, offset: &offset) else { return false }
+            }
+            return true
+        case 0xdd: // array32
+            guard offset + 4 <= data.count else { return false }
+            let count = Int(data[offset]) << 24 | Int(data[offset + 1]) << 16 | Int(data[offset + 2]) << 8 | Int(data[offset + 3])
+            offset += 4
+            for _ in 0..<count {
+                guard skipMsgpackElement(in: data, offset: &offset) else { return false }
+            }
+            return true
+        case 0xde: // map16
+            guard offset + 2 <= data.count else { return false }
+            let count = Int(data[offset]) << 8 | Int(data[offset + 1])
+            offset += 2
+            for _ in 0..<(count * 2) {
+                guard skipMsgpackElement(in: data, offset: &offset) else { return false }
+            }
+            return true
+        case 0xdf: // map32
+            guard offset + 4 <= data.count else { return false }
+            let count = Int(data[offset]) << 24 | Int(data[offset + 1]) << 16 | Int(data[offset + 2]) << 8 | Int(data[offset + 3])
+            offset += 4
+            for _ in 0..<(count * 2) {
+                guard skipMsgpackElement(in: data, offset: &offset) else { return false }
+            }
+            return true
+        default:
+            return false
+        }
     }
 
     // MARK: - Initialization
