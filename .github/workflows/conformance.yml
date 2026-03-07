@@ -1,0 +1,62 @@
+name: Conformance Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: Conformance (Swift)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: reticulum-swift-lib
+
+      - uses: actions/checkout@v4
+        with:
+          repository: torlando-tech/reticulum-conformance
+          path: reticulum-conformance
+          token: ${{ secrets.CONFORMANCE_PAT }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: markqvist/Reticulum
+          path: Reticulum
+
+      - uses: actions/checkout@v4
+        with:
+          repository: markqvist/LXMF
+          path: LXMF
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm/
+          key: spm-conformance-${{ hashFiles('reticulum-conformance/impls/swift/Package.swift') }}
+
+      - name: Build Swift bridge
+        working-directory: reticulum-conformance/impls/swift
+        run: swift build -c release
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pytest
+
+      - name: Run conformance tests
+        working-directory: reticulum-conformance
+        env:
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+          PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
+        run: python3 -m pytest tests/ --impl=swift -v --tb=short
