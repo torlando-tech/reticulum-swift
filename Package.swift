@@ -36,6 +36,11 @@ let package = Package(
             dependencies: ["ReticulumSwift", "CryptoSwift"],
             path: "Sources/ConformanceBridge"
         ),
+        .executableTarget(
+            name: "PipePeer",
+            dependencies: ["ReticulumSwift"],
+            path: "Sources/PipePeer"
+        ),
         .testTarget(
             name: "ReticulumSwiftTests",
             dependencies: ["ReticulumSwift"],
