@@ -31,6 +31,11 @@ let package = Package(
             dependencies: ["CryptoSwift", "CBZ2", "CEd25519"],
             path: "Sources/ReticulumSwift"
         ),
+        .executableTarget(
+            name: "ConformanceBridge",
+            dependencies: ["ReticulumSwift", "CryptoSwift"],
+            path: "Sources/ConformanceBridge"
+        ),
         .testTarget(
             name: "ReticulumSwiftTests",
             dependencies: ["ReticulumSwift"],
