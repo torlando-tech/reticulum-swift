@@ -44,8 +44,8 @@ jobs:
           path: ~/Library/Caches/org.swift.swiftpm/
           key: spm-conformance-${{ hashFiles('reticulum-swift-lib/Package.swift') }}
 
-      - name: Build conformance bridge
-        run: swift build -c release --product ConformanceBridge
+      - name: Build conformance bridge and pipe peer
+        run: swift build -c release --product ConformanceBridge --product PipePeer
         working-directory: reticulum-swift-lib
 
       - uses: actions/setup-python@v5
@@ -61,3 +61,11 @@ jobs:
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
         run: python3 -m pytest tests/ --impl=swift -v --tb=short
+
+      - name: Run integration tests (IFAC pipe)
+        working-directory: reticulum-conformance
+        env:
+          PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
+        run: >-
+          python3 -m pytest integration/ -v --tb=short
+          --peer-cmd=${{ github.workspace }}/reticulum-swift-lib/.build/release/PipePeer
