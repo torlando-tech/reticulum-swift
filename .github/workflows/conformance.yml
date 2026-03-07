@@ -42,11 +42,11 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/Library/Caches/org.swift.swiftpm/
-          key: spm-conformance-${{ hashFiles('reticulum-conformance/impls/swift/Package.swift') }}
+          key: spm-conformance-${{ hashFiles('reticulum-swift-lib/Package.swift') }}
 
-      - name: Build Swift bridge
-        working-directory: reticulum-conformance/impls/swift
-        run: swift build -c release
+      - name: Build conformance bridge
+        run: swift build -c release --product ConformanceBridge
+        working-directory: reticulum-swift-lib
 
       - uses: actions/setup-python@v5
         with:
@@ -57,6 +57,7 @@ jobs:
       - name: Run conformance tests
         working-directory: reticulum-conformance
         env:
+          CONFORMANCE_BRIDGE_CMD: ${{ github.workspace }}/reticulum-swift-lib/.build/release/ConformanceBridge
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
         run: python3 -m pytest tests/ --impl=swift -v --tb=short

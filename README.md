@@ -1,5 +1,8 @@
 # ReticulumSwift
 
+[![CI](https://github.com/torlando-tech/reticulum-swift-lib/actions/workflows/ci.yml/badge.svg)](https://github.com/torlando-tech/reticulum-swift-lib/actions/workflows/ci.yml)
+[![Conformance](https://github.com/torlando-tech/reticulum-swift-lib/actions/workflows/conformance.yml/badge.svg)](https://github.com/torlando-tech/reticulum-swift-lib/actions/workflows/conformance.yml)
+
 A Swift implementation of the [Reticulum](https://reticulum.network) cryptographic networking stack. Provides encrypted, identity-based peer-to-peer communication over TCP, BLE, AutoInterface, and RNode radio interfaces.
 
 Designed for interoperability with the [Python reference implementation](https://github.com/markqvist/Reticulum).
