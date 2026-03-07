@@ -45,8 +45,10 @@ jobs:
           key: spm-conformance-${{ hashFiles('reticulum-swift-lib/Package.swift') }}
 
       - name: Build conformance bridge and pipe peer
-        run: swift build -c release --product ConformanceBridge --product PipePeer
         working-directory: reticulum-swift-lib
+        run: |
+          swift build -c release --product ConformanceBridge
+          swift build -c release --product PipePeer
 
       - uses: actions/setup-python@v5
         with:
