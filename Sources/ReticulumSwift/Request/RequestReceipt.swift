@@ -153,7 +153,7 @@ public actor RequestReceipt {
         self.failedCallback = failedCallback
         self.progressCallback = progressCallback
 
-        startTimeoutMonitor()
+        Task { [self] in await startTimeoutMonitor() }
     }
 
     // MARK: - Response Handling

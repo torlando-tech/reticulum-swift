@@ -120,15 +120,14 @@ public actor PathTable {
                 throw PathTableError.databaseError("Failed to create table: \(error)")
             }
 
-            // Migrate old schema: rename random_blob → random_blobs if needed
-            migrateRandomBlobColumn()
-
-            // Add announce_data column if missing (migration for existing databases)
-            migrateAnnounceDataColumn()
-
-            // Load existing paths into memory
-            loadFromDatabase()
-            logger.info("Loaded \(self.paths.count) paths from database: \(dbPath)")
+            // Migrate and load in a Task to satisfy actor isolation
+            Task { [self] in
+                await migrateRandomBlobColumn()
+                await migrateAnnounceDataColumn()
+                await loadFromDatabase()
+                let pathCount = await self.paths.count
+                logger.info("Loaded \(pathCount) paths from database: \(dbPath)")
+            }
         }
     }
 
@@ -383,7 +382,7 @@ public actor PathTable {
 
         // Re-insert with wrapped blobs
         for row in oldRows {
-            let blobsJson = Self.encodeRandomBlobs([row.randomBlob])
+            _ = Self.encodeRandomBlobs([row.randomBlob])
             let entry = PathEntry(
                 destinationHash: row.destHash,
                 publicKeys: row.pubKeys,
@@ -550,10 +549,10 @@ public actor PathTable {
         }
         defer { sqlite3_finalize(stmt) }
 
-        entry.destinationHash.withUnsafeBytes { ptr in
+        _ = entry.destinationHash.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(entry.destinationHash.count), nil)
         }
-        entry.publicKeys.withUnsafeBytes { ptr in
+        _ = entry.publicKeys.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(entry.publicKeys.count), nil)
         }
         sqlite3_bind_text(stmt, 3, entry.interfaceId, -1, nil)
@@ -566,7 +565,7 @@ public actor PathTable {
         sqlite3_bind_text(stmt, 7, blobsJson, -1, nil)
 
         if let ratchet = entry.ratchet {
-            ratchet.withUnsafeBytes { ptr in
+            _ = ratchet.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 8, ptr.baseAddress, Int32(ratchet.count), nil)
             }
         } else {
@@ -574,7 +573,7 @@ public actor PathTable {
         }
 
         if let appData = entry.appData {
-            appData.withUnsafeBytes { ptr in
+            _ = appData.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 9, ptr.baseAddress, Int32(appData.count), nil)
             }
         } else {
@@ -582,7 +581,7 @@ public actor PathTable {
         }
 
         if let nextHop = entry.nextHop {
-            nextHop.withUnsafeBytes { ptr in
+            _ = nextHop.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 10, ptr.baseAddress, Int32(nextHop.count), nil)
             }
         } else {
@@ -590,7 +589,7 @@ public actor PathTable {
         }
 
         if let announceData = entry.announceData {
-            announceData.withUnsafeBytes { ptr in
+            _ = announceData.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 11, ptr.baseAddress, Int32(announceData.count), nil)
             }
         } else {
@@ -612,7 +611,7 @@ public actor PathTable {
         guard sqlite3_prepare_v2(db, deleteSQL, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
 
-        destinationHash.withUnsafeBytes { ptr in
+        _ = destinationHash.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(destinationHash.count), nil)
         }
 
