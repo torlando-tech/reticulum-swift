@@ -121,7 +121,7 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
     }
 
     public func disconnect() async {
-        await detach()
+        detach()
     }
 
     public func send(_ data: Data) async throws {

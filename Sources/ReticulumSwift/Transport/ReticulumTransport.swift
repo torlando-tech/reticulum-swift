@@ -482,11 +482,11 @@ public actor ReticulumTransport {
     public func getInterfaceName(for interfaceId: String) async -> String? {
         if let iface = interfaces[interfaceId] {
             if let peer = iface as? AutoInterfacePeer {
-                let addr = await peer.peerAddress
+                let addr = peer.peerAddress
                 return "AutoInterface [\(addr)]"
             }
             if let blePeer = iface as? BLEPeerInterface {
-                let identityHex = await blePeer.peerIdentityHex
+                let identityHex = blePeer.peerIdentityHex
                 return "BLE [\(identityHex.prefix(8))]"
             }
             let config = iface.config
@@ -515,7 +515,7 @@ public actor ReticulumTransport {
     public func getInterfaceSnapshots() async -> [InterfaceSnapshot] {
         var snapshots: [InterfaceSnapshot] = []
         for (_, iface) in interfaces {
-            let state = await iface.state
+            let state = iface.state
             let config = iface.config
             // Get error description from TCPInterface if available
             let errorDesc: String?
@@ -525,7 +525,7 @@ public actor ReticulumTransport {
                 errorDesc = nil
             }
             if let peer = iface as? AutoInterfacePeer {
-                let addr = await peer.peerAddress
+                let addr = peer.peerAddress
                 snapshots.append(InterfaceSnapshot(
                     id: iface.id,
                     name: config.name,
@@ -537,7 +537,7 @@ public actor ReticulumTransport {
                     lastErrorDescription: errorDesc
                 ))
             } else if let blePeer = iface as? BLEPeerInterface {
-                let identityHex = await blePeer.peerIdentityHex
+                let identityHex = blePeer.peerIdentityHex
                 snapshots.append(InterfaceSnapshot(
                     id: iface.id,
                     name: config.name,
@@ -648,7 +648,7 @@ public actor ReticulumTransport {
         guard let iface = interfaces[pathEntry.interfaceId] else {
             return nil
         }
-        return await iface.hwMtu
+        return iface.hwMtu
     }
 
     /// Initiate a link to a destination.
@@ -1337,7 +1337,7 @@ public actor ReticulumTransport {
             // No path available - queue packet and request path
             logger.info("No path to \(destHex)..., queuing packet")
             queuePendingPacket(packet, for: destHash)
-            try? await requestPath(for: destHash)
+            await requestPath(for: destHash)
             return  // Don't throw - packet is queued for later delivery
         }
 
@@ -1899,7 +1899,7 @@ public actor ReticulumTransport {
             logger.debug("LRRTT packet detected (context=0xFE)")
             // Only process if we're the responder and link is in handshake state
             let linkState = await link.state
-            let isInitiator = await link.initiator
+            let isInitiator = link.initiator
 
             if !isInitiator && linkState == .handshake {
                 logger.debug("Processing LRRTT for responder link")
@@ -3413,7 +3413,6 @@ public final class TransportDelegateWrapper: InterfaceDelegate, @unchecked Senda
         self.transport = transport
     }
 
-    @MainActor
     public func interface(id: String, didChangeState state: InterfaceState) {
         guard let transport = transport else { return }
         Task {
@@ -3421,7 +3420,6 @@ public final class TransportDelegateWrapper: InterfaceDelegate, @unchecked Senda
         }
     }
 
-    @MainActor
     public func interface(id: String, didReceivePacket data: Data) {
         guard let transport = transport else { return }
         Task {
@@ -3429,7 +3427,6 @@ public final class TransportDelegateWrapper: InterfaceDelegate, @unchecked Senda
         }
     }
 
-    @MainActor
     public func interface(id: String, didFailWithError error: Error) {
         guard let transport = transport else { return }
         Task {
