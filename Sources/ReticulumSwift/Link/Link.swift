@@ -1465,7 +1465,7 @@ public actor Link {
                     // deliver the assembled data as the request response.
                     // Python: packed_response = umsgpack.packb([request_id, response])
                     // The assembled data IS this msgpack blob.
-                    if let reqId = await resource.requestId {
+                    if let reqId = resource.requestId {
                         let reqHex = reqId.prefix(8).map { String(format: "%02x", $0) }.joined()
                         resourceDebugLog("DELIVER: response resource for request \(reqHex), data=\(assembledData.count)B")
                         linkLogger.info("Response resource complete for request \(reqHex, privacy: .public), data=\(assembledData.count, privacy: .public) bytes")
