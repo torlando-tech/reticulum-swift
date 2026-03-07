@@ -145,9 +145,7 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
             CBAdvertisementDataServiceUUIDsKey: [BLEMeshConstants.serviceUUID],
         ])
 
-        lock.lock()
-        _isRunning = true
-        lock.unlock()
+        lock.withLock { _isRunning = true }
 
         bleDiag("Advertising started for service \(BLEMeshConstants.serviceUUIDString)")
     }
@@ -212,13 +210,12 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
             // Timeout
             Task {
                 try? await Task.sleep(for: .seconds(BLEMeshConstants.connectionTimeout))
-                self.lock.lock()
-                if let cont = self.pendingConnect.removeValue(forKey: address) {
-                    self.lock.unlock()
+                let cont = self.lock.withLock {
+                    self.pendingConnect.removeValue(forKey: address)
+                }
+                if let cont {
                     cont.resume(throwing: InterfaceError.connectionFailed(underlying: "Connection timed out"))
                     self.centralManager.cancelPeripheralConnection(peripheral)
-                } else {
-                    self.lock.unlock()
                 }
             }
         }
