@@ -2490,14 +2490,20 @@ public actor ReticulumTransport {
                 }
 
                 // Apply AnnounceFilter per-outgoing-interface
-                let outgoingMode = interface.config.mode
-                let isLocal = isLocalDestination(action.destinationHash)
-                guard AnnounceFilter.shouldForward(
-                    outgoingMode: outgoingMode,
-                    sourceMode: sourceMode,
-                    isLocalDestination: isLocal
-                ) else {
-                    continue
+                // Python Transport.py:1041: announce filter only runs when
+                // attached_interface is None (broadcast). When attached_interface
+                // is set, it's a targeted response (e.g. path request reply)
+                // that bypasses filtering.
+                if action.attachedInterfaceId == nil {
+                    let outgoingMode = interface.config.mode
+                    let isLocal = isLocalDestination(action.destinationHash)
+                    guard AnnounceFilter.shouldForward(
+                        outgoingMode: outgoingMode,
+                        sourceMode: sourceMode,
+                        isLocalDestination: isLocal
+                    ) else {
+                        continue
+                    }
                 }
 
                 do {
