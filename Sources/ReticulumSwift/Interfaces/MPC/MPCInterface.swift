@@ -257,6 +257,21 @@ public actor MPCInterface: @preconcurrency NetworkInterface {
     func reportError(_ error: Error) {
         delegateRef?.delegate?.interface(id: id, didFailWithError: error)
     }
+
+    /// Handle advertiser failure — transition to disconnected if not already browsing successfully.
+    func handleAdvertiserFailed(_ error: Error) {
+        logger.error("MPC advertiser failed, disconnecting: \(error.localizedDescription, privacy: .public)")
+        delegateRef?.delegate?.interface(id: id, didFailWithError: error)
+        // If browsing is also not working, go disconnected
+        Task { await self.disconnect() }
+    }
+
+    /// Handle browser failure — transition to disconnected if not already advertising successfully.
+    func handleBrowserFailed(_ error: Error) {
+        logger.error("MPC browser failed, disconnecting: \(error.localizedDescription, privacy: .public)")
+        delegateRef?.delegate?.interface(id: id, didFailWithError: error)
+        Task { await self.disconnect() }
+    }
 }
 
 // MARK: - SessionHandler
@@ -371,9 +386,7 @@ private final class SessionHandler: NSObject,
         logger.error("MPC advertiser failed: \(error.localizedDescription, privacy: .public)")
         guard let interface = interface else { return }
         Task {
-            await interface.reportError(
-                InterfaceError.connectionFailed(underlying: error.localizedDescription)
-            )
+            await interface.handleAdvertiserFailed(error)
         }
     }
 
@@ -410,9 +423,7 @@ private final class SessionHandler: NSObject,
         logger.error("MPC browser failed: \(error.localizedDescription, privacy: .public)")
         guard let interface = interface else { return }
         Task {
-            await interface.reportError(
-                InterfaceError.connectionFailed(underlying: error.localizedDescription)
-            )
+            await interface.handleBrowserFailed(error)
         }
     }
 }
