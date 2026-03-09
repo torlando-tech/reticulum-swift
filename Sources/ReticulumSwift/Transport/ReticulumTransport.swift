@@ -439,6 +439,45 @@ public actor ReticulumTransport {
         logger.info("BLEInterface \(parentId, privacy: .public) connected")
     }
 
+    #if canImport(MultipeerConnectivity)
+    /// Add an MPCInterface with peer lifecycle management.
+    ///
+    /// MPCInterface spawns sub-interfaces for each connected Multipeer Connectivity peer.
+    /// This method registers the parent for state tracking and wires up
+    /// callbacks to add/remove child interfaces as peers connect/disconnect.
+    public func addMPCInterface(_ mpcInterface: MPCInterface) async throws {
+        let parentId = mpcInterface.id
+        logger.info("Adding MPCInterface: \(parentId, privacy: .public)")
+
+        // Register parent for state tracking
+        interfaces[parentId] = mpcInterface
+        let wrapper = TransportDelegateWrapper(transport: self)
+        delegateWrappers[parentId] = wrapper
+        await mpcInterface.setDelegate(wrapper)
+
+        // Wire peer lifecycle callbacks
+        await mpcInterface.setPeerCallbacks(
+            onPeerAdded: { [weak self] peer in
+                guard let self = self else { return }
+                Task {
+                    try? await self.addInterface(peer)
+                    await self.onInterfaceAdded?(peer.id)
+                }
+            },
+            onPeerRemoved: { [weak self] peerId in
+                guard let self = self else { return }
+                Task {
+                    await self.removeInterface(id: peerId)
+                }
+            }
+        )
+
+        // Start the interface (advertising + browsing begins)
+        try await mpcInterface.connect()
+        logger.info("MPCInterface \(parentId, privacy: .public) connected")
+    }
+    #endif
+
     /// Get an interface by ID.
     ///
     /// - Parameter id: Interface ID
@@ -507,6 +546,12 @@ public actor ReticulumTransport {
                 return "BLE [\(parts[2])]"
             }
             return "BLE Mesh"
+        }
+        if interfaceId.hasPrefix("tcp") {
+            return "TCP"
+        }
+        if interfaceId.hasPrefix("rnode") {
+            return "RNode"
         }
         return nil
     }
