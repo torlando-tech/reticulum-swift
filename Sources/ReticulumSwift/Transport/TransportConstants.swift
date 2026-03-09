@@ -72,9 +72,13 @@ public enum TransportConstants {
     /// Python reference: Transport.PATH_REQUEST_RG = 1.5
     public static let PATH_REQUEST_RG: TimeInterval = 1.5
 
-    /// Interface modes eligible for path discovery forwarding
-    /// Python reference: Transport.DISCOVER_PATHS_FOR
-    public static let DISCOVER_PATHS_FOR: [InterfaceMode] = [.accessPoint, .gateway, .roaming, .full]
+    /// Interface modes eligible for path discovery forwarding.
+    /// When a path request arrives on one of these interface modes and the path
+    /// is unknown, the transport node will forward the request on all other
+    /// interfaces to proactively discover the path.
+    /// Python reference: Interface.DISCOVER_PATHS_FOR = [MODE_ACCESS_POINT, MODE_GATEWAY, MODE_ROAMING]
+    /// Note: MODE_FULL is NOT included — full-mode interfaces do not trigger proactive discovery.
+    public static let DISCOVER_PATHS_FOR: [InterfaceMode] = [.accessPoint, .gateway, .roaming]
 
     // MARK: - Announce Queue (Transport.py:94-95)
 
