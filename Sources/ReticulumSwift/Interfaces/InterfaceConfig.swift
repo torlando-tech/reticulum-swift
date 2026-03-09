@@ -24,6 +24,7 @@ public enum InterfaceType: String, Codable, Sendable, Equatable {
     case autoInterface
     case rnode
     case ble
+    case multipeerConnectivity
 }
 
 // MARK: - Interface Configuration
