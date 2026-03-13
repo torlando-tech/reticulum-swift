@@ -1,0 +1,1 @@
+../../../../reticulum-kt/python-bridge/bridge_server.py

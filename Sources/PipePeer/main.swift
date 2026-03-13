@@ -13,6 +13,18 @@ func hexString(_ data: Data) -> String {
     data.map { String(format: "%02x", $0) }.joined()
 }
 
+func dataFromHex(_ hex: String) -> Data? {
+    var data = Data()
+    var hex = hex
+    while hex.count >= 2 {
+        let pair = String(hex.prefix(2))
+        hex = String(hex.dropFirst(2))
+        guard let byte = UInt8(pair, radix: 16) else { return nil }
+        data.append(byte)
+    }
+    return hex.isEmpty ? data : nil
+}
+
 func parseMode(_ str: String) -> InterfaceMode {
     switch str.lowercased() {
     case "ap", "access_point": return .accessPoint
@@ -114,6 +126,11 @@ Task {
 
         if enableTransport {
             await transport.setTransportEnabled(true)
+        }
+
+        // Register path request handler for transport nodes and destination_only
+        // (needed to respond to path requests for local destinations)
+        if enableTransport || action == "destination_only" {
             await transport.registerPathRequestHandler()
         }
 
@@ -144,6 +161,85 @@ Task {
 
         case "listen":
             break
+
+        case "destination_only":
+            // Create destination but do NOT announce it.
+            // When a path request arrives for this destination, Swift's
+            // handlePathRequest auto-responds with an announce (same as Python).
+            let identity = Identity()
+            let destination = Destination(
+                identity: identity,
+                appName: appName,
+                aspects: aspects,
+                type: .single,
+                direction: .in
+            )
+            await transport.registerDestination(destination)
+
+            emit([
+                "type": "destination_created",
+                "destination_hash": hexString(destination.hash),
+                "identity_hash": hexString(identity.hash),
+                "identity_public_key": hexString(identity.publicKeys),
+            ])
+
+            // Write hash to output file if specified
+            if let hashOutputFile = env["PIPE_PEER_HASH_OUTPUT_FILE"], !hashOutputFile.isEmpty {
+                try hexString(destination.hash).write(
+                    toFile: hashOutputFile, atomically: true, encoding: .utf8
+                )
+            }
+
+        case "path_request":
+            // Send a path request for a specific destination hash.
+            var destHashHex = env["PIPE_PEER_PATH_REQUEST_DEST"] ?? ""
+
+            if destHashHex.isEmpty {
+                // Poll a file for the destination hash
+                let destFile = env["PIPE_PEER_PATH_REQUEST_DEST_FILE"] ?? ""
+                if !destFile.isEmpty {
+                    emit(["type": "waiting_for_dest_file", "file": destFile])
+                    let deadline = Date().addingTimeInterval(30)
+                    while Date() < deadline {
+                        if FileManager.default.fileExists(atPath: destFile),
+                           let contents = try? String(contentsOfFile: destFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+                           !contents.isEmpty {
+                            destHashHex = contents
+                            break
+                        }
+                        try await Task.sleep(nanoseconds: 500_000_000)
+                    }
+                }
+            }
+
+            guard !destHashHex.isEmpty,
+                  let destHash = dataFromHex(destHashHex) else {
+                emit(["type": "error", "message": "No destination hash (set PIPE_PEER_PATH_REQUEST_DEST or PIPE_PEER_PATH_REQUEST_DEST_FILE)"])
+                break
+            }
+
+            emit(["type": "path_request_queued", "destination_hash": destHashHex])
+
+            // Wait a moment for the pipe to be fully connected
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+
+            // Send the path request and wait for result
+            let found = await transport.awaitPath(for: destHash, timeout: 20.0)
+
+            if found {
+                let pathTable = await transport.getPathTable()
+                let entry = await pathTable.lookup(destinationHash: destHash)
+                emit([
+                    "type": "path_discovered",
+                    "destination_hash": destHashHex,
+                    "hops": entry.map { Int($0.hopCount) } ?? -1,
+                ])
+            } else {
+                emit([
+                    "type": "path_not_found",
+                    "destination_hash": destHashHex,
+                ])
+            }
 
         default:
             emit(["type": "error", "message": "Unknown action: \(action)"])
