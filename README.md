@@ -1,7 +1,7 @@
 # ReticulumSwift
 
-[![CI](https://github.com/torlando-tech/reticulum-swift-lib/actions/workflows/ci.yml/badge.svg)](https://github.com/torlando-tech/reticulum-swift-lib/actions/workflows/ci.yml)
-[![Conformance](https://github.com/torlando-tech/reticulum-swift-lib/actions/workflows/conformance.yml/badge.svg)](https://github.com/torlando-tech/reticulum-swift-lib/actions/workflows/conformance.yml)
+[![CI](https://github.com/torlando-tech/reticulum-swift/actions/workflows/ci.yml/badge.svg)](https://github.com/torlando-tech/reticulum-swift/actions/workflows/ci.yml)
+[![Conformance](https://github.com/torlando-tech/reticulum-swift/actions/workflows/conformance.yml/badge.svg)](https://github.com/torlando-tech/reticulum-swift/actions/workflows/conformance.yml)
 
 A Swift implementation of the [Reticulum](https://reticulum.network) cryptographic networking stack. Provides encrypted, identity-based peer-to-peer communication over TCP, BLE, AutoInterface, and RNode radio interfaces.
 
@@ -63,3 +63,5 @@ await transport.announce(destination: dest)
 ## License
 
 [MPL-2.0](LICENSE)
+
+Copyright (c) 2026 Torlando Tech LLC
