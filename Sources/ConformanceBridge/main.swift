@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 Torlando Tech LLC
+
 import Foundation
 import ReticulumSwift
 import CryptoKit
@@ -1323,6 +1329,75 @@ func handleCommand(_ req: Request) throws -> Result {
             "valid": boolean(valid),
             "computed_ifac": hex(computedIfac)
         ]
+
+    case "ifac_mask_packet":
+        let ifacKey = try getHex(p, "ifac_key")
+        let raw = try getHex(p, "packet_data")
+        let ifacSize = getIntOptional(p, "ifac_size") ?? 16
+        // 1. Compute IFAC: Ed25519 sign(raw), take last ifac_size bytes
+        let ed25519Seed = Data(ifacKey[32..<64])
+        guard let signature = Ed25519Pure.sign(message: raw, seed: ed25519Seed) else {
+            throw BridgeError.invalidData("Ed25519 signing failed")
+        }
+        let ifac = Data(signature.suffix(ifacSize))
+        // 2-3. Set flag and insert IFAC after 2-byte header
+        var newRaw = Data([raw[0] | 0x80, raw[1]]) + ifac + raw[2...]
+        // 4. Generate mask
+        let mask = KeyDerivation.deriveKey(length: newRaw.count, inputKeyMaterial: ifac, salt: ifacKey, context: nil)
+        // 5. Apply mask: header and payload masked, IFAC bytes NOT masked
+        for i in 0..<newRaw.count {
+            if i == 0 {
+                newRaw[i] = newRaw[i] ^ mask[i] | 0x80
+            } else if i == 1 || i > ifacSize + 1 {
+                newRaw[i] = newRaw[i] ^ mask[i]
+            }
+            // else: IFAC bytes (2..2+ifacSize-1) not masked
+        }
+        return [
+            "masked_packet": hex(newRaw),
+            "ifac": hex(ifac),
+        ]
+
+    case "ifac_unmask_packet":
+        let ifacKey = try getHex(p, "ifac_key")
+        let masked = try getHex(p, "masked_packet")
+        let ifacSize = getIntOptional(p, "ifac_size") ?? 16
+        // 1. Check flag
+        guard masked[0] & 0x80 == 0x80 else {
+            return ["valid": boolean(false), "error": .string("ifac_flag_not_set")]
+        }
+        guard masked.count > 2 + ifacSize else {
+            return ["valid": boolean(false), "error": .string("packet_too_short")]
+        }
+        // 2. Extract IFAC (not masked)
+        let extractedIfac = Data(masked[2..<(2 + ifacSize)])
+        // 3. Generate mask
+        let unmaskMask = KeyDerivation.deriveKey(length: masked.count, inputKeyMaterial: extractedIfac, salt: ifacKey, context: nil)
+        // 4. Unmask
+        var unmasked = Data(count: masked.count)
+        for i in 0..<masked.count {
+            if i <= 1 || i > ifacSize + 1 {
+                unmasked[i] = masked[i] ^ unmaskMask[i]
+            } else {
+                unmasked[i] = masked[i]
+            }
+        }
+        // 5. Clear flag and remove IFAC
+        let recoveredRaw = Data([unmasked[0] & 0x7f, unmasked[1]]) + unmasked[(2 + ifacSize)...]
+        // 6. Validate
+        guard let verifySig = Ed25519Pure.sign(message: recoveredRaw, seed: Data(ifacKey[32..<64])) else {
+            throw BridgeError.invalidData("Ed25519 signing failed")
+        }
+        let expectedIfac = Data(verifySig.suffix(ifacSize))
+        let ifacValid = extractedIfac == expectedIfac
+        var unmaskResult: [String: JSONValue] = [
+            "valid": boolean(ifacValid),
+            "ifac": hex(extractedIfac),
+        ]
+        if ifacValid {
+            unmaskResult["packet_data"] = hex(recoveredRaw)
+        }
+        return unmaskResult
 
     // === 17. Compression ===
 
