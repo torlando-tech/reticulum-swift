@@ -47,7 +47,7 @@ Comparison with [Python RNS](https://github.com/markqvist/Reticulum) reference i
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Unit/integration tests | 421 methods | Across 34 test files |
+| Unit/integration tests | 421 methods | Across 33 test files |
 | Python interop tests | 79 methods | JSON bridge to Python RNS reference |
 | Conformance suite | CI workflow | Runs pytest against Python RNS weekly and on PRs |
 | ConformanceBridge | 89 commands | JSON RPC bridge covering crypto, framing, IFAC, announces, packets |
