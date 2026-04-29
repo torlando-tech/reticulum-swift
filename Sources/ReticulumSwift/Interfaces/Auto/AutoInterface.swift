@@ -141,6 +141,12 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
     /// VPN tunnel that does its own multicast).
     private var outboundHook: (@Sendable (Data) async -> Void)?
 
+    /// Reconnect task spawned by `endTunnelMode`. Held so a fast
+    /// follow-up `beginTunnelMode` can cancel it before it spawns
+    /// peer/announce jobs that would otherwise leak past the new
+    /// tunnel-mode entry.
+    private var pendingReconnectTask: Task<Void, Never>?
+
     // MARK: - Background Tasks
 
     private var announceTask: Task<Void, Never>?
@@ -331,6 +337,14 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
     ///   bytes (no framing — UDP preserves boundaries). Forwards e.g.
     ///   to a VPN extension via `sendProviderMessage`.
     public func beginTunnelMode(send hook: @escaping @Sendable (Data) async -> Void) async {
+        // Cancel any reconnect task left over from a recent
+        // `endTunnelMode`. Without this, a fast off→on toggle could
+        // let the previous warmup-sleep wake AFTER tunnel mode was
+        // re-entered and start peer/announce jobs that would orphan
+        // until the next teardown.
+        pendingReconnectTask?.cancel()
+        pendingReconnectTask = nil
+
         // Tear down local sockets / receive tasks WITHOUT firing a
         // .disconnected delegate transition. If we delegated to
         // `disconnect()` here it would notify the delegate twice
@@ -384,7 +398,11 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
         outboundHook = nil
         state = .disconnected
         delegateRef?.delegate?.interface(id: id, didChangeState: .disconnected)
-        Task { [weak self] in
+        // Cancel any earlier reconnect task before spawning a fresh
+        // one; otherwise a back-to-back endTunnelMode call could
+        // leave two competing connect() flows in flight.
+        pendingReconnectTask?.cancel()
+        pendingReconnectTask = Task { [weak self] in
             try? await self?.connect()
         }
     }
