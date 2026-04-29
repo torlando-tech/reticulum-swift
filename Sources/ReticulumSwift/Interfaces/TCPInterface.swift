@@ -257,8 +257,15 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
     public func endTunnelMode() async {
         outboundHook = nil
         autoReconnect = true
-        state = .disconnected
-        notifyStateChange()
+        // Match the lifecycle a normal cold `connect()` produces:
+        // `.disconnected` → `.connecting` → (eventually `.connected`
+        // via the transport's state callback). Without the
+        // `.connecting` notification, a delegate that key off
+        // intermediate state would see the interface flip straight
+        // from disconnected to connected and miss any "connection in
+        // progress" UI / routing prep.
+        await transitionState(to: .disconnected)
+        await transitionState(to: .connecting)
         await setupTransport()
     }
 

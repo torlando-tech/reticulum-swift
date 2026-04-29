@@ -331,16 +331,53 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
     ///   bytes (no framing — UDP preserves boundaries). Forwards e.g.
     ///   to a VPN extension via `sendProviderMessage`.
     public func beginTunnelMode(send hook: @escaping @Sendable (Data) async -> Void) async {
-        // Tear down local sockets / receive tasks. Reuses the existing
-        // disconnect path so we don't have to duplicate cleanup logic.
-        await disconnect()
+        // Tear down local sockets / receive tasks WITHOUT firing a
+        // .disconnected delegate transition. If we delegated to
+        // `disconnect()` here it would notify the delegate twice
+        // (.disconnected then immediately .connected), and any
+        // delegate that drops the interface from its routing table on
+        // .disconnected would create a window where outbound packets
+        // are dropped despite the tunnel being seamlessly active.
+        announceTask?.cancel()
+        peerJobsTask?.cancel()
+        for task in mcastReceiveTasks.values { task.cancel() }
+        for task in ucastReceiveTasks.values { task.cancel() }
+        for task in dataReceiveTasks.values { task.cancel() }
+        mcastReceiveTasks.removeAll()
+        ucastReceiveTasks.removeAll()
+        dataReceiveTasks.removeAll()
+
+        for (addr, peer) in spawnedInterfaces {
+            await peer.disconnect()
+            onPeerRemoved?(peer.id)
+            logger.info("Removed peer \(addr, privacy: .public)")
+        }
+        spawnedInterfaces.removeAll()
+        peers.removeAll()
+
+        for (_, fd) in multicastSockets { UDPSocketHelper.close(fd) }
+        for (_, fd) in unicastSockets { UDPSocketHelper.close(fd) }
+        for (_, fd) in dataSockets { UDPSocketHelper.close(fd) }
+        multicastSockets.removeAll()
+        unicastSockets.removeAll()
+        dataSockets.removeAll()
+        adoptedInterfaces.removeAll()
+        ownAddresses.removeAll()
 
         outboundHook = hook
+        let wasConnected = state == .connected
         state = .connected
-        delegateRef?.delegate?.interface(id: id, didChangeState: .connected)
+        if !wasConnected {
+            delegateRef?.delegate?.interface(id: id, didChangeState: .connected)
+        }
     }
 
     /// Exit tunnel mode and resume managing local UDP sockets directly.
+    ///
+    /// Notifies the delegate of the same `.disconnected` →
+    /// `.connecting` → `.connected` sequence that a normal cold
+    /// `connect()` would, so transport observers see a consistent
+    /// lifecycle.
     public func endTunnelMode() async {
         outboundHook = nil
         state = .disconnected
