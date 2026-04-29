@@ -374,15 +374,19 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
 
     /// Exit tunnel mode and resume managing local UDP sockets directly.
     ///
-    /// Notifies the delegate of the same `.disconnected` →
-    /// `.connecting` → `.connected` sequence that a normal cold
-    /// `connect()` would, so transport observers see a consistent
-    /// lifecycle.
+    /// Returns as soon as the delegate has been notified of the
+    /// `.disconnected` transition. Reconnection (which contains a
+    /// warmup `Task.sleep`) is kicked off in a detached task so the
+    /// caller — typically an `NEPacketTunnelProvider.stopTunnel`
+    /// handler that needs to complete promptly — isn't held up for
+    /// the multi-second warmup window.
     public func endTunnelMode() async {
         outboundHook = nil
         state = .disconnected
         delegateRef?.delegate?.interface(id: id, didChangeState: .disconnected)
-        try? await connect()
+        Task { [weak self] in
+            try? await self?.connect()
+        }
     }
 
     // MARK: - Socket Setup
