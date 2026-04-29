@@ -82,6 +82,16 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
     /// Current reconnection attempt (0 when not reconnecting)
     private var reconnectAttempt: Int = 0
 
+    /// Optional outbound hook installed via `beginTunnelMode(send:)`.
+    ///
+    /// When non-nil, `send(_:)` skips the local `FramedTransport` and
+    /// instead HDLC-frames the payload itself, then hands the framed
+    /// bytes to this hook. Used by clients that own a separate
+    /// transport channel (e.g. iOS Network Extension VPN tunnel) and
+    /// need outbound traffic to flow through that channel rather than
+    /// a duplicate `NWConnection` from this interface.
+    private var outboundHook: (@Sendable (Data) async -> Void)?
+
     /// Total bytes sent through this interface
     public private(set) var bytesSent: UInt64 = 0
 
@@ -173,6 +183,19 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
     /// - Throws: InterfaceError.notConnected if not in connected state
     /// - Throws: InterfaceError.sendFailed if transmission fails
     public func send(_ data: Data) async throws {
+        // Tunnel-mode short-circuit: if a host (e.g. iOS Network
+        // Extension manager) has installed an outbound hook, HDLC-frame
+        // the payload here and hand it off — the local NWConnection is
+        // bypassed entirely. State is forced to `.connected` while in
+        // tunnel mode so this branch can run even though the local
+        // FramedTransport is torn down.
+        if let hook = outboundHook {
+            let framed = HDLC.frame(data)
+            await hook(framed)
+            updateBytesSent(data.count)
+            return
+        }
+
         guard state == .connected, let transport = transport else {
             throw InterfaceError.notConnected
         }
@@ -189,6 +212,54 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
                 }
             }
         }
+    }
+
+    // MARK: - Tunnel Mode
+
+    /// Route outbound traffic through an external channel (e.g. an iOS
+    /// Network Extension packet tunnel) instead of this interface's own
+    /// `NWConnection`.
+    ///
+    /// Tears down any existing local transport, cancels reconnection,
+    /// installs `hook` as the outbound sink, and forces `state` to
+    /// `.connected` so the upstream Reticulum router treats the
+    /// interface as available for routing. Frames passed to `hook` are
+    /// already HDLC-framed.
+    ///
+    /// Reverse with `endTunnelMode()`.
+    ///
+    /// - Parameter hook: Closure that receives HDLC-framed bytes ready
+    ///   for the wire (e.g. forwards to a VPN extension via
+    ///   `sendProviderMessage`).
+    public func beginTunnelMode(send hook: @escaping @Sendable (Data) async -> Void) async {
+        autoReconnect = false
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectAttempt = 0
+
+        transport?.disconnect()
+        transport = nil
+
+        outboundHook = hook
+        let wasConnected = state == .connected
+        state = .connected
+        if !wasConnected {
+            notifyStateChange()
+        }
+    }
+
+    /// Exit tunnel mode and resume normal local-connection management.
+    ///
+    /// Removes the outbound hook, marks the interface disconnected, and
+    /// re-runs `setupTransport()` so the local `FramedTransport`
+    /// reconnects to the configured host. Call when the tunnel is
+    /// turned off so this interface owns its own socket again.
+    public func endTunnelMode() async {
+        outboundHook = nil
+        autoReconnect = true
+        state = .disconnected
+        notifyStateChange()
+        await setupTransport()
     }
 
     // MARK: - Private Methods
