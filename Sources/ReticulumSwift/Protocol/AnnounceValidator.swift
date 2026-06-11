@@ -181,6 +181,32 @@ public enum AnnounceValidator {
             throw AnnounceValidationError.signatureInvalid
         }
 
+        // Bind the destination hash to the announced identity.
+        //
+        // A valid signature only proves the announcer controls the signing key in
+        // `publicKeys` — it does NOT prove that the packet's destination_hash belongs
+        // to that identity. Without this check, an attacker can sign an announce with
+        // their own keys while setting destination_hash to a victim's address, causing
+        // the path table to map the victim's destination to attacker-controlled keys
+        // (transparent key substitution / MITM of all traffic to that destination).
+        //
+        // Reconstruct the expected hash exactly as Destination.hash / Python RNS
+        // Identity.validate_announce does:
+        //   identity_hash   = truncated_hash(public_keys)              (16 bytes)
+        //   expected_hash   = truncated_hash(name_hash || identity_hash)  (16 bytes)
+        // and reject the announce if it does not match the on-wire destination_hash.
+        let identityHash = Hashing.truncatedHash(publicKeys)
+        var hashMaterial = parsed.nameHash
+        hashMaterial.append(identityHash)
+        let expectedDestinationHash = Hashing.truncatedHash(hashMaterial)
+
+        guard expectedDestinationHash == parsed.destinationHash else {
+            let computedHex = expectedDestinationHash.map { String(format: "%02x", $0) }.joined()
+            let expectedHex = parsed.destinationHash.map { String(format: "%02x", $0) }.joined()
+            logger.warning("Announce destination hash does not bind to announced identity (computed=\(computedHex), header=\(expectedHex)) — rejecting")
+            throw AnnounceValidationError.hashMismatch(computed: computedHex, expected: expectedHex)
+        }
+
         // Reconstruct signed data
         // For ratcheted announces (hasContext=true): dest_hash || public_keys || name_hash || random_hash || ratchet [|| app_data]
         // For non-ratcheted announces: may use different format, try without dest_hash first
