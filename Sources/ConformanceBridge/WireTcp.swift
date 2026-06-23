@@ -63,6 +63,15 @@ final class WireInstance: @unchecked Sendable {
     // (reference/wire_tcp.py cmd_wire_resource_send / cmd_wire_resource_cancel).
     var outResources: [String: Resource] = [:]
 
+    // GROUP symmetric Token keys created/loaded by wire_group_create, keyed by
+    // the GROUP destination hash hex. Mirrors python wire_tcp.py inst["group_dests"]
+    // (cmd_wire_group_create :5286), but stores the raw 64-byte AES-256-CBC Token
+    // key rather than a Destination object (reticulum-swift Destination has no
+    // GROUP symmetric key slot — the GROUP path is RNS's Token directly, exactly
+    // as Ext+Destination.swift destination_group_encrypt does). Backs the sibling
+    // wire_group_encrypt / wire_group_decrypt commands.
+    var groupKeys: [String: Data] = [:]
+
     // MARK: Captured reticulum_config posture knobs
     //
     // RNS resolves these once at Reticulum.__init__ / __apply_config time and
