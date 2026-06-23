@@ -137,6 +137,7 @@ public actor AnnounceTable {
         attachedInterfaceId: String? = nil,
         isLocalClient: Bool = false,
         receivingInterfaceId: String? = nil,
+        pathRequestAnswer: Bool = false,
         extraDelay: TimeInterval = 0
     ) {
         let now = Date()
@@ -146,6 +147,18 @@ public actor AnnounceTable {
         if isLocalClient {
             // Local client announces are sent immediately but only once
             retransmitTimeout = now
+            retries = TransportConstants.PATHFINDER_R
+        } else if pathRequestAnswer {
+            // Answering a path request with a cached announce: the retransmit is
+            // scheduled at a *fixed* `now + extraDelay` with NO PATHFINDER_RW
+            // random window, and retries starts at PATHFINDER_R so the entry is
+            // rebroadcast exactly once then culled. `extraDelay` already carries
+            // the answering-context grace (0 for a local-client requestor,
+            // PATH_REQUEST_GRACE for FULL, +PATH_REQUEST_RG for ROAMING).
+            // Python Transport.py:2967-2987 (retransmit_timeout = now [+ GRACE
+            // [+ RG]]; retries = PATHFINDER_R) — distinct from the heard-announce
+            // reinsert at Transport.py:1871 which uses the random window.
+            retransmitTimeout = now.addingTimeInterval(extraDelay)
             retries = TransportConstants.PATHFINDER_R
         } else {
             // Random jitter before first retransmission, plus any extra delay (E6).

@@ -232,6 +232,13 @@ public actor ReticulumTransport {
     /// Registered local destinations by hash
     private var destinations: [Data: Destination] = [:]
 
+    /// Interface IDs that are local-client interfaces (shared-instance clients).
+    /// Mirrors Python `Transport.local_client_interfaces` (Transport.py:164).
+    /// A path request arriving on a local-client interface is answered
+    /// immediately (retransmit_timeout = now, no PATH_REQUEST_GRACE) per
+    /// Transport.py:2973-2974 / from_local_client().
+    private var localClientInterfaceIds: Set<String> = []
+
     /// Logger for transport events
     private let logger: Logger
 
@@ -498,6 +505,23 @@ public actor ReticulumTransport {
         await interface.disconnect()
         interfaces.removeValue(forKey: id)
         delegateWrappers.removeValue(forKey: id)
+        localClientInterfaceIds.remove(id)
+    }
+
+    /// Register an interface as a local-client interface (shared-instance
+    /// client connection). Mirrors appending to Python
+    /// `Transport.local_client_interfaces` (Transport.py:164, populated by
+    /// LocalInterface accept). Path requests arriving on such an interface
+    /// are answered immediately (see respondWithCachedPath).
+    public func markLocalClientInterface(id: String) {
+        localClientInterfaceIds.insert(id)
+    }
+
+    /// Whether `id` is a registered local-client interface.
+    /// Mirrors `packet.receiving_interface in Transport.local_client_interfaces`
+    /// (Transport.from_local_client, Transport.py:1479-1510).
+    func isLocalClientInterface(_ id: String) -> Bool {
+        localClientInterfaceIds.contains(id)
     }
 
     /// Add an AutoInterface with peer lifecycle management.
@@ -4200,9 +4224,21 @@ public actor ReticulumTransport {
             data: cachedData
         )
 
-        // E6: Capture interface mode before Task (actor-isolated)
+        // E6: Capture interface mode before Task (actor-isolated).
+        //
+        // The retransmit grace mirrors Python Transport.py:2973-2987 exactly:
+        //   - local-client requestor          -> now            (delay 0)
+        //   - FULL/other arrival              -> now + GRACE     (0.4s)
+        //   - ROAMING arrival                 -> now + GRACE+RG  (1.9s)
+        // and crucially NO PATHFINDER_RW random window is added — a path-request
+        // answer uses a *fixed* delay, unlike a heard-announce reinsert
+        // (Transport.py:1871). The `pathRequestAnswer` flag selects that fixed
+        // path in AnnounceTable.insert and sets retries = PATHFINDER_R (2968).
+        let isLocalClientRequest = attachedInterfaceId.map { isLocalClientInterface($0) } ?? false
         let isRoaming = attachedInterfaceId.flatMap { getInterfaceMode(for: $0) } == .roaming
-        let extraDelay = Self.PATH_REQUEST_GRACE + (isRoaming ? TransportConstants.PATH_REQUEST_RG : 0)
+        let extraDelay: TimeInterval = isLocalClientRequest
+            ? 0
+            : Self.PATH_REQUEST_GRACE + (isRoaming ? TransportConstants.PATH_REQUEST_RG : 0)
 
         Task { [weak self] in
             guard let self = self else { return }
@@ -4217,6 +4253,7 @@ public actor ReticulumTransport {
                 receivedFrom: destinationHash,
                 blockRebroadcasts: true,
                 attachedInterfaceId: attachedInterfaceId,
+                pathRequestAnswer: true,
                 extraDelay: extraDelay
             )
         }

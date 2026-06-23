@@ -260,6 +260,15 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         try blockingAsync {
             await transport.setTransportEnabled(enableTransport, identity: identity)
             await transport.startRetransmissionLoop()
+            // Register the RNS `rnstransport.path.request` callback so this
+            // behavioral peer answers injected path-request packets with cached
+            // announces (and forwards unknown-destination PRs). Without this the
+            // PLAIN `rnstransport/path/request` destination is never registered,
+            // so `deliverToLocalDestination` drops every injected PR packet and
+            // tests asserting on PR behaviour (test_path_request_tag_dedup,
+            // test_path_request_answer_grace_delays, ...) see {'found': False}.
+            // Mirrors wire_start_tcp_server (WireTcp.swift:471) and PipePeer.
+            await transport.registerPathRequestHandler()
         }
 
         let handle = Data((0..<8).map { _ in UInt8.random(in: 0...255) }).map { String(format: "%02x", $0) }.joined()
@@ -349,11 +358,20 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
             announceRatePenalty: announceRatePenalty
         )
 
+        // local_client marks this as a shared-instance client interface
+        // (Python Transport.local_client_interfaces). A path request arriving
+        // on it is answered immediately (no PATH_REQUEST_GRACE). Mirrors
+        // behavioral_transport.py attach_mock_interface(local_client=...).
+        let isLocalClient = getBoolOptional(p, "local_client") ?? false
+
         try blockingAsync {
             // addInterface caches the IFAC signing seed (ifacKey[32..64]) when the
             // config carries a 64-byte ifacKey + non-zero ifacSize, arming the
             // inbound IFAC gate and applyIFAC for this interface.
             try await inst.transport.addInterface(iface)
+            if isLocalClient {
+                await inst.transport.markLocalClientInterface(id: ifaceId)
+            }
         }
         inst.setInterface(iface, forId: ifaceId)
 
