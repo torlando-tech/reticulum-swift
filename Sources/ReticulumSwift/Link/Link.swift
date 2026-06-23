@@ -1140,6 +1140,40 @@ public actor Link {
         }
     }
 
+    /// Conformance-probe helper: run `processKeepalive` and report whether THIS
+    /// call advanced `lastInbound` / `lastDataAt`, measured atomically within a
+    /// single actor execution.
+    ///
+    /// `processKeepalive` is synchronous and this method takes no suspension point
+    /// between the before/after snapshots, so the live keepalive task or a real
+    /// inbound 0xFE echo from the peer cannot interleave and perturb the
+    /// measurement (the bridge previously compared timestamps captured across
+    /// separate `await` hops, which an interleaved inbound keepalive raced). Pure
+    /// observation: behaviour of `processKeepalive` itself is unchanged.
+    ///
+    /// Returns the initiator flag, whether each timestamp advanced, and the link
+    /// state before/after (for STALE→ACTIVE recovery observation).
+    public func probeKeepalive(_ data: Data)
+        -> (initiator: Bool, lastInboundAdvanced: Bool, lastDataAdvanced: Bool,
+            stateBefore: LinkState, stateAfter: LinkState) {
+        let inboundBefore = lastInbound
+        let dataBefore = lastDataAt
+        let stateBefore = state
+        processKeepalive(data)
+        let inboundAfter = lastInbound
+        let dataAfter = lastDataAt
+        let stateAfter = state
+        func advanced(_ b: Date?, _ a: Date?) -> Bool {
+            guard let a = a else { return false }
+            guard let b = b else { return true }
+            return a > b
+        }
+        return (initiator,
+                advanced(inboundBefore, inboundAfter),
+                advanced(dataBefore, dataAfter),
+                stateBefore, stateAfter)
+    }
+
     /// Stop keep-alive task.
     private func stopKeepalive() {
         keepaliveTask?.cancel()
