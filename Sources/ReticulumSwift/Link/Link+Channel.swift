@@ -33,6 +33,15 @@ extension Link {
         return ch
     }
 
+    /// Whether this link currently has an open Channel.
+    ///
+    /// Mirrors RNS's `if not self._channel` gate in the Link.receive CHANNEL
+    /// branch (Link.py:1166-1172): an inbound CHANNEL packet is only processed
+    /// (and proved) when the link has an open channel. RNS checks the underlying
+    /// `_channel` attribute directly (NOT the lazily-creating property), so this
+    /// reports the raw open/closed state without creating a channel.
+    public var hasOpenChannel: Bool { channel != nil }
+
     /// Handle inbound channel data (decrypted plaintext from transport).
     ///
     /// Called by ReticulumTransport.handleLinkData() for context 0x0E.

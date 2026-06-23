@@ -1018,6 +1018,14 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         // to auto-prove (tests/wire/test_opportunistic_proof.py). Default PROVE_NONE
         // is left untouched so the LXMF/Columba opportunistic path is not double-proofed.
         let proofStrategyStr = (getStringOptional(p, "proof_strategy") ?? "none").lowercased()
+        // open_channel (default True): whether the link-established hook opens a
+        // Channel on each inbound link. Mirrors python cmd_wire_listen
+        // (reference/wire_tcp.py:1268-1272): an open channel makes the receiver
+        // PROVE inbound CHANNEL-context packets (Link.py:1172), which resolves the
+        // sender's PacketReceipt so it stops retransmitting; open_channel=False
+        // reproduces a peer with NO channel, where an inbound CHANNEL packet is
+        // dropped WITHOUT a proof (Link.py:1166-1167).
+        let openChannel = getBoolOptional(p, "open_channel") ?? true
 
         let inst = try requireInstance(handle)
 
@@ -1084,6 +1092,16 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
                     listener: listener, strategy: resourceStrategy
                 )
                 await link.setResourceCallbacks(callbacks)
+                // Open a Channel on the inbound link when requested (default), so
+                // the receiver PROVES inbound CHANNEL-context packets
+                // (ReticulumTransport CHANNEL branch / Link.py:1172). Without an
+                // open channel the prove is (correctly) skipped (Link.py:1166-1167)
+                // and a reference sender retransmits to teardown. Mirrors python
+                // cmd_wire_listen's link.get_channel() on link-established
+                // (reference/wire_tcp.py:1268-1272).
+                if openChannel {
+                    _ = await link.getOrCreateChannel()
+                }
             }
         }
 

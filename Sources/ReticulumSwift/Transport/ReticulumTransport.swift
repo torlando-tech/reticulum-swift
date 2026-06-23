@@ -2439,7 +2439,32 @@ public actor ReticulumTransport {
         }
 
         // CHANNEL (0x0E) - typed message channel data (encrypted)
+        // Mirrors RNS Link.receive CHANNEL branch (Link.py:1165-1173):
+        //   elif packet.context == RNS.Packet.CHANNEL:
+        //       if not self._channel:
+        //           RNS.log("Channel data received without open channel", ...)
+        //       else:
+        //           packet.prove()
+        //           plaintext = self.decrypt(packet.data)
+        //           if plaintext != None:
+        //               self.__update_phy_stats(packet)
+        //               self._channel._receive(plaintext)
+        // The packet is only processed — and crucially PROVED — when the link
+        // has an open channel; with no channel it is dropped WITHOUT a proof
+        // (Link.py:1166-1167). RNS proves CHANNEL packets UNCONDITIONALLY when a
+        // channel is open (Link.py:1172) — unlike the DATA branch below, it does
+        // NOT consult the destination's proof_strategy. Proving lets the sender's
+        // PacketReceipt resolve, so it stops retransmitting (otherwise 5 retries
+        // → link teardown). provePacket guards initiator-side proving internally
+        // (an initiator would sign with the wrong key), hence `try?` as in the
+        // DATA branch. Prove is done before decrypt to match RNS ordering;
+        // provePacket signs the wire packet's full hash, independent of decrypt.
         if packet.context == PacketContext.CHANNEL {
+            guard await link.hasOpenChannel else {
+                logger.debug("Channel data received without open channel")
+                return
+            }
+            try? await link.provePacket(packet)
             do {
                 let plaintext = try await link.decrypt(packet.data)
                 await link.handleChannelData(plaintext)
