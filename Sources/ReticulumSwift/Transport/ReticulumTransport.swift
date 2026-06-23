@@ -305,6 +305,30 @@ public actor ReticulumTransport {
     /// E12: Pending local path requests (dest hash → receiving interface ID)
     private var pendingLocalPathRequests: [Data: String] = [:]
 
+    /// RNS `Transport.blackholed_identities` (Transport.py:123): the set of
+    /// announcing-identity hashes whose inbound announces are invalidated and
+    /// dropped in `Identity.validate_announce` (Identity.py:567-569) BEFORE any
+    /// path is learned. Populated via `blackholeIdentity` / cleared via
+    /// `unblackholeIdentity`; consulted in `processAnnounce`.
+    private var blackholedIdentities: Set<Data> = []
+
+    /// Add an identity hash to the blackhole set (RNS Transport.blackhole_identity,
+    /// Transport.py:3399-3413). Subsequent announces from this identity are dropped.
+    public func blackholeIdentity(_ identityHash: Data) {
+        blackholedIdentities.insert(identityHash)
+    }
+
+    /// Remove an identity hash from the blackhole set (RNS Transport.unblackhole_identity,
+    /// Transport.py:3415-3428).
+    public func unblackholeIdentity(_ identityHash: Data) {
+        blackholedIdentities.remove(identityHash)
+    }
+
+    /// Whether an identity hash is currently blackholed.
+    public func isIdentityBlackholed(_ identityHash: Data) -> Bool {
+        blackholedIdentities.contains(identityHash)
+    }
+
     /// E13: Receipt-based proof validation.
     ///
     /// The stored callback carries the received PROOF packet's bytes
@@ -2880,6 +2904,26 @@ public actor ReticulumTransport {
         if isLocalDestination(packet.destination) {
             onDiagnostic?("[ANNOUNCE] Ignoring announce for own destination")
             return
+        }
+
+        // Blackhole gate (RNS Identity.validate_announce, Identity.py:567-569): if
+        // the announcing identity's hash is in Transport.blackholed_identities
+        // (Transport.py:123), the announce is invalidated and dropped before any
+        // path is learned. The announced identity hash is truncated_hash(public_key),
+        // where public_key is the leading 64 (KEYSIZE//8) bytes of the announce
+        // payload — the same slice validate_announce takes (Identity.py:535). Only
+        // typed (non-PLAIN) destinations carry identity key material.
+        if !blackholedIdentities.isEmpty,
+           packet.header.destinationType != .plain,
+           packet.data.count >= 64 {
+            let publicKey = Data(packet.data.prefix(64))
+            let announcedIdentityHash = Hashing.truncatedHash(publicKey)
+            if blackholedIdentities.contains(announcedIdentityHash) {
+                let hexPrefix = announcedIdentityHash.prefix(4).map { String(format: "%02x", $0) }.joined()
+                logger.debug("Dropped announce from blackholed identity \(hexPrefix, privacy: .public)...")
+                onDiagnostic?("[ANNOUNCE] Dropped announce from blackholed identity")
+                return
+            }
         }
 
         // Get interface mode
