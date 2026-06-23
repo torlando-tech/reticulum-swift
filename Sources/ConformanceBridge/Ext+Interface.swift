@@ -131,24 +131,53 @@ func handleInterfaceExtCommand(_ command: String, _ p: [String: JSONValue]) thro
         // the sentinel when autoconfigure was off.
         return ["hw_mtu": hwMtu, "unchanged": boolean(!assigned)]
 
-    // Push raw RNS config text through ConfigObj + Reticulum._synthesize_interface
-    // and read back the stored interface attrs. (cmd_config_parse_interface :3744)
+    // Push raw RNS config text through the ReticulumSwift ConfigObj INI parser +
+    // InterfaceConfigSynthesizer (a focused port of Reticulum._synthesize_interface,
+    // Reticulum.py:685-1034) and read back the stored interface attrs.
+    // (cmd_config_parse_interface :3744)
     case "config_parse_interface":
-        // LIBRARY-GAP: reticulum-swift has no ConfigObj INI parser and no
-        // Reticulum._synthesize_interface equivalent (InterfaceConfig is a Codable
-        // struct, not an INI config pipeline). The command delegates *entirely* to
-        // that RNS machinery — the mode-alias/precedence selection, the
-        // discoverable mode-forcing, the bitrate/announce_cap/ifac_size bound
-        // checks, the discovery-interval floor/default, the ic_* ingress-control
-        // knobs and IFAC credential resolution — none of which the library
-        // exposes. Reimplementing the whole RNS config pipeline in the bridge
-        // would test the bridge rather than the library, so this is surfaced as an
-        // unimplemented library gap (mirrors reticulum-kt's deliberate omission).
-        _ = try getString(p, "interface_name")
-        _ = try getString(p, "config_text")
-        throw BridgeError.invalidData(
-            "config_parse_interface unsupported: reticulum-swift has no ConfigObj "
-            + "INI parser / Reticulum._synthesize_interface to delegate to")
+        let interfaceName = try getString(p, "interface_name")
+        let configText = try getString(p, "config_text")
+        let syn: InterfaceConfigSynthesizer.Synthesized
+        do {
+            syn = try InterfaceConfigSynthesizer.parseAndSynthesize(
+                configText: configText, interfaceName: interfaceName)
+        } catch let e as InterfaceConfigSynthesizer.SynthesisError {
+            // Faithfully surface the upstream KeyError quirk (Reticulum.py:701) and
+            // ConfigObj coercion failures as bridge errors so the harness raises
+            // BridgeError, exactly as real RNS propagates the exception out of
+            // _synthesize_interface (the mode-selection runs BEFORE RNS's
+            // try/except, so the KeyError is not swallowed).
+            throw BridgeError.invalidData("\(e)")
+        }
+        // Mirror cmd_config_parse_interface's read-back (bridge_server.py:3830-3875):
+        // selected_interface_mode + configured_bitrate come from the config section;
+        // the rest are read straight off the synthesized interface attrs.
+        func optInt(_ v: Int?) -> JSONValue { v.map { num($0) } ?? .null }
+        func optDouble(_ v: Double?) -> JSONValue { v.map { num($0) } ?? .null }
+        func optStr(_ v: String?) -> JSONValue { v.map { str($0) } ?? .null }
+        return [
+            "selected_interface_mode": num(syn.selectedInterfaceMode),
+            "configured_bitrate": optInt(syn.configuredBitrate),
+            "mode": num(syn.selectedInterfaceMode),
+            "mode_name": optStr(syn.modeName),
+            "bitrate": num(syn.bitrate),
+            "announce_cap": num(syn.announceCap),
+            "ifac_size": num(syn.ifacSize),
+            "default_ifac_size": num(syn.defaultIfacSize),
+            "discoverable": boolean(syn.discoverable),
+            "discovery_announce_interval": optInt(syn.discoveryAnnounceInterval),
+            "ifac_netname": optStr(syn.ifacNetname),
+            "ifac_netkey": optStr(syn.ifacNetkey),
+            "ifac_active": boolean(syn.ifacActive),
+            "ic_max_held_announces": optInt(syn.icMaxHeldAnnounces),
+            "ic_burst_hold": optDouble(syn.icBurstHold),
+            "ic_burst_freq_new": optDouble(syn.icBurstFreqNew),
+            "ic_burst_freq": optDouble(syn.icBurstFreq),
+            "ic_new_time": optDouble(syn.icNewTime),
+            "ic_burst_penalty": optDouble(syn.icBurstPenalty),
+            "ic_held_release_interval": optDouble(syn.icHeldReleaseInterval),
+        ]
 
     default:
         return nil

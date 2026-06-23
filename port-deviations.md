@@ -23,6 +23,34 @@ API parity but maps both onto the same implementation. The conformance test only
 asserts the two providers produce identical output against fixed NIST/RFC vectors,
 which a single shared implementation satisfies trivially. No protocol bytes differ.
 
+### ConformanceBridge `config_parse_interface` — focused `_synthesize_interface` port
+
+**Sites:** `Sources/ReticulumSwift/Interfaces/InterfaceConfigSynthesizer.swift`
+(`ConfigParser`, `InterfaceConfigSynthesizer`); driven by
+`Sources/ConformanceBridge/Ext+Interface.swift` — `config_parse_interface` case.
+
+**Python reference:** `RNS/Reticulum.py:685-1034` (`Reticulum._synthesize_interface`)
+plus `RNS.vendor.configobj.ConfigObj`, exercised by
+`reticulum-conformance/reference/bridge_server.py` `cmd_config_parse_interface`
+over the no-op `ConfigParseProbeInterface` (`DEFAULT_IFAC_SIZE = 16`,
+`AUTOCONFIGURE_MTU = False`, seed `bitrate = 62500`).
+
+**Reason:** Category (a) — scope. reticulum-swift has no ConfigObj INI parser and
+no full `_synthesize_interface` (its `InterfaceConfig` is a Codable struct, not an
+INI pipeline). The port reproduces the config-derived RULES under conformance
+*exactly* against the reference site — interface_mode alias selection + precedence
+(incl. the upstream `c["mode"]` KeyError quirk at Reticulum.py:701), the
+discoverable->gateway/AP forcing, the bitrate/announce_cap/ifac_size bound checks,
+the discovery announce-interval floor/default, the ic_* ingress-control knobs, and
+IFAC networkname/passphrase credential resolution. It deliberately does NOT model
+the full interface-class dispatch (Reticulum.py:928-996) or
+`Transport.add_interface`/`final_init`; instead it hardcodes the probe interface's
+class constants (`DEFAULT_IFAC_SIZE == 16`, seed bitrate 62500, no
+AUTOCONFIGURE_MTU re-size), which is the exact interface the reference command
+synthesizes onto — so the read-back attributes match RNS byte-for-byte for the
+keys under test. No protocol bytes differ; values outside the probe's constants
+(other interface types) are out of scope for this command.
+
 ### `ReticulumTransport.onInterfacePeerSpawned` / `onInterfaceConnected` (new feature)
 
 **Sites:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —
