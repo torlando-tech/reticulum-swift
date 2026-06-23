@@ -532,6 +532,44 @@ extension ReticulumTransport {
         }
     }
 
+    // MARK: - Transport Table Seed / Snapshot Accessors
+    //
+    // The link and reverse transport tables are populated by the real forwarding
+    // paths (forwardLinkData / forwardDataPacket) and consumed by the real inbound
+    // deferral, hop-count gate, PROOF return-routing and cull. They are otherwise
+    // module-internal. These public accessors let an out-of-module caller (the
+    // conformance bridge's behavioral_seed_* / behavioral_read_* commands) inject a
+    // correctly-shaped entry — to exercise those paths on a single injected packet —
+    // and observe the table the real relay actually built. They mirror direct
+    // `RNS.Transport.link_table[key] = entry` / `reverse_table[key] = entry`
+    // assignment and `dict.items()` iteration in the python reference
+    // (reference/behavioral_transport.py cmd_behavioral_seed_link_table /
+    // _seed_reverse_table / _read_link_table / _read_reverse_table). No routing
+    // behavior is added; these are pure mutator/snapshot accessors over the same
+    // tables the production paths use.
+
+    /// Snapshot the link table (link_id → entry). Returns a value copy.
+    public func linkTableSnapshot() -> [Data: LinkTableEntry] {
+        return linkTable
+    }
+
+    /// Seed or overwrite a link table entry, equivalent to a direct
+    /// `RNS.Transport.link_table[key] = entry` assignment.
+    public func seedLinkTableEntry(key: Data, entry: LinkTableEntry) {
+        linkTable[key] = entry
+    }
+
+    /// Snapshot the reverse table (truncated_hash → entry). Returns a value copy.
+    public func reverseTableSnapshot() -> [Data: ReverseTableEntry] {
+        return reverseTable
+    }
+
+    /// Seed or overwrite a reverse table entry, equivalent to a direct
+    /// `RNS.Transport.reverse_table[key] = entry` assignment.
+    public func seedReverseTableEntry(key: Data, entry: ReverseTableEntry) {
+        reverseTable[key] = entry
+    }
+
     // MARK: - Raw Byte Rewrite Helpers
 
     /// Compute link_id from a LINKREQUEST packet.

@@ -7,8 +7,18 @@
 // Keeps python-faithful result keys/values; reconstructs logic inline against the
 // real ReticulumTransport + primitives, reporting genuine subsystem gaps rather
 // than bailing (see /tmp/bridge_behavioral_spec.md DO-NOT-BAIL rule).
+import CryptoKit
 import Foundation
 import ReticulumSwift
+
+/// Recompute the 16-byte interface hash a mock interface was attached with
+/// (SHA256(idBytes).prefix(16), where idBytes == hex-decoded iface_id). Mirrors
+/// behavioral_attach_mock_interface's `interface_hash` and the behavioralInterfaceHash
+/// helper in Behavioral+Path.swift (kept file-local to avoid cross-file private coupling).
+private func behavioralTablesInterfaceHash(forId ifaceId: String) -> Data? {
+    guard let idBytes = hexToBytes(ifaceId) else { return nil }
+    return Data(Data(SHA256.hash(data: idBytes)).prefix(16))
+}
 
 // MARK: - packet_filter reconstruction state
 //
@@ -303,23 +313,63 @@ func handleBehavioralTablesCommand(_ command: String, _ p: [String: JSONValue]) 
         return ["iface_id": str(ifaceId), "tunnel_id": hex(tunnelId)]
 
     case "behavioral_read_link_table":
-        // Read the link table decomposed into fields (Transport.py:1298-1363
-        // reference; IDX_LT_* at Transport.py:3569-3578).
+        // Read the REAL link table decomposed into fields (RNS Transport.py:1298-1363
+        // reference; IDX_LT_* at Transport.py:3569-3578). Reads the live
+        // ReticulumTransport.linkTable via linkTableSnapshot() — the same table the
+        // real LINKREQUEST relay populates and the inbound deferral / hop-count gate /
+        // cull consult — so a relayed or seeded entry is observed faithfully. With
+        // `link_id` return that single decomposed entry; without it return all entries.
         let handle = try getString(p, "handle")
-        _ = try requireBehavioralInstance(handle)
-        // LIBRARY-GAP: ReticulumTransport.linkTable is module-internal with no
-        // public read accessor/snapshot, so entries cannot be decomposed. Return
-        // the python-shaped empty result (single-entry {found:false} when a
-        // link_id is supplied, otherwise the empty {entries:[]} listing).
-        if getStringOptional(p, "link_id") != nil {
-            return ["found": boolean(false)]
+        let inst = try requireBehavioralInstance(handle)
+        let linkIdOpt = getHexOptional(p, "link_id")
+
+        let table = try blockingAsync { await inst.transport.linkTableSnapshot() }
+
+        func descriptor(_ ifaceId: String) -> (id: JSONValue, hash: JSONValue, name: JSONValue) {
+            let h = behavioralTablesInterfaceHash(forId: ifaceId)
+            let iface = inst.interface(forId: ifaceId)
+            return (str(ifaceId),
+                    h.map { hex($0) } ?? .null,
+                    iface.map { str($0.config.name) } ?? .null)
         }
-        return ["entries": .array([])]
+        func decompose(keyHex: String, _ e: LinkTableEntry) -> Result {
+            // LinkTableEntry field → IDX_LT_* mapping: outboundInterfaceId == NH_IF,
+            // receivingInterfaceId == RCVD_IF, takenHops == HOPS. An empty
+            // nextHopTransportId is the python `None` (seeded entries store no next hop).
+            let nh = descriptor(e.outboundInterfaceId)
+            let rcvd = descriptor(e.receivingInterfaceId)
+            return [
+                "link_id": str(keyHex),
+                "timestamp": num(e.timestamp.timeIntervalSince1970),
+                "next_hop_transport_id": e.nextHopTransportId.isEmpty ? .null : hex(e.nextHopTransportId),
+                "next_hop_if": nh.id,
+                "next_hop_if_hash": nh.hash,
+                "remaining_hops": num(Int(e.remainingHops)),
+                "received_if": rcvd.id,
+                "received_if_hash": rcvd.hash,
+                "hops": num(Int(e.takenHops)),
+                "destination_hash": hex(e.destinationHash),
+                "validated": boolean(e.validated),
+                "proof_timeout": num(e.proofTimeout.timeIntervalSince1970),
+            ]
+        }
+
+        if let linkId = linkIdOpt {
+            guard let e = table[linkId] else { return ["found": boolean(false)] }
+            var d = decompose(keyHex: bytesToHex(linkId), e)
+            d["found"] = boolean(true)
+            return d
+        }
+
+        let entries = table.map { decompose(keyHex: bytesToHex($0.key), $0.value) }
+        return ["entries": .array(entries.map { .dict($0) })]
 
     case "behavioral_seed_link_table":
-        // Seed a correctly-shaped link_table entry so the inbound link-table
-        // deferral / link-routing paths can be exercised on a single injected
-        // packet (Transport.py:1200-1259 reference; link_entry layout at
+        // Seed a correctly-shaped link_table entry directly into the REAL
+        // ReticulumTransport.linkTable so the inbound link-table deferral
+        // (Transport.py:1496-1498), the cross/same-interface hop-count gate
+        // (Transport.py:1644-1679) and the link-table cull (Transport.py:685-692)
+        // can be exercised on a single injected packet (link_entry layout at
         // Transport.py:1600-1620, IDX_LT_* at :3569-3578).
         let handle = try getString(p, "handle")
         let dest = try getHex(p, "dest")
@@ -332,12 +382,31 @@ func handleBehavioralTablesCommand(_ command: String, _ p: [String: JSONValue]) 
               inst.interface(forId: rcvdIfaceId) != nil else {
             throw BridgeError.invalidData("nh_iface_id / rcvd_iface_id must reference attached interfaces")
         }
-        // LIBRARY-GAP: ReticulumTransport.linkTable is module-internal with no
-        // public seed/mutator. The LinkTableEntry struct is public, but receive()
-        // consults the internal table, so an entry constructed here cannot be made
-        // visible to the real inbound link-table deferral or link-routing paths.
-        // Params are validated (above); the table insertion is a no-op pending a
-        // public seed API. Reported as a partial.
+        // Aging / validation knobs drive the cull (Transport.py:685-692):
+        //   timestamp_age_s    — backdate timestamp (validated LINK_TIMEOUT arm)
+        //   validated          — False drives the unvalidated proof-timeout arm
+        //   proof_timeout_in_s — proof_timeout relative to now (negative = expired)
+        let remHops = getIntOptional(p, "rem_hops") ?? 99
+        let takenHops = getIntOptional(p, "hops") ?? 99
+        let validated = getBoolOptional(p, "validated") ?? true
+        let ageS = (try? getDouble(p, "timestamp_age_s")) ?? 0
+        let proofTimeoutInS = (try? getDouble(p, "proof_timeout_in_s")) ?? 60.0
+        let now = Date()
+        // link_entry next_hop (IDX_LT_NH_TRID) is None in the python seed; the empty
+        // Data here is surfaced as null by read_link_table. Field mapping:
+        // outboundInterfaceId == NH_IF (next hop), receivingInterfaceId == RCVD_IF.
+        let entry = LinkTableEntry(
+            timestamp: now.addingTimeInterval(-ageS),
+            nextHopTransportId: Data(),
+            outboundInterfaceId: nhIfaceId,
+            remainingHops: UInt8(clamping: remHops),
+            receivingInterfaceId: rcvdIfaceId,
+            takenHops: UInt8(clamping: takenHops),
+            destinationHash: dest,
+            validated: validated,
+            proofTimeout: now.addingTimeInterval(proofTimeoutInS)
+        )
+        try blockingAsync { await inst.transport.seedLinkTableEntry(key: dest, entry: entry) }
         return ["seeded": boolean(true), "dest": hex(dest)]
 
     default:

@@ -1723,6 +1723,28 @@ bridge can prove an inbound frame was accepted+recorded (count delta) for the in
 IFAC-gate tests. No behavioral change. `PacketHashlist.count`/`shouldAccept` were
 already public; only the actor-held instance was internal.
 
+### `Transport.linkTableSnapshot()` / `seedLinkTableEntry(key:entry:)` / `reverseTableSnapshot()` / `seedReverseTableEntry(key:entry:)` accessors
+
+**Site:** `Transport/ReticulumTransport+Transport.swift` (after `cullTransportTables()`).
+
+**Python reference:** `RNS/Transport.py` `link_table` / `reverse_table` are plain dict
+attributes mutated/read directly (under `link_table_lock` / `reverse_table_lock`) by the
+forwarding paths and, in the conformance harness, by
+`reference/behavioral_transport.py` `cmd_behavioral_seed_link_table` /
+`_seed_reverse_table` (`RNS.Transport.link_table[dest] = link_entry`) and
+`_read_link_table` / `_read_reverse_table` (`table.items()` iteration).
+
+**Reason:** Category (a) language/runtime. The swift `linkTable` / `reverseTable` are
+actor-isolated `var`s on `ReticulumTransport`; an out-of-module caller (the bridge)
+cannot do python's direct `Transport.link_table[key] = entry` / `dict.items()` across the
+actor boundary. These four accessors are the actor-isolation-required equivalent of that
+direct dict access — pure seed mutators + value-copy snapshots over the *same* tables the
+production inbound-deferral / hop-count gate / PROOF return-routing / cull already use.
+No routing behavior is added. Mirrors the existing `packetHashlistCount()` /
+`getPathTable()` accessor precedent. Wires `behavioral_seed_link_table` /
+`behavioral_read_link_table` / `behavioral_seed_reverse_table` /
+`behavioral_read_reverse_table` to the real tables (previously LIBRARY-GAP shadows/no-ops).
+
 ### `AnnounceTable.entryPacketHash(_:)` accessor
 
 **Site:** `Transport/AnnounceTable.swift` (additive accessor mirroring the existing
