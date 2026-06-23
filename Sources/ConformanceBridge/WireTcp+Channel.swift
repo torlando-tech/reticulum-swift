@@ -261,21 +261,28 @@ func handleWireChannelCommand(_ command: String, _ p: [String: JSONValue]) throw
         let handle = try getString(p, "handle")
         let linkIdHex = bytesToHex(try getHex(p, "link_id"))
         let inst = try requireInstance(handle)
-        _ = try channelEnsureState(handle: handle, inst: inst, linkIdHex: linkIdHex)
+        let state = try channelEnsureState(handle: handle, inst: inst, linkIdHex: linkIdHex)
+
+        // Live receive-side counters read straight off the real Channel actor
+        // (Channel.nextRxSequence / nextSequence / rxRingDepth), mirroring how the
+        // python bridge reads them off RNS.Channel.
+        let ch = state.channel
+        let nextRx = try blockingAsync { await ch.nextRxSequence }
+        let nextSeq = try blockingAsync { await ch.nextSequence }
+        let rxRing = try blockingAsync { await ch.rxRingDepth }
 
         // The fixed initial flow-control profile a real Channel selects for a
         // loopback link (rtt <= RTT_SLOW), Channel.py:304-308.
-        // LIBRARY-GAP: reticulum-swift's Channel exposes no public accessors for
-        // its live window/sequence counters and models no tx/rx retransmission
-        // ring, so the dynamic fields below report fresh-channel values.
+        // LIBRARY-GAP: reticulum-swift's Channel models no tx retransmission ring,
+        // so tx_ring/tx_tries below report fresh-channel values.
         return [
             "window": num(2),
             "window_min": num(2),
             "window_max": num(5),
             "window_flexibility": num(4),
-            "next_rx_sequence": num(0),           // LIBRARY-GAP: not observable
-            "next_sequence": num(0),              // LIBRARY-GAP: not observable
-            "rx_ring": num(0),                    // LIBRARY-GAP: no rx ring model
+            "next_rx_sequence": num(Int(nextRx)),
+            "next_sequence": num(Int(nextSeq)),
+            "rx_ring": num(rxRing),
             "tx_ring": num(0),                    // LIBRARY-GAP: no tx ring model
             "tx_tries": num(0),
             "tx_envelopes": .array([]),

@@ -1802,3 +1802,25 @@ remote process-aborts from any authenticated peer, reachable even on a `resource
 node. The fixes make hostile input a clean decode-failure / dropped-advertisement (mirroring RNS's
 graceful drop) and are NO-OPS for every valid value, so behaviour matches RNS for all reachable
 non-malicious inputs. Found by a proactive bug-class sweep, not by a reviewer.
+
+### `Channel` receive buffer — sequence-keyed dictionary vs RNS sorted rx_ring deque (fix/conformance-failures 2026-06-23)
+
+**Site:** `Channel/Channel.swift` — `Channel.inboundBuffer: [UInt16: Envelope]`, `Channel.receive(data:)`
+(emplace + contiguous-drain), `Channel.rxRingDepth`.
+
+**Python reference:** `RNS/Channel.py:392-413` (`_emplace_envelope` — sorted-deque insertion with the
+half-space modular ordering check) and `:447-466` (`_receive` contiguous-run drain that scans the
+ordered `rx_ring` deque once per receive).
+
+**Reason:** Category (a) language/runtime data-structure choice. RNS keeps received out-of-order
+envelopes in a `collections.deque` kept in ascending sequence order (with a half-space wrap check so a
+numerically-smaller wrapped-forward sequence is appended rather than inserted early), then drains the
+contiguous run by scanning that ordered deque. This port stores the same envelopes in a dictionary
+keyed by sequence and drains the contiguous run by looking up the next expected sequence directly
+(`removeValue(forKey: rxSequence)` in a wrapping-increment loop). The observable behaviour is
+identical — keep-first de-duplication (a key already present is not overwritten, mirroring
+`_emplace_envelope` returning `False`), in-order contiguous delivery, and correct 0xFFFF->0 wrap — but
+the explicit deque ordering / half-space insertion positioning is unnecessary because exact-key lookup
+does not depend on iteration order. The stale-drop window (`Channel.py:431-439`, WINDOW_MAX=48) and the
+unpack-before-advance MSGTYPE gate (`Channel.py:429`/`468-469`) are mirrored exactly. `rxRingDepth`
+reports `inboundBuffer.count`, equivalent to RNS's `len(rx_ring)`.

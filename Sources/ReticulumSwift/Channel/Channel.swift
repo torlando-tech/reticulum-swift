@@ -51,13 +51,19 @@ struct Envelope: Sendable {
     }
 
     /// Deserialize from wire format.
+    ///
+    /// Mirrors `Channel.Envelope.unpack` (Channel.py:180-181): the 6-byte
+    /// `>HHH` header carries (MSGTYPE, sequence, length), but the payload on
+    /// receive is ALL bytes after the header (`raw[6:]`) — the on-wire length
+    /// field is read but NEVER used to slice the payload. Slicing by the length
+    /// field would truncate a payload whose advertised length is wrong.
     static func unpack(from data: Data) throws -> Envelope {
         guard data.count >= 6 else { throw ChannelError.envelopeTooShort }
-        let msgtype = UInt16(data[data.startIndex]) << 8 | UInt16(data[data.startIndex + 1])
-        let seq = UInt16(data[data.startIndex + 2]) << 8 | UInt16(data[data.startIndex + 3])
-        let len = UInt16(data[data.startIndex + 4]) << 8 | UInt16(data[data.startIndex + 5])
-        guard data.count >= 6 + Int(len) else { throw ChannelError.payloadTruncated }
-        let payload = Data(data[(data.startIndex + 6)..<(data.startIndex + 6 + Int(len))])
+        let base = data.startIndex
+        let msgtype = UInt16(data[base]) << 8 | UInt16(data[base + 1])
+        let seq = UInt16(data[base + 2]) << 8 | UInt16(data[base + 3])
+        // Bytes 4-5 are the advertised length; RNS does not consult it on receive.
+        let payload = Data(data[(base + 6)...])
         return Envelope(msgtype: msgtype, sequence: seq, payload: payload)
     }
 }
@@ -87,6 +93,10 @@ public actor Channel {
     public static let MAX_TRIES = 5
     /// Envelope overhead in bytes.
     public static let ENVELOPE_OVERHEAD = 6
+    /// Maximum 16-bit sequence value (Channel.py:278 SEQ_MAX).
+    public static let SEQ_MAX = 0xFFFF
+    /// Sequence modulus = SEQ_MAX + 1 (Channel.py:279 SEQ_MODULUS).
+    public static let SEQ_MODULUS = 0x10000
 
     // MARK: - Properties
 
@@ -167,20 +177,58 @@ public actor Channel {
         do {
             let envelope = try Envelope.unpack(from: data)
 
-            // Check sequence ordering
-            if envelope.sequence == rxSequence {
-                // In-order: deliver immediately
-                await deliverMessage(envelope)
-                rxSequence = rxSequence &+ 1
+            // (1) Validate the envelope is constructable (its MSGTYPE is
+            // registered) BEFORE touching any receive-sequence state. RNS unpacks
+            // the envelope at Channel.py:429; an unregistered MSGTYPE raises
+            // ME_NOT_REGISTERED, caught at Channel.py:468-469, so the whole
+            // receive aborts WITHOUT advancing _next_rx_sequence. Advancing on an
+            // unhandled type would permanently stall the channel at that gap.
+            guard messageFactory.isRegistered(envelope.msgtype) else {
+                logger.debug("Dropping channel envelope with unregistered MSGTYPE \(envelope.msgtype)")
+                return
+            }
 
-                // Deliver any buffered out-of-order messages that are now contiguous
-                while let buffered = inboundBuffer.removeValue(forKey: rxSequence) {
-                    await deliverMessage(buffered)
-                    rxSequence = rxSequence &+ 1
+            // (2) Stale-drop window (Channel.py:431-439). Only sequences strictly
+            // below next_rx_sequence (plain 16-bit comparison) are drop candidates.
+            if envelope.sequence < rxSequence {
+                let windowOverflow = UInt16(
+                    (UInt32(rxSequence) + UInt32(Channel.WINDOW_MAX_FAST)) % UInt32(Channel.SEQ_MODULUS)
+                )
+                if windowOverflow < rxSequence {
+                    // next_rx + WINDOW_MAX wrapped the modulus: sequences in
+                    // (windowOverflow, rxSequence) are stale, but sequences
+                    // <= windowOverflow are wrapped-forward and kept.
+                    if envelope.sequence > windowOverflow {
+                        logger.debug("Dropping stale channel sequence \(envelope.sequence)")
+                        return
+                    }
+                } else {
+                    // No wrap: any sequence below next_rx is unconditionally stale.
+                    logger.debug("Dropping stale channel sequence \(envelope.sequence)")
+                    return
                 }
-            } else {
-                // Out-of-order: buffer for later delivery
-                inboundBuffer[envelope.sequence] = envelope
+            }
+
+            // (3) Emplace with KEEP-FIRST de-duplication (Channel.py:398-400:
+            // _emplace_envelope returns False for a sequence already present, so
+            // the first-seen envelope is retained and the later copy discarded).
+            // The buffer is keyed by sequence, so RNS's half-space modular
+            // ordering of its sorted rx_ring (Channel.py:392-413) is unnecessary —
+            // the contiguous drain below looks up the next expected sequence
+            // directly rather than scanning an ordered deque.
+            if inboundBuffer[envelope.sequence] != nil {
+                logger.debug("Dropping duplicate channel sequence \(envelope.sequence)")
+                return
+            }
+            inboundBuffer[envelope.sequence] = envelope
+
+            // (4) Deliver the contiguous run starting at next_rx_sequence,
+            // constructing and delivering each message and advancing the counter
+            // as we go (Channel.py:447-466). The wrapping increment crosses the
+            // 0xFFFF->0 modulus boundary naturally.
+            while let next = inboundBuffer.removeValue(forKey: rxSequence) {
+                await deliverMessage(next)
+                rxSequence = rxSequence &+ 1
             }
         } catch {
             logger.error("Failed to unpack envelope: \(error)")
@@ -217,6 +265,17 @@ public actor Channel {
         streamReaders[streamId] = reader
         return (reader, writer)
     }
+
+    // MARK: - Window / sequence observability
+
+    /// Next expected receive sequence — RNS `Channel._next_rx_sequence`.
+    public var nextRxSequence: UInt16 { rxSequence }
+
+    /// Next transmit sequence to be assigned — RNS `Channel._next_sequence`.
+    public var nextSequence: UInt16 { txSequence }
+
+    /// Number of out-of-order envelopes currently buffered — RNS rx_ring depth.
+    public var rxRingDepth: Int { inboundBuffer.count }
 
     // MARK: - Internal
 
