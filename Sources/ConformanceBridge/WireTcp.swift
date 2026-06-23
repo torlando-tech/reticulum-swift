@@ -400,6 +400,23 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
     case "wire_start_tcp_server":
         resetWireState()
 
+        // Shared-instance master: reticulum-swift has no LocalServerInterface /
+        // LocalClientInterface (RNS Interfaces/LocalInterface.py) and no
+        // Transport.local_client_interfaces wiring over a real loopback transport,
+        // so it cannot host a shared instance other bridge processes attach to.
+        // Surface this as an explicit BridgeError (mirroring the config_parse_interface
+        // pattern) instead of silently omitting `shared_instance_port` from the
+        // response — the latter crashes the conftest with an opaque int(None)
+        // TypeError (tests/wire/conftest.py:241/:198). The byte-level master-side
+        // routing rules ARE implemented for the behavioral harness
+        // (tests/behavioral/test_local_client.py); only the live cross-process
+        // LocalServer/LocalClient transport is missing.
+        if getBoolOptional(p, "share_instance") ?? false {
+            throw BridgeError.invalidData(
+                "share_instance unsupported: reticulum-swift has no LocalServerInterface/LocalClientInterface (shared-instance master over a loopback transport)"
+            )
+        }
+
         let networkName = getStringOptional(p, "network_name") ?? ""
         let passphrase = getStringOptional(p, "passphrase") ?? ""
         let requestedPortInt = getIntOptional(p, "bind_port") ?? 0
@@ -1428,6 +1445,20 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         }
         let out = listener.drainResources().map { JSONValue.string(bytesToHex($0)) }
         return ["resources": .array(out)]
+
+    // MARK: wire_start_local_client
+
+    case "wire_start_local_client":
+        // Attaching as a shared-instance local CLIENT requires a
+        // LocalClientInterface (RNS Interfaces/LocalInterface.py) connecting to a
+        // master's LocalServerInterface over a loopback transport, plus the
+        // client-side is_connected_to_shared_instance posture (Reticulum.py:385-387)
+        // and the outbound HEADER_2 wrap to a hops==1 destination
+        // (Transport.py:1146-1164). None of that transport plumbing exists in this
+        // port yet. Fail explicitly rather than with an opaque downstream error.
+        throw BridgeError.invalidData(
+            "wire_start_local_client unsupported: reticulum-swift has no LocalClientInterface / shared-instance client posture"
+        )
 
     default:
         // Route any wire_* command not matched above into the per-cluster

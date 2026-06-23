@@ -2031,6 +2031,18 @@ public actor ReticulumTransport {
             }
         }
 
+        // RNS Transport.py:1516-1530 — PLAIN-broadcast shared-instance fanout.
+        // A PLAIN BROADCAST packet is never injected into transport; instead, if it
+        // came from a local client it is repeated on every OTHER interface, and if it
+        // came from a normal interface it is pushed to the local-client interfaces
+        // only. Control destinations (e.g. the path-request PLAIN destination) are
+        // excluded (`if not packet.destination_hash in Transport.control_hashes`).
+        if packet.header.destinationType == .plain,
+           packet.header.transportType == .broadcast,
+           !controlHashes.contains(destHash) {
+            await fanoutPlainBroadcast(packet: packet, from: interfaceId)
+        }
+
         // Route based on packet type
         switch packet.header.packetType {
         case .announce:
@@ -2727,6 +2739,22 @@ public actor ReticulumTransport {
 
         // Check if destination is local
         guard let destination = destinations[destHash] else {
+            // for_local_client (RNS Transport.py:1511/1545-1581): a non-announce
+            // packet whose destination is held at hops==0 via a local-client
+            // interface is routed back to that client. The hops==0 sentinel exists
+            // only because the local-client decrement (Transport.py:1479-1480) made
+            // the attached app look master-originated. RNS regenerates the
+            // transport_id stripped on the previous hop (:1545-1546); the
+            // remaining_hops==0 relay branch (:1575-1579) strips transport headers,
+            // so the wire re-emission stays HEADER_1 with the hop count incremented —
+            // which is exactly forwardDataPacket's hopCount==0 branch.
+            if !localClientInterfaceIds.isEmpty,
+               let pathEntry = await pathTable.lookup(destinationHash: destHash),
+               pathEntry.hopCount == 0,
+               isLocalClientInterface(pathEntry.interfaceId) {
+                await forwardDataPacket(packet, from: interfaceId)
+                return
+            }
             // Not local — try forwarding if transport is enabled and this is a HEADER_2 addressed to us
             if transportEnabled,
                packet.header.headerType == .header2,
@@ -2951,11 +2979,17 @@ public actor ReticulumTransport {
         // Get interface mode
         let mode = getInterfaceMode(for: interfaceId)
 
+        // RNS local-client hop decrement (Transport.py:1455/1479-1480): an announce
+        // heard from a shared-instance local client is stored at its wire hop count
+        // (net-zero +1/-1), making the destination look master-originated.
+        let isFromLocalClient = isLocalClientInterface(interfaceId)
+
         // Process via announce handler
         let result = await announceHandler.process(
             packet: packet,
             from: interfaceId,
-            interfaceMode: mode
+            interfaceMode: mode,
+            hopDecrement: isFromLocalClient
         )
 
         // L2: Local-rebroadcast / passed-on detection (RNS Transport.py:1719-1736).
@@ -3008,6 +3042,12 @@ public actor ReticulumTransport {
             // The ORIGINAL packet is passed so announce_packet_hash == packet hash.
             await dispatchAnnounceToHandlers(packet: packet, destinationHash: destHash)
 
+            // RNS Transport.py:1931-1976 — re-emit every accepted announce to our
+            // attached local clients immediately, rewritten to HEADER_2/TRANSPORT
+            // with our own identity as transport_id so they see the destination as
+            // 1-hop reachable via this shared instance.
+            await reEmitAnnounceToLocalClients(packet: packet, receivingInterfaceId: interfaceId, isFromLocalClient: isFromLocalClient)
+
             // C17: Check pending discovery path requests on announce arrival
             if transportEnabled, let prEntry = discoveryPathRequests.removeValue(forKey: destHash) {
                 if let prInterfaceId = prEntry.requestingInterfaceId {
@@ -3050,6 +3090,12 @@ public actor ReticulumTransport {
             // for every should_add==True announce regardless of transport_enabled.
             // The ORIGINAL packet is passed so announce_packet_hash == packet hash.
             await dispatchAnnounceToHandlers(packet: packet, destinationHash: destHash)
+
+            // RNS Transport.py:1931-1976 — re-emit every accepted announce to our
+            // attached local clients immediately (HEADER_2/TRANSPORT, our identity as
+            // transport_id). Independent of transport_enabled and of the normal
+            // announce-table rebroadcast below.
+            await reEmitAnnounceToLocalClients(packet: packet, receivingInterfaceId: interfaceId, isFromLocalClient: isFromLocalClient)
 
             // L2: Local-rebroadcast detection now runs before this switch (hoisted
             // to fire for any validated HEADER_2 announce, RNS Transport.py:1719-1736).
@@ -3163,6 +3209,89 @@ public actor ReticulumTransport {
             }
 
             await processPendingPackets(for: destHash)
+        }
+    }
+
+    /// Destination hashes of control-plane destinations that are exempt from the
+    /// PLAIN-broadcast shared-instance fanout and the general relay (RNS
+    /// `Transport.control_hashes`, populated from `control_destinations` at
+    /// Transport.start()). RNS registers the path-request and tunnel-synthesize
+    /// PLAIN destinations as control destinations, so both are carved out here —
+    /// independent of whether this port has a handler bound for each.
+    private lazy var controlHashes: Set<Data> = {
+        var hashes: Set<Data> = []
+        hashes.insert(Destination(plainAppName: "rnstransport", aspects: ["path", "request"]).hash)
+        hashes.insert(Destination(plainAppName: "rnstransport", aspects: ["tunnel", "synthesize"]).hash)
+        return hashes
+    }()
+
+    /// Fan out a PLAIN BROADCAST packet across the shared-instance boundary.
+    ///
+    /// Mirrors RNS Transport.py:1516-1530. PLAIN broadcasts are never injected into
+    /// transport: a broadcast that arrived FROM a local client is repeated on every
+    /// other attached interface; one that arrived on a normal interface is pushed to
+    /// the local-client interfaces only. The original bytes are forwarded verbatim.
+    private func fanoutPlainBroadcast(packet: Packet, from interfaceId: String) async {
+        let raw = packet.encode()
+        if isLocalClientInterface(interfaceId) {
+            // From a local client: send on all interfaces except the originator.
+            for (otherId, iface) in interfaces {
+                guard otherId != interfaceId, iface.state == .connected else { continue }
+                try? await sendToInterface(raw, interfaceId: otherId)
+            }
+        } else {
+            // From a normal interface: push to the local clients only.
+            for localId in localClientInterfaceIds {
+                guard let iface = interfaces[localId], iface.state == .connected else { continue }
+                try? await sendToInterface(raw, interfaceId: localId)
+            }
+        }
+    }
+
+    /// Re-emit an accepted announce to every attached local client immediately.
+    ///
+    /// Mirrors RNS Transport.py:1931-1976 (the `if len(local_client_interfaces)`
+    /// block inside the should_add announce path). Each local client receives a
+    /// fresh announce rewritten to HEADER_2 / TRANSPORT carrying THIS instance's
+    /// identity as the transport_id, so a client behind the shared instance learns
+    /// the destination as 1-hop reachable via its LocalClientInterface. The packet
+    /// is never re-emitted to the interface it arrived on. The hop count is the
+    /// post-increment value RNS carries at this point: +1 for the receive, minus 1
+    /// again if the source was itself a local client (Transport.py:1455/1479-1480).
+    private func reEmitAnnounceToLocalClients(packet: Packet, receivingInterfaceId: String, isFromLocalClient: Bool) async {
+        guard !localClientInterfaceIds.isEmpty else { return }
+        guard let transportId = transportIdentityHash else { return }
+
+        // packet.hops after the inbound +1 / local-client -1 net (Transport.py:1957/1975).
+        let reEmitHops = packet.header.hopCount &+ (isFromLocalClient ? 0 : 1)
+
+        for localInterfaceId in localClientInterfaceIds {
+            // RNS: `if packet.receiving_interface != local_interface`
+            guard localInterfaceId != receivingInterfaceId else { continue }
+            guard let iface = interfaces[localInterfaceId], iface.state == .connected else { continue }
+
+            let header = PacketHeader(
+                headerType: .header2,
+                hasContext: packet.header.hasContext,
+                hasIFAC: false,
+                transportType: .transport,
+                destinationType: packet.header.destinationType,
+                packetType: .announce,
+                hopCount: reEmitHops
+            )
+            let reEmit = Packet(
+                header: header,
+                destination: packet.destination,
+                transportAddress: transportId,
+                context: packet.context,
+                data: packet.data
+            )
+            do {
+                try await sendToInterface(reEmit.encode(), interfaceId: localInterfaceId)
+                onDiagnostic?("[TRANSPORT] Re-emitted announce for \(packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()) to local client \(localInterfaceId)")
+            } catch {
+                onDiagnostic?("[TRANSPORT] Failed to re-emit announce to local client \(localInterfaceId): \(error)")
+            }
         }
     }
 

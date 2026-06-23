@@ -182,7 +182,8 @@ public actor AnnounceHandler {
     public func process(
         packet: Packet,
         from interfaceId: String,
-        interfaceMode: InterfaceMode
+        interfaceMode: InterfaceMode,
+        hopDecrement: Bool = false
     ) async -> AnnounceProcessResult {
         logger.debug("Processing announce from \(interfaceId), hops=\(packet.header.hopCount), data=\(packet.data.count) bytes")
 
@@ -287,12 +288,21 @@ public actor AnnounceHandler {
             logger.debug("Direct announce (hops=0): no nextHop needed")
         }
 
+        // RNS increments packet.hops on receive (Transport.py:1455), then decrements
+        // again by one if the receiving interface is a local-client interface
+        // (Transport.py:1479-1480) — net zero. So an announce heard from a shared-
+        // instance local client is stored at its wire hop count (hops==0 for a
+        // directly-attached app), making the destination look master-originated
+        // (the for_local_client sentinel, Transport.py:1511/:2011). A normal-interface
+        // announce keeps the +1.
+        let recordedHopCount = packet.header.hopCount + (hopDecrement ? 0 : 1)
+
         let pathRecorded = await pathTable.record(
             destinationHash: parsed.destinationHash,
             publicKeys: publicKeys,
             randomBlob: parsed.randomHash,
             interfaceId: interfaceId,
-            hopCount: packet.header.hopCount + 1, // Increment for next hop
+            hopCount: recordedHopCount, // +1 for next hop, net-zero for local clients
             expiration: interfaceMode.pathExpiration,
             ratchet: parsed.ratchet,  // Pass ratchet for forward secrecy encryption
             appData: parsed.appData,
