@@ -531,98 +531,289 @@ func handleWireChannelCommand(_ command: String, _ p: [String: JSONValue]) throw
             "errors": .array([])
         ]
 
-    // MARK: wire_buffer_stream (wire_tcp.py:4722-4908)
+    // MARK: wire_buffer_stream (wire_tcp.py:4827-5013)
 
     case "wire_buffer_stream":
-        // Stream bytes over a link via RawChannelWriter. reticulum-swift provides
-        // RawChannelWriter (Buffer.swift) so the send-side chunking + EOF works,
-        // but: there is no channel.send hook to capture the per-message manifest /
-        // envelope sequences, no bz2 (so the compression-bomb path is
-        // unrepresentable), and StreamDataMessage carries compressed=false only.
-        // The receiver-side reassembly is not wired by wire_listen (out of edit
-        // scope) — see LIBRARY-GAP report.
+        // Stream bytes over a link via RawChannelWriter (Buffer.swift): the
+        // payload is chunked into StreamDataMessages with the COMPRESSION_TRIES=4
+        // bz2 decision (Buffer.py:231-266), each emitted message captured into a
+        // manifest {bytes, compressed, eof, sequence}. The receiver's
+        // RawChannelReader (wired by wire_listen) reassembles them and enforces
+        // the MAX_CHUNK_LEN decompression bound.
         let handle = try getString(p, "handle")
         let linkIdHex = bytesToHex(try getHex(p, "link_id"))
         let bomb = getBoolOptional(p, "bomb") ?? false
-        let streamId = getIntOptional(p, "stream_id") ?? 0
+        let streamId = UInt16(truncatingIfNeeded: getIntOptional(p, "stream_id") ?? 0)
+        let eofWithData = getBoolOptional(p, "eof_with_data") ?? false
+        let useClose = getBoolOptional(p, "use_close") ?? false
+        let timeoutMs = getIntOptional(p, "timeout_ms") ?? 30000
+        let timeoutSec = min(Double(timeoutMs) / 1000.0, 25.0)
         let inst = try requireInstance(handle)
         let link = try channelRequireLink(inst, linkIdHex)
+        let channel: Channel = try blockingAsync { await link.getOrCreateChannel() }
+
+        let maxDataLen = StreamDataMessage.MAX_DATA_LEN
+        let maxChunkLen = RawChannelWriter.MAX_CHUNK_LEN
 
         if bomb {
-            // LIBRARY-GAP: no bz2 in swift; cannot craft a real compression bomb.
+            // Craft a real bz2.compress(bytes(N)) chunk wrapped in a real
+            // StreamDataMessage and send it over the channel. N == MAX_CHUNK_LEN
+            // inflates to exactly the bound and is accepted; N > MAX_CHUNK_LEN
+            // aborts the receiver's unpack (Buffer.py:95-97). Mirrors python's
+            // bomb branch (reference/wire_tcp.py:4920-4945).
+            let oversize = getIntOptional(p, "bomb_decompressed_len") ?? (maxChunkLen * 4)
+            let compressed: Data
+            do {
+                compressed = try ResourceCompression.bz2Compress(Data(count: oversize), blockSize: 9)
+            } catch {
+                throw BridgeError.invalidData("bomb compress failed: \(error)")
+            }
+            if compressed.count >= maxDataLen {
+                throw BridgeError.invalidData("crafted bomb chunk does not fit a single message")
+            }
+            let msg = StreamDataMessage(streamId: streamId, eof: true, compressed: true, data: compressed)
+            let seq: Int = try blockingAsync { try await channel.streamSendMessage(msg) }
             return [
                 "written": num(0),
-                "eof": boolean(false),
+                "eof": boolean(true),
                 "bomb": boolean(true),
-                "manifest": .array([]),
-                "max_chunk_len": num(16384)
+                "decompressed_len": num(oversize),
+                "sequence": num(seq),
+                "manifest": .array([
+                    .dict([
+                        "bytes": num(compressed.count),
+                        "compressed": boolean(true),
+                        "eof": boolean(true),
+                        "sequence": num(seq)
+                    ])
+                ]),
+                "max_chunk_len": num(maxChunkLen)
             ]
         }
 
         let data = getStringOptional(p, "data").flatMap { hexToBytes($0) } ?? Data()
-        let channel: Channel = try blockingAsync { await link.getOrCreateChannel() }
-        let writer = RawChannelWriter(channel: channel, streamId: UInt16(truncatingIfNeeded: streamId))
-        try? blockingAsync {
-            try await writer.write(data)
-            try await writer.close()
+
+        struct StreamRun: Sendable {
+            var total: Int = 0
+            var writeReturns: [Int] = []
+            var manifest: [StreamWriteOutcome] = []
+            var txRingAfter: Int = 0
+        }
+
+        let run: StreamRun = try blockingAsync {
+            let writer = RawChannelWriter(channel: channel, streamId: streamId)
+            var r = StreamRun()
+            var remaining = data
+            let deadline = Date().addingTimeInterval(timeoutSec)
+
+            while !remaining.isEmpty && Date() < deadline {
+                // eof_with_data: flag EOF on the final data-bearing write so its
+                // StreamDataMessage carries both payload and EOF together
+                // (reference/wire_tcp.py:4958-4959).
+                if eofWithData && remaining.count <= maxDataLen {
+                    await writer.setEof(true)
+                }
+                let o = try await writer.writeChunk(remaining)
+                guard o.processed > 0 else { break }
+                remaining = Data(remaining.dropFirst(o.processed))
+                r.total += o.processed
+                r.writeReturns.append(o.processed)
+                r.manifest.append(o)
+            }
+
+            if useClose {
+                // close(): flush a separate empty EOF message (the tx-ring drain
+                // wait is performed by the txRingAfter poll below).
+                await writer.setEof(true)
+                let o = try await writer.writeChunk(Data())
+                r.manifest.append(o)
+            } else if !eofWithData {
+                // Default: flush a separate empty EOF message.
+                await writer.setEof(true)
+                let o = try await writer.writeChunk(Data())
+                r.manifest.append(o)
+            }
+
+            // Let delivery settle so tx_ring_after reflects a drained ring (every
+            // emitted envelope proved + removed). Mirrors reference/wire_tcp.py:
+            // 4984-4997.
+            while Date() < deadline {
+                let snap = await channel.windowSnapshot()
+                if snap.txRing == 0 { break }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            r.txRingAfter = await channel.windowSnapshot().txRing
+            return r
+        }
+
+        let manifestJSON: [JSONValue] = run.manifest.map { o in
+            .dict([
+                "bytes": num(o.bytes),
+                "compressed": boolean(o.compressed),
+                "eof": boolean(o.eof),
+                "sequence": num(o.sequence)
+            ])
         }
         return [
-            "written": num(data.count),
+            "written": num(run.total),
             "eof": boolean(true),
-            "manifest": .array([]),            // LIBRARY-GAP: no send hook to capture
-            "write_returns": .array([]),
-            "max_data_len": num(LinkConstants.CHANNEL_MDU - 2),
-            "max_chunk_len": num(16384),
-            "compression_tries": num(0),
-            "tx_ring_after": num(0)
+            "manifest": .array(manifestJSON),
+            "write_returns": .array(run.writeReturns.map { num($0) }),
+            "max_data_len": num(maxDataLen),
+            "max_chunk_len": num(maxChunkLen),
+            "compression_tries": num(RawChannelWriter.COMPRESSION_TRIES),
+            "tx_ring_after": num(run.txRingAfter)
         ]
 
-    // MARK: wire_buffer_received (wire_tcp.py:4911-4986)
+    // MARK: wire_buffer_received (wire_tcp.py:5016-5091)
 
     case "wire_buffer_received":
-        // Drain what a listener's RawChannelReader reassembled. reticulum-swift's
-        // wire_listen (WireTcp.swift, out of edit scope) does not attach a
-        // RawChannelReader to inbound links, so there is no receiver-side stream
-        // to drain (LIBRARY-GAP). Validate the listener exists (error parity),
-        // then report an empty/non-aborted result.
+        // Drain what a listener's RawChannelReader reassembled from a stream.
+        // Blocks up to timeout_ms for the stream to conclude (EOF) or abort
+        // (the bz2 MAX_CHUNK_LEN bound). Returns {data, eof, aborted, error}.
         let handle = try getString(p, "handle")
         let destHex = bytesToHex(try getHex(p, "destination_hash"))
+        let timeoutMs = getIntOptional(p, "timeout_ms") ?? 30000
+        let streamId = UInt16(truncatingIfNeeded: getIntOptional(p, "stream_id") ?? 0)
         let inst = try requireInstance(handle)
-        guard inst.listeners[destHex] != nil else {
+        guard let listener = inst.listeners[destHex] else {
             throw BridgeError.invalidData("No listener registered for destination_hash=\(destHex)")
         }
+
+        struct BufferRecv: Sendable {
+            var data: Data = Data()
+            var eof: Bool = false
+            var aborted: Bool = false
+            var error: String?
+        }
+
+        let timeoutSec = min(Double(timeoutMs) / 1000.0, 25.0)
+        let result: BufferRecv = try blockingAsync {
+            var out = BufferRecv()
+            let deadline = Date().addingTimeInterval(timeoutSec)
+            while Date() < deadline {
+                let reader = listener.bufferReader(for: streamId)
+                if let reader = reader {
+                    let chunk = await reader.drain()
+                    if !chunk.isEmpty {
+                        out.data.append(chunk)
+                        continue
+                    }
+                    if await reader.isEof { out.eof = true }
+                }
+                if let ch = listener.inboundChannel(), await ch.decompressionAborted {
+                    out.aborted = true
+                    out.error = await ch.decompressionError
+                }
+                if out.eof || out.aborted { break }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            // Final drain.
+            if let reader = listener.bufferReader(for: streamId) {
+                let tail = await reader.drain()
+                if !tail.isEmpty { out.data.append(tail) }
+                if await reader.isEof { out.eof = true }
+            }
+            if let ch = listener.inboundChannel(), await ch.decompressionAborted {
+                out.aborted = true
+                out.error = await ch.decompressionError
+            }
+            return out
+        }
+
         return [
-            "data": str(""),
-            "eof": boolean(false),
-            "aborted": boolean(false),
-            "error": .null
+            "data": hex(result.data),
+            "eof": boolean(result.eof),
+            "aborted": boolean(result.aborted),
+            "error": result.error.map { str($0) } ?? .null
         ]
 
-    // MARK: wire_channel_emit_capture (wire_tcp.py:4989-5067)
+    // MARK: wire_channel_emit_capture (wire_tcp.py:5094-5172)
 
     case "wire_channel_emit_capture":
         // Send a real Channel message and report the CONTEXT byte of the Packet
         // the outlet emits. reticulum-swift's Channel sends via
-        // Link.sendChannelData, which builds a Packet with context CHANNEL (0x0E)
-        // and packet_type DATA (0x00) — the context invariant the test pins.
-        // packet_hash / delivered require an outlet send hook + per-packet state
-        // that reticulum-swift's Channel does not expose (LIBRARY-GAP).
+        // Link.channelBuildPacket, which builds a Packet with context CHANNEL
+        // (0x0E) and packet_type DATA (0x00) — the context invariant the test
+        // pins. `delivered` is driven by the real TX reliability layer (the peer's
+        // returning PROOF), via Channel.sendTracked.
         let handle = try getString(p, "handle")
         let linkIdHex = bytesToHex(try getHex(p, "link_id"))
         let payload = getStringOptional(p, "data").flatMap { hexToBytes($0) } ?? Data()
+        let timeoutMs = getIntOptional(p, "timeout_ms") ?? 15000
+        let timeoutSec = min(Double(timeoutMs) / 1000.0, 14.0)
         let inst = try requireInstance(handle)
         let state = try channelEnsureState(handle: handle, inst: inst, linkIdHex: linkIdHex)
+        let ch = state.channel
 
-        try? blockingAsync {
-            try await state.channel.send(WireChannelMessage(data: payload))
+        let outcome: ChannelSendOutcome = try blockingAsync {
+            await ch.sendTracked(
+                payload: payload, msgtype: WireChannelMessage.MSGTYPE,
+                dropAck: false, failOutlet: false, timeout: timeoutSec
+            )
         }
         return [
             "context": num(Int(PacketContext.CHANNEL)),
             "packet_type": num(0),
-            "packet_hash": .null,                          // LIBRARY-GAP: no outlet hook
-            "delivered": boolean(false),                   // LIBRARY-GAP: not observable
+            "packet_hash": .null,
+            "delivered": boolean(outcome.delivered),
             "channel_context": num(Int(PacketContext.CHANNEL)),
             "data_context": num(Int(PacketContext.NONE))
+        ]
+
+    // MARK: wire_listener_proof_log (wire_tcp.py:5175-5203)
+
+    case "wire_listener_proof_log":
+        // Receiver-side proof log {contexts, channel_proofs, channel_context}: the
+        // context byte of every inbound packet the listener's inbound link PROVED.
+        // A CHANNEL (0x0E) entry appears only when a channel is open (Link.py:1172);
+        // a no-channel listener proves ZERO CHANNEL packets (Link.py:1166-1167).
+        let handle = try getString(p, "handle")
+        let destHex = bytesToHex(try getHex(p, "destination_hash"))
+        let inst = try requireInstance(handle)
+        guard let listener = inst.listeners[destHex] else {
+            throw BridgeError.invalidData("No listener registered for destination_hash=\(destHex)")
+        }
+        let contexts = listener.proofLog()
+        let channelCtx = Int(PacketContext.CHANNEL)
+        return [
+            "contexts": .array(contexts.map { num($0) }),
+            "channel_proofs": num(contexts.filter { $0 == channelCtx }.count),
+            "channel_context": num(channelCtx)
+        ]
+
+    // MARK: wire_listener_channel_rx (wire_tcp.py:5206-5251)
+
+    case "wire_listener_channel_rx":
+        // Receiver-side Channel rx state {next_rx_sequence, next_sequence, rx_ring}
+        // read off the inbound link's real Channel. The receive sequence advances
+        // only when an envelope unpacks cleanly; a chunk that aborts the bz2
+        // decompression bound never advances it (Buffer.py:95-97 raises in unpack
+        // before the sequence bump). Poll briefly for the inbound channel since the
+        // inbound link + channel register asynchronously after the link activates.
+        let handle = try getString(p, "handle")
+        let destHex = bytesToHex(try getHex(p, "destination_hash"))
+        let inst = try requireInstance(handle)
+        guard let listener = inst.listeners[destHex] else {
+            throw BridgeError.invalidData("No listener registered for destination_hash=\(destHex)")
+        }
+        let snap: ChannelWindowSnapshot? = try blockingAsync {
+            let deadline = Date().addingTimeInterval(4.0)
+            while Date() < deadline {
+                if let ch = listener.inboundChannel() {
+                    return await ch.windowSnapshot()
+                }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            return nil
+        }
+        guard let snap else {
+            throw BridgeError.invalidData("no inbound channel on this listener")
+        }
+        return [
+            "next_rx_sequence": num(snap.nextRxSequence),
+            "next_sequence": num(snap.nextSequence),
+            "rx_ring": num(snap.rxRing)
         ]
 
     default:

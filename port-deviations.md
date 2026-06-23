@@ -1914,3 +1914,49 @@ adaptations, all observably equivalent:
      happens on first send/window-read instead of in `__init__` because the actor cannot read the link
      RTT synchronously at construction; the stored defaults already equal the non-degenerate profile, so
      the only observable effect is the degenerate (RTT>RTT_SLOW) downgrade, applied before the first send.
+
+---
+
+### `Buffer.swift` — RawChannelWriter blocking-on-window + close drain split
+
+**Port site:** `Sources/ReticulumSwift/Channel/Buffer.swift` (`RawChannelWriter.writeChunk`, `write`,
+`close`; `StreamDataMessage.unpack`).
+
+**Python reference:** `RNS/Buffer.py:231-279` (`RawChannelWriter.write`/`close`), `:87-97`
+(`StreamDataMessage.unpack`).
+
+**Reason:** Category (a) language/runtime (actor isolation + sync-vs-async send model). The chunking +
+COMPRESSION_TRIES=4 decision, the MAX_DATA_LEN(423) raw cap, and the MAX_CHUNK_LEN(16384) bz2
+decompression bound mirror `Buffer.py` exactly. Two structural adaptations, observably equivalent:
+  1. **Window admission.** RNS `write()` is non-blocking: on `ChannelException(ME_LINK_NOT_READY)` it
+     returns 0 and the caller retries. The swift writer's `writeChunk` instead awaits window admission
+     inside `Channel.streamSendMessage` (bounded, mirroring the `is_ready_to_send()` gate RNS polls in
+     `close()`), then performs the same non-blocking `performSend`. The reserved Channel sequence is
+     returned so the conformance bridge can build the per-message manifest (RNS reads it off the
+     `Envelope` the wrapped `channel.send` returns).
+  2. **close() drain.** RNS `close()` waits for the tx ring to drain (`while not is_ready_to_send:
+     sleep`) before flushing the empty EOF. The swift `close()` flushes the EOF (via `writeChunk`); the
+     drain-to-empty wait is performed by the bridge `wire_buffer_stream` loop, which polls
+     `Channel.windowSnapshot().txRing` until 0 — the same settle the python command performs around its
+     `RawChannelWriter.close()`.
+
+---
+
+### `Channel.swift` / `Link.swift` — receiver-side conformance observability hooks
+
+**Port sites:** `Sources/ReticulumSwift/Channel/Channel.swift` (`decompressionAborted` /
+`decompressionError`, `registerStreamReader`, `streamSendMessage`); `Sources/ReticulumSwift/Link/Link.swift`
+(`proofObserver` / `setProofObserver`).
+
+**Python reference:** `RNS/Channel.py:425-466` (`_receive`), `RNS/Buffer.py:115-129`
+(`RawChannelReader.__init__`); the receiver-side recorders mirror the conformance harness's own hooks at
+`reference/wire_tcp.py:1431-1441` (wrapping `link.prove_packet`) and `:1551-1559`
+(`_DetectingStreamDataMessage.unpack` recording the bz2-bound abort onto `buffer_state`).
+
+**Reason:** Category (b) added (test-only) observability — no production-path behavior change.
+`Channel._receive` already unpacks the inner message before the sequence advance (Channel.py:429); the
+port now does the same so a raising bz2 unpack (the MAX_CHUNK_LEN bound) aborts WITHOUT advancing
+`_next_rx_sequence`, faithfully. The new `decompressionAborted` flag only RECORDS that swallowed abort
+(RNS discards it in `_receive`'s except); `proofObserver` only records the context byte RNS already
+proves. `registerStreamReader` / `streamSendMessage` expose the existing `RawChannelReader` registration
+and `Channel.send`-returns-sequence behaviors to the listener-side recorder.

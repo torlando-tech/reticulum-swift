@@ -230,14 +230,22 @@ public actor Channel {
     /// TX retransmission ring (RNS `_tx_ring`).
     private var txRing: [TxEnvelope] = []
 
-    // Inbound state
+    // Inbound state. The rx ring caches the CONSTRUCTED message (RNS unpacks the
+    // envelope's inner message at receive time, Channel.py:429, and re-uses the
+    // cached message when the contiguous run is delivered, Channel.py:460-463).
     private var rxSequence: UInt16 = 0
-    private var inboundBuffer: [UInt16: Envelope] = [:]
+    private var inboundBuffer: [UInt16: any MessageBase] = [:]
+
+    /// Set when a compressed StreamDataMessage chunk decompressed past the
+    /// MAX_CHUNK_LEN bound (Buffer.py:95-97). RNS swallows the raised IOError in
+    /// `_receive`; the conformance recorder surfaces the abort via this flag.
+    public private(set) var decompressionAborted = false
+    public private(set) var decompressionError: String?
 
     // Callbacks
     private var messageCallback: (@Sendable (any MessageBase) async -> Void)?
 
-    // Stream readers for Buffer support
+    // Stream readers for Buffer support, keyed by local stream id.
     var streamReaders: [UInt16: RawChannelReader] = [:]
 
     // MARK: - Initialization
@@ -387,6 +395,34 @@ public actor Channel {
                 return
             }
 
+            // (1b) Construct (unpack) the inner message NOW, before any sequence
+            // bookkeeping. RNS unpacks the message inside the lock at
+            // Channel.py:429 BEFORE the stale-drop / emplace / next_rx_sequence
+            // advance; a raising unpack (notably the bz2 MAX_CHUNK_LEN
+            // decompression bound, Buffer.py:95-97) is caught by the outer
+            // try/except (Channel.py:468) so the receive aborts WITHOUT advancing
+            // _next_rx_sequence. The constructed message is cached on the rx ring
+            // and re-used at delivery (Channel.py:460-463).
+            let message: any MessageBase
+            do {
+                guard let m = try messageFactory.create(msgtype: envelope.msgtype, data: envelope.payload) else {
+                    return
+                }
+                message = m
+            } catch ChannelError.decompressionBoundExceeded {
+                // Record the over-bound abort so the receiver can surface it
+                // (the conformance recorder reads `decompressionAborted`), then
+                // abort WITHOUT advancing the sequence — matching RNS, where the
+                // raised IOError unwinds _receive before the next_rx_sequence bump.
+                decompressionAborted = true
+                decompressionError = "Decompressed buffer chunk exceeds maximum legitimate size"
+                logger.debug("Dropping channel envelope: decompression bound exceeded")
+                return
+            } catch {
+                logger.debug("Dropping channel envelope: message unpack failed: \(error)")
+                return
+            }
+
             // (2) Stale-drop window (Channel.py:431-439). Only sequences strictly
             // below next_rx_sequence (plain 16-bit comparison) are drop candidates.
             if envelope.sequence < rxSequence {
@@ -419,12 +455,12 @@ public actor Channel {
                 logger.debug("Dropping duplicate channel sequence \(envelope.sequence)")
                 return
             }
-            inboundBuffer[envelope.sequence] = envelope
+            inboundBuffer[envelope.sequence] = message
 
             // (4) Deliver the contiguous run starting at next_rx_sequence,
-            // constructing and delivering each message and advancing the counter
-            // as we go (Channel.py:447-466). The wrapping increment crosses the
-            // 0xFFFF->0 modulus boundary naturally.
+            // delivering each cached message and advancing the counter as we go
+            // (Channel.py:447-466). The wrapping increment crosses the 0xFFFF->0
+            // modulus boundary naturally.
             while let next = inboundBuffer.removeValue(forKey: rxSequence) {
                 await deliverMessage(next)
                 rxSequence = rxSequence &+ 1
@@ -442,13 +478,60 @@ public actor Channel {
     /// - Parameter streamId: Stream identifier (0-16383)
     /// - Returns: Tuple of (reader, writer)
     public func createBuffer(streamId: UInt16 = 0) -> (RawChannelReader, RawChannelWriter) {
-        let reader = RawChannelReader()
+        let reader = registerStreamReader(streamId: streamId)
         let writer = RawChannelWriter(channel: self, streamId: streamId)
+        return (reader, writer)
+    }
+
+    /// Register (idempotently) a RawChannelReader for `streamId`, mirroring
+    /// `RawChannelReader.__init__` (Buffer.py:115-129): it registers the
+    /// StreamDataMessage system type on the channel and installs the reader so
+    /// inbound StreamDataMessages for that stream id are reassembled. Used by the
+    /// listener-side receive recorder to attach a reader per buffer_stream_id.
+    @discardableResult
+    public func registerStreamReader(streamId: UInt16) -> RawChannelReader {
+        if let existing = streamReaders[streamId] { return existing }
         if !messageFactory.isRegistered(StreamDataMessage.MSGTYPE) {
             messageFactory.register(StreamDataMessage.self)
         }
+        let reader = RawChannelReader(streamId: streamId)
         streamReaders[streamId] = reader
-        return (reader, writer)
+        return reader
+    }
+
+    /// The reader registered for `streamId`, if any (bridge drain accessor).
+    public func streamReader(for streamId: UInt16) -> RawChannelReader? {
+        streamReaders[streamId]
+    }
+
+    /// Stream-writer send returning the reserved Channel sequence. Waits
+    /// (bounded) for the window to admit another envelope, then performs the
+    /// same non-blocking send `sendStream` does. RNS's `RawChannelWriter.write`
+    /// calls `channel.send(message)` and reads the returned Envelope's
+    /// `.sequence` (Buffer.py:258-261); the bridge records that sequence in the
+    /// per-message manifest.
+    public func streamSendMessage(_ message: any MessageBase) async throws -> Int {
+        let payload = try message.pack()
+        let msgtype = type(of: message).MSGTYPE
+        await initializeProfileIfNeeded()
+
+        let deadline = Date().addingTimeInterval(15)
+        while !isReadyToSend() && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000) // 0.05s, matching RNS
+        }
+
+        let result = await performSend(
+            payload: payload, msgtype: msgtype, dropAck: false, failOutlet: false
+        )
+        if result.rejected {
+            switch result.ceType {
+            case ChannelExceptionType.meTooBig.rawValue:
+                throw ChannelError.messageTooLarge(size: payload.count, max: await link.channelOutletMdu - Channel.ENVELOPE_OVERHEAD)
+            default:
+                throw ChannelError.channelNotReady
+            }
+        }
+        return result.sequence.map { Int($0) } ?? -1
     }
 
     // MARK: - Window / sequence observability
@@ -793,20 +876,19 @@ public actor Channel {
 
     // MARK: - Internal
 
-    /// Deliver a received envelope to the message callback or stream reader.
-    private func deliverMessage(_ envelope: Envelope) async {
-        // Check if it's a StreamDataMessage for a registered buffer
-        if envelope.msgtype == StreamDataMessage.MSGTYPE {
-            if let msg = try? StreamDataMessage.unpack(from: envelope.payload),
-               let reader = streamReaders[msg.streamId] {
-                await reader.receive(data: msg.data, eof: msg.eof)
-                return
+    /// Deliver an already-unpacked message to its stream reader (Buffer) or the
+    /// registered message callback. Mirrors `_run_callbacks` dispatch
+    /// (Channel.py:415-466) — a StreamDataMessage is routed to the reader whose
+    /// stream id matches (RawChannelReader._handle_message, Buffer.py:150-164); a
+    /// message addressed to an unregistered stream id is ignored, exactly as the
+    /// reader's handler returns False on a non-matching id.
+    private func deliverMessage(_ message: any MessageBase) async {
+        if let stream = message as? StreamDataMessage {
+            if let reader = streamReaders[stream.streamId] {
+                await reader.receive(data: stream.data, eof: stream.eof)
             }
+            return
         }
-
-        // Try to create a typed message via factory
-        if let message = try? messageFactory.create(msgtype: envelope.msgtype, data: envelope.payload) {
-            await messageCallback?(message)
-        }
+        await messageCallback?(message)
     }
 }

@@ -349,6 +349,18 @@ public actor Link {
     /// LXST and other protocols use this for raw link data delivery.
     private var packetCallback: (@Sendable (Data, Packet) async -> Void)?
 
+    /// Optional observer invoked with the context byte of every packet this link
+    /// PROVES (inside `provePacket`). The conformance receiver wraps RNS's
+    /// `link.prove_packet` the same way (reference/wire_tcp.py:1431-1441) to build
+    /// a server-side proof log — a CHANNEL (0x0E) entry appears only when a
+    /// channel is open (Link.py:1172), never for a no-channel link (Link.py:1166).
+    private var proofObserver: (@Sendable (Int) -> Void)?
+
+    /// Install the proof observer (see `proofObserver`).
+    public func setProofObserver(_ observer: (@Sendable (Int) -> Void)?) {
+        self.proofObserver = observer
+    }
+
     /// Whether a packet callback is registered on this link.
     public var hasPacketCallback: Bool {
         packetCallback != nil
@@ -1799,6 +1811,11 @@ public actor Link {
         }
         guard state.isEstablished else { throw LinkError.notActive }
         guard let sendCallback else { throw LinkError.transportNotAvailable }
+
+        // Record the proved packet's context byte for any installed observer
+        // (the conformance receiver-side proof log). Mirrors the python harness
+        // wrapping link.prove_packet (reference/wire_tcp.py:1433-1439).
+        proofObserver?(Int(packet.context))
 
         let packetHash = packet.getFullHash()
         let signature = try localIdentity.sign(packetHash)

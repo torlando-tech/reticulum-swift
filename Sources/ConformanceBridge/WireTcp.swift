@@ -150,9 +150,55 @@ final class WireListener: @unchecked Sendable {
     // consistent should the upstream pattern change.
     private var _seenResourceHashes: Set<Data> = []
 
+    // MARK: Receiver-side Channel / Buffer observation state
+    //
+    // Populated by wire_listen's link-established hook on each inbound (responder)
+    // link, mirroring python cmd_wire_listen's per-listener buffer_state /
+    // proof_log / channel (reference/wire_tcp.py:1311-1326,1461-1498).
+
+    /// The inbound link's Channel (set when an inbound link opens one). Backs
+    /// wire_listener_channel_rx (the receiver-side rx sequence state).
+    private var _inboundChannel: Channel?
+    /// RawChannelReaders registered per receiver-relative stream id (default +
+    /// any buffer_stream_ids). Backs wire_buffer_received.
+    private var _bufferReaders: [UInt16: RawChannelReader] = [:]
+    /// Context byte of every inbound packet the receiver PROVED, in order. A
+    /// CHANNEL (0x0E) entry appears only when a channel is open (Link.py:1172).
+    private var _proofLog: [Int] = []
+
     init(destination: Destination, identity: Identity) {
         self.destination = destination
         self.identity = identity
+    }
+
+    func setInboundChannel(_ channel: Channel) {
+        lock.lock(); defer { lock.unlock() }
+        _inboundChannel = channel
+    }
+
+    func inboundChannel() -> Channel? {
+        lock.lock(); defer { lock.unlock() }
+        return _inboundChannel
+    }
+
+    func setBufferReader(_ reader: RawChannelReader, for streamId: UInt16) {
+        lock.lock(); defer { lock.unlock() }
+        _bufferReaders[streamId] = reader
+    }
+
+    func bufferReader(for streamId: UInt16) -> RawChannelReader? {
+        lock.lock(); defer { lock.unlock() }
+        return _bufferReaders[streamId]
+    }
+
+    func appendProof(context: Int) {
+        lock.lock(); defer { lock.unlock() }
+        _proofLog.append(context)
+    }
+
+    func proofLog() -> [Int] {
+        lock.lock(); defer { lock.unlock() }
+        return _proofLog
     }
 
     func append(packetData: Data) {
@@ -1052,6 +1098,14 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         // reproduces a peer with NO channel, where an inbound CHANNEL packet is
         // dropped WITHOUT a proof (Link.py:1166-1167).
         let openChannel = getBoolOptional(p, "open_channel") ?? true
+        // buffer_stream_ids (default none): extra receiver-relative stream ids to
+        // register RawChannelReaders for, in addition to the default stream 0.
+        // Drives the multi-reader stream-id filtering gap (reference/wire_tcp.py:
+        // 1273-1276,1494-1496).
+        let extraStreamIds: [UInt16] = (p["buffer_stream_ids"]?.arrayValue ?? [])
+            .compactMap { $0.intValue }
+            .filter { $0 >= 0 && $0 <= Int(StreamDataMessage.STREAM_ID_MAX) }
+            .map { UInt16($0) }
 
         let inst = try requireInstance(handle)
 
@@ -1104,6 +1158,14 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
                 await link.setPacketCallback { data, _packet in
                     listener.append(packetData: data)
                 }
+                // Receiver-side proof log: record the context byte of every packet
+                // this inbound link PROVES, so wire_listener_proof_log can show
+                // ZERO CHANNEL (0x0E) proofs for a no-channel listener and >=1 for
+                // a channel listener (Link.py:1166-1173). Mirrors python wrapping
+                // link.prove_packet (reference/wire_tcp.py:1431-1441).
+                await link.setProofObserver { context in
+                    listener.appendProof(context: context)
+                }
                 // Honor the requested resource strategy (RNS/Link.py:1087-1098):
                 // .acceptAll accepts every advertisement, .acceptNone drops them
                 // silently (no parts flow), .acceptApp consults the callback's
@@ -1134,6 +1196,19 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
                     await wireAttachInboundChannelRecorder(
                         handle: handle, linkId: lid, channel: channel
                     )
+                    // Buffer (RawChannelReader): reassemble StreamDataMessage
+                    // streams + detect the MAX_CHUNK_LEN decompression-bomb abort.
+                    // Register the default-stream reader plus any extra
+                    // receiver-relative stream ids (multi-reader stream-id
+                    // filtering). Mirrors python _ensure_buffer_reader
+                    // (reference/wire_tcp.py:1490-1496,1563-1593).
+                    listener.setInboundChannel(channel)
+                    let defaultReader = await channel.registerStreamReader(streamId: 0)
+                    listener.setBufferReader(defaultReader, for: 0)
+                    for sid in extraStreamIds {
+                        let reader = await channel.registerStreamReader(streamId: sid)
+                        listener.setBufferReader(reader, for: sid)
+                    }
                 }
             }
         }
