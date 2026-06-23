@@ -56,6 +56,39 @@ private final class ChannelRecState: @unchecked Sendable {
 private let wireChannelLock = NSLock()
 private nonisolated(unsafe) var wireChannelStates: [String: ChannelRecState] = [:]
 
+/// Attach a recording handler to a listener's INBOUND channel so the receiver
+/// surfaces the in-order payloads it delivered via `wire_channel_received`.
+/// Mirrors python `cmd_wire_listen` registering `_WireChannelMessage` + a
+/// recorder on each inbound link's channel (wire_tcp.py:1268-1289). Called from
+/// `wire_listen`'s link-established hook (WireTcp.swift); keyed by handle:link_id
+/// so the server-role `wire_channel_received` finds it on the same key the
+/// initiator side uses.
+func wireAttachInboundChannelRecorder(handle: String, linkId: Data, channel: Channel) async {
+    let linkIdHex = bytesToHex(linkId)
+    let key = "\(handle):\(linkIdHex)"
+
+    wireChannelLock.lock()
+    if wireChannelStates[key] != nil {
+        wireChannelLock.unlock()
+        return
+    }
+    wireChannelLock.unlock()
+
+    let state = ChannelRecState(channel: channel)
+    await channel.register(WireChannelMessage.self)
+    await channel.setMessageCallback { message in
+        if let m = message as? WireChannelMessage {
+            state.record(m.data)
+        }
+    }
+
+    wireChannelLock.lock()
+    if wireChannelStates[key] == nil {
+        wireChannelStates[key] = state
+    }
+    wireChannelLock.unlock()
+}
+
 // MARK: - Helpers
 
 /// Pack a Channel envelope wire frame: the fixed 6-byte big-endian header
@@ -263,34 +296,27 @@ func handleWireChannelCommand(_ command: String, _ p: [String: JSONValue]) throw
         let inst = try requireInstance(handle)
         let state = try channelEnsureState(handle: handle, inst: inst, linkIdHex: linkIdHex)
 
-        // Live receive-side counters read straight off the real Channel actor
-        // (Channel.nextRxSequence / nextSequence / rxRingDepth), mirroring how the
-        // python bridge reads them off RNS.Channel.
+        // Live window/sequence/ring state read straight off the real Channel actor
+        // (Channel.windowSnapshot()), mirroring how the python bridge reads them
+        // off RNS.Channel.
         let ch = state.channel
-        let nextRx = try blockingAsync { await ch.nextRxSequence }
-        let nextSeq = try blockingAsync { await ch.nextSequence }
-        let rxRing = try blockingAsync { await ch.rxRingDepth }
-
-        // The fixed initial flow-control profile a real Channel selects for a
-        // loopback link (rtt <= RTT_SLOW), Channel.py:304-308.
-        // LIBRARY-GAP: reticulum-swift's Channel models no tx retransmission ring,
-        // so tx_ring/tx_tries below report fresh-channel values.
+        let snap = try blockingAsync { await ch.windowSnapshot() }
         return [
-            "window": num(2),
-            "window_min": num(2),
-            "window_max": num(5),
-            "window_flexibility": num(4),
-            "next_rx_sequence": num(Int(nextRx)),
-            "next_sequence": num(Int(nextSeq)),
-            "rx_ring": num(rxRing),
-            "tx_ring": num(0),                    // LIBRARY-GAP: no tx ring model
-            "tx_tries": num(0),
-            "tx_envelopes": .array([]),
-            "mdu": num(LinkConstants.CHANNEL_MDU),
-            "outlet_mdu": num(LinkConstants.LINK_MDU),
-            "message_handlers": num(1),
-            "medium_rate_rounds": num(0),
-            "fast_rate_rounds": num(0)
+            "window": num(snap.window),
+            "window_min": num(snap.windowMin),
+            "window_max": num(snap.windowMax),
+            "window_flexibility": num(snap.windowFlexibility),
+            "next_rx_sequence": num(snap.nextRxSequence),
+            "next_sequence": num(snap.nextSequence),
+            "rx_ring": num(snap.rxRing),
+            "tx_ring": num(snap.txRing),
+            "tx_tries": num(snap.txTries),
+            "tx_envelopes": .array(snap.txEnvelopes.map { num($0) }),
+            "mdu": num(snap.mdu),
+            "outlet_mdu": num(snap.outletMdu),
+            "message_handlers": num(snap.messageHandlers),
+            "medium_rate_rounds": num(snap.mediumRateRounds),
+            "fast_rate_rounds": num(snap.fastRateRounds)
         ]
 
     // MARK: wire_channel_send (wire_tcp.py:4046-4222)
@@ -318,27 +344,37 @@ func handleWireChannelCommand(_ command: String, _ p: [String: JSONValue]) throw
         let link = try channelRequireLink(inst, linkIdHex)
         let state = try channelEnsureState(handle: handle, inst: inst, linkIdHex: linkIdHex)
 
-        // Perform a real Channel.send. reticulum-swift's send returns Void and
-        // tracks no per-message delivery/sequence state, so delivered/tries/
-        // sequence/next_sequence below are not observable (LIBRARY-GAP); the
-        // drop_acks / fail_outlet fault-injection has no channel-layer analogue
-        // (no retransmission ring or outlet-receipt neutering).
-        var sentOk = true
-        do {
-            try blockingAsync { try await state.channel.send(WireChannelMessage(data: payload)) }
-        } catch {
-            sentOk = false
+        let dropAcks = getBoolOptional(p, "drop_acks") ?? false
+        let failOutlet = getBoolOptional(p, "fail_outlet") ?? false
+        // Bound the in-bridge wait below the 30s blockingAsync watchdog so a stuck
+        // delivery surfaces as a clean result rather than a wedged runner.
+        let timeoutMs = getIntOptional(p, "timeout_ms") ?? 20000
+        let timeoutSec = min(Double(timeoutMs) / 1000.0, 25.0)
+
+        // Perform a real Channel.send through the TX reliability layer, awaiting
+        // delivery (the peer's PROOF) or the retransmission teardown. The recording
+        // message type 0x0101 keeps the receiver's recorder able to surface the
+        // payload; a custom non-reserved msgtype rides verbatim.
+        let mt = UInt16(truncatingIfNeeded: msgtype ?? Int(WireChannelMessage.MSGTYPE))
+        let ch = state.channel
+        let outcome: ChannelSendOutcome = try blockingAsync {
+            await ch.sendTracked(
+                payload: payload, msgtype: mt,
+                dropAck: dropAcks, failOutlet: failOutlet, timeout: timeoutSec
+            )
         }
 
         return [
-            "sent": boolean(sentOk),
-            "rejected": boolean(false),
-            "delivered": boolean(false),      // LIBRARY-GAP: not observable
-            "tries": num(0),
-            "sequence": .null,                // LIBRARY-GAP: send() returns no envelope
-            "next_sequence": .null,           // LIBRARY-GAP: not observable
-            "window": num(2),
-            "window_max": num(5),
+            "sent": boolean(outcome.sent),
+            "rejected": boolean(outcome.rejected),
+            "delivered": boolean(outcome.delivered),
+            "tries": num(outcome.tries),
+            "sequence": outcome.sequence.map { num($0) } ?? .null,
+            "next_sequence": num(outcome.nextSequence),
+            "window": num(outcome.window),
+            "window_max": num(outcome.windowMax),
+            "ce_type": outcome.ceType.map { num($0) } ?? .null,
+            "error": outcome.error.map { str($0) } ?? .null,
             "link_status": num(channelLinkStatus(link))
         ]
 
@@ -459,28 +495,37 @@ func handleWireChannelCommand(_ command: String, _ p: [String: JSONValue]) throw
     // MARK: wire_channel_spurious_proof (wire_tcp.py:4572-4668)
 
     case "wire_channel_spurious_proof":
-        // Re-fire a delivered packet's proof/timeout callbacks to exercise RNS's
-        // spurious-message + stale-timeout guards. reticulum-swift's Channel has
-        // no _packet_delivered/_packet_timeout, tx ring, or proof-driven window
-        // growth (LIBRARY-GAP), so the re-fire is a no-op; the invariant the test
-        // pins (window does not grow, no exceptions, no teardown) holds trivially.
+        // Send a genuine message and wait for it to deliver (growing the window),
+        // then re-fire a duplicate delivery + a stale timeout for envelopes no
+        // longer in the tx ring. RNS's _packet_tx_op / _packet_timeout swallow
+        // both (no window growth, no teardown, no throw) — the invariant pinned.
         let handle = try getString(p, "handle")
         let linkIdHex = bytesToHex(try getHex(p, "link_id"))
         let inst = try requireInstance(handle)
         let link = try channelRequireLink(inst, linkIdHex)
         let state = try channelEnsureState(handle: handle, inst: inst, linkIdHex: linkIdHex)
+        let ch = state.channel
 
-        try? blockingAsync {
-            try await state.channel.send(WireChannelMessage(data: Data("genuine-proof".utf8)))
+        let outcome: ChannelSendOutcome = try blockingAsync {
+            await ch.sendTracked(
+                payload: Data("genuine-proof".utf8),
+                msgtype: WireChannelMessage.MSGTYPE,
+                dropAck: false, failOutlet: false, timeout: 12.0
+            )
         }
+        let before = try blockingAsync { await ch.windowSnapshot() }
+        // Spurious duplicate delivery + stale timeout (both no-ops).
+        try blockingAsync { await ch.fireSpuriousCallbacks() }
+        let after = try blockingAsync { await ch.windowSnapshot() }
+
         let status = channelLinkStatus(link)
         return [
-            "delivered": boolean(false),          // LIBRARY-GAP: not observable
-            "window_before": num(2),
-            "window_after_duplicate": num(2),
-            "window_final": num(2),
-            "tx_ring_before": num(0),
-            "tx_ring_final": num(0),
+            "delivered": boolean(outcome.delivered),
+            "window_before": num(before.window),
+            "window_after_duplicate": num(after.window),
+            "window_final": num(after.window),
+            "tx_ring_before": num(before.txRing),
+            "tx_ring_final": num(after.txRing),
             "link_status": num(status),
             "link_closed": boolean(status == 4),
             "errors": .array([])

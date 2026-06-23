@@ -24,6 +24,18 @@ import os.log
 
 private let logger = Logger(subsystem: "net.reticulum", category: "Channel")
 
+// MARK: - ChannelException type codes (RNS CEType, Channel.py:101-110)
+
+/// Mirrors `RNS.Channel.CEType` — the type codes carried by a `ChannelException`.
+public enum ChannelExceptionType: Int, Sendable {
+    case meNoMsgType      = 0
+    case meInvalidMsgType = 1
+    case meNotRegistered  = 2
+    case meLinkNotReady   = 3
+    case meAlreadySent    = 4
+    case meTooBig         = 5
+}
+
 // MARK: - Envelope
 
 /// Internal envelope for channel messages on the wire.
@@ -68,6 +80,84 @@ struct Envelope: Sendable {
     }
 }
 
+// MARK: - TX envelope (RNS Channel.Envelope tx-ring entry, Channel.py:172-205)
+
+/// A tracked outbound envelope held in the channel TX ring until the peer proves
+/// it (delivery) or the channel retransmits/tears down (RNS Channel `_tx_ring`).
+///
+/// `@unchecked Sendable`: every field is mutated ONLY from inside the `Channel`
+/// actor. The reference escapes into a detached timeout `Task` and the transport
+/// delivery callback, but those merely hand the reference (or its hash) back to an
+/// actor-isolated method — they never touch its fields off-actor — so the lack of
+/// internal synchronization is safe.
+private final class TxEnvelope: @unchecked Sendable {
+    let sequence: UInt16
+    /// Packed (plaintext) envelope bytes (for re-pack/logging).
+    let raw: Data
+    /// Encoded CHANNEL packet wire bytes — packed ONCE, reused for every resend so
+    /// the outlet packet id (hash) is stable across tries (RNS resends the same
+    /// already-packed Packet).
+    var wirePacket: Data?
+    /// Outlet packet id = the CHANNEL packet's full hash (RNS `get_packet_id`).
+    var packetHash: Data?
+    /// Number of transmissions so far (RNS `Envelope.tries`).
+    var tries: Int = 0
+    /// Whether the peer has proved this envelope (RNS receipt DELIVERED).
+    var delivered: Bool = false
+    /// When true, the delivery callback is never registered, so the returning
+    /// PROOF can never resolve this envelope (fault injection for the
+    /// retransmission/teardown tests; mirrors the harness's drop_acks).
+    let dropAck: Bool
+    /// In-flight retransmission timer.
+    var timeoutTask: Task<Void, Never>?
+    /// Continuation for a caller awaiting this envelope's final outcome.
+    var waiter: CheckedContinuation<Bool, Never>?
+    var resolved = false
+    var outcomeDelivered = false
+
+    init(sequence: UInt16, raw: Data, dropAck: Bool) {
+        self.sequence = sequence
+        self.raw = raw
+        self.dropAck = dropAck
+    }
+}
+
+// MARK: - Send outcome (bridge-facing)
+
+/// The observable result of a tracked `Channel.send`, mirroring the fields the
+/// conformance harness reads off `RNS.Channel.send` + the live channel state.
+public struct ChannelSendOutcome: Sendable {
+    public var sent: Bool
+    public var delivered: Bool
+    public var rejected: Bool
+    public var ceType: Int?
+    public var error: String?
+    public var tries: Int
+    public var sequence: Int?
+    public var nextSequence: Int
+    public var window: Int
+    public var windowMax: Int
+}
+
+/// A snapshot of the channel's window / sequence / ring state (RNS `channel_window`).
+public struct ChannelWindowSnapshot: Sendable {
+    public var window: Int
+    public var windowMin: Int
+    public var windowMax: Int
+    public var windowFlexibility: Int
+    public var nextRxSequence: Int
+    public var nextSequence: Int
+    public var rxRing: Int
+    public var txRing: Int
+    public var txTries: Int
+    public var txEnvelopes: [Int]
+    public var mdu: Int
+    public var outletMdu: Int
+    public var messageHandlers: Int
+    public var mediumRateRounds: Int
+    public var fastRateRounds: Int
+}
+
 // MARK: - Channel
 
 /// Typed, bidirectional message channel over a Link.
@@ -79,16 +169,30 @@ struct Envelope: Sendable {
 /// NOT by application-level ACK/NACK messages. This matches Python RNS/Channel.py.
 public actor Channel {
 
-    // MARK: - Constants
+    // MARK: - Constants (RNS Channel.py:242-280)
 
-    /// Minimum window size (initial).
+    /// The initial window size at channel setup (RNS `Channel.WINDOW`).
+    public static let WINDOW = 2
+    /// Absolute minimum window size (RNS `Channel.WINDOW_MIN`).
     public static let WINDOW_MIN = 2
+    /// Minimum window floor once the medium rate is reached (`WINDOW_MIN_LIMIT_MEDIUM`).
+    public static let WINDOW_MIN_LIMIT_MEDIUM = 5
+    /// Minimum window floor once the fast rate is reached (`WINDOW_MIN_LIMIT_FAST`).
+    public static let WINDOW_MIN_LIMIT_FAST = 16
     /// Maximum window for slow links (RTT > 0.75s or unknown).
     public static let WINDOW_MAX_SLOW = 5
     /// Maximum window for medium links (0.18s < RTT < 0.75s).
     public static let WINDOW_MAX_MEDIUM = 12
     /// Maximum window for fast links (RTT < 0.18s).
     public static let WINDOW_MAX_FAST = 48
+    /// Window flexibility — the guaranteed gap between window_max and window_min.
+    public static let WINDOW_FLEXIBILITY = 4
+    /// Sustained-rate rounds before a faster window profile is allowed.
+    public static let FAST_RATE_THRESHOLD = 10
+    /// RTT band thresholds (RNS `RTT_FAST` / `RTT_MEDIUM` / `RTT_SLOW`).
+    public static let RTT_FAST = 0.18
+    public static let RTT_MEDIUM = 0.75
+    public static let RTT_SLOW = 1.45
     /// Maximum retransmission attempts per envelope.
     public static let MAX_TRIES = 5
     /// Envelope overhead in bytes.
@@ -106,10 +210,25 @@ public actor Channel {
     /// Message type registry.
     public let messageFactory: MessageFactory
 
-    // Outbound state
+    // Outbound flow-control state (RNS Channel window fields, Channel.py:296-308)
     private var txSequence: UInt16 = 0
-    private var windowSize: Int = WINDOW_MIN
+    private var window: Int = WINDOW
     private var windowMax: Int = WINDOW_MAX_SLOW
+    private var windowMin: Int = WINDOW_MIN
+    private var windowFlexibility: Int = WINDOW_FLEXIBILITY
+    private var mediumRateRounds: Int = 0
+    private var fastRateRounds: Int = 0
+    private var maxTries: Int = MAX_TRIES
+    /// The window profile is chosen once from the link RTT (RNS does this in
+    /// `__init__`; the swift channel is created lazily and cannot read the actor's
+    /// RTT synchronously, so the profile is realized on first send / first window
+    /// read). The stored defaults already match the common non-degenerate profile.
+    private var profileInitialized = false
+    /// Set once `_shutdown` has run (RNS clears handlers + rings on teardown).
+    private var shutDown = false
+
+    /// TX retransmission ring (RNS `_tx_ring`).
+    private var txRing: [TxEnvelope] = []
 
     // Inbound state
     private var rxSequence: UInt16 = 0
@@ -137,34 +256,114 @@ public actor Channel {
     }
 
     /// Set the callback for inbound messages.
-    public func setMessageCallback(_ callback: @escaping @Sendable (any MessageBase) async -> Void) {
+    public func setMessageCallback(_ callback: (@escaping @Sendable (any MessageBase) async -> Void)) {
         messageCallback = callback
     }
 
-    /// Send a typed message over the channel.
-    ///
-    /// Packs the message into an envelope with the next sequence number
-    /// and sends it over the link. Delivery confirmation is handled by the
-    /// Link layer's packet receipt system, not by application-level ACKs.
+    /// Send a typed message over the channel (fire-and-forget; the buffer writer
+    /// and other in-library callers use this). Throws on rejection so callers see
+    /// ME_TOO_BIG / ME_LINK_NOT_READY as `ChannelError`. To observe delivery and
+    /// the full TX outcome, use `sendTracked`.
     ///
     /// - Parameter message: Message conforming to MessageBase
-    /// - Throws: ChannelError.messageTooLarge if payload exceeds CHANNEL_MDU
+    /// - Throws: ChannelError on rejection
     public func send(_ message: any MessageBase) async throws {
         let payload = try message.pack()
-        let maxPayload = LinkConstants.CHANNEL_MDU
-        guard payload.count <= maxPayload else {
-            throw ChannelError.messageTooLarge(size: payload.count, max: maxPayload)
+        let result = await performSend(
+            payload: payload,
+            msgtype: type(of: message).MSGTYPE,
+            dropAck: false,
+            failOutlet: false
+        )
+        if result.rejected {
+            switch result.ceType {
+            case ChannelExceptionType.meTooBig.rawValue:
+                throw ChannelError.messageTooLarge(size: payload.count, max: await link.channelOutletMdu - Channel.ENVELOPE_OVERHEAD)
+            default:
+                throw ChannelError.channelNotReady
+            }
+        }
+    }
+
+    /// Stream-writer send (RNS `RawChannelWriter.write`, Buffer.py:231-264): wait
+    /// (bounded) until the window admits another envelope, then send. RNS's writer
+    /// is non-blocking and relies on the caller retrying on ME_LINK_NOT_READY; the
+    /// swift writer is a simple loop, so it throttles itself to the window here
+    /// (mirroring the `is_ready_to_send()` gate RNS polls in `close()`, Buffer.py:275)
+    /// instead of bouncing off ME_LINK_NOT_READY.
+    public func sendStream(_ message: any MessageBase) async throws {
+        let payload = try message.pack()
+        let msgtype = type(of: message).MSGTYPE
+        await initializeProfileIfNeeded()
+
+        let deadline = Date().addingTimeInterval(15)
+        while !isReadyToSend() && Date() < deadline {
+            // Yield the actor so in-flight deliveries can drain the tx ring.
+            try? await Task.sleep(nanoseconds: 50_000_000) // 0.05s, matching RNS
         }
 
-        let envelope = Envelope(
-            msgtype: type(of: message).MSGTYPE,
-            sequence: txSequence,
-            payload: payload
+        let result = await performSend(
+            payload: payload, msgtype: msgtype, dropAck: false, failOutlet: false
         )
-        txSequence = txSequence &+ 1
+        if result.rejected {
+            switch result.ceType {
+            case ChannelExceptionType.meTooBig.rawValue:
+                throw ChannelError.messageTooLarge(size: payload.count, max: await link.channelOutletMdu - Channel.ENVELOPE_OVERHEAD)
+            default:
+                throw ChannelError.channelNotReady
+            }
+        }
+    }
 
-        let wireData = envelope.pack()
-        try await link.sendChannelData(wireData)
+    /// Send a message and report the full TX outcome, awaiting delivery (the peer's
+    /// PROOF) or link teardown. Mirrors `RNS.Channel.send` (Channel.py:586-625)
+    /// plus the harness's wait-for-delivery loop. Used by the conformance bridge.
+    ///
+    /// - Parameters:
+    ///   - payload: packed message payload bytes
+    ///   - msgtype: the message MSGTYPE (placed in the envelope header)
+    ///   - dropAck: suppress this message's delivery callback (fault injection)
+    ///   - failOutlet: simulate the outlet failing to transmit (fault injection)
+    ///   - timeout: max seconds to await delivery/teardown before returning
+    public func sendTracked(
+        payload: Data,
+        msgtype: UInt16,
+        dropAck: Bool,
+        failOutlet: Bool,
+        timeout: TimeInterval
+    ) async -> ChannelSendOutcome {
+        let result = await performSend(
+            payload: payload, msgtype: msgtype, dropAck: dropAck, failOutlet: failOutlet
+        )
+
+        guard result.sent, let tx = result.envelope else {
+            return ChannelSendOutcome(
+                sent: false,
+                delivered: false,
+                rejected: result.rejected,
+                ceType: result.ceType,
+                error: result.error,
+                tries: 0,
+                sequence: result.sequence.map { Int($0) },
+                nextSequence: Int(txSequence),
+                window: window,
+                windowMax: windowMax
+            )
+        }
+
+        let delivered = await awaitEnvelope(tx, timeout: timeout)
+        return ChannelSendOutcome(
+            sent: true,
+            delivered: delivered,
+            rejected: false,
+            ceType: nil,
+            error: nil,
+            tries: tx.tries,
+            sequence: Int(tx.sequence),
+            nextSequence: Int(txSequence),
+            window: window,
+            windowMax: windowMax
+        )
     }
 
     /// Process inbound channel data (decrypted plaintext from link).
@@ -235,20 +434,6 @@ public actor Channel {
         }
     }
 
-    /// Update window sizing based on link RTT.
-    public func updateWindowSize() async {
-        let rtt = await link.rtt
-        if rtt <= 0 {
-            windowMax = Channel.WINDOW_MAX_SLOW
-        } else if rtt < 0.18 {
-            windowMax = Channel.WINDOW_MAX_FAST
-        } else if rtt < 0.75 {
-            windowMax = Channel.WINDOW_MAX_MEDIUM
-        } else {
-            windowMax = Channel.WINDOW_MAX_SLOW
-        }
-    }
-
     /// Create a reader/writer pair for a byte stream.
     ///
     /// Registers StreamDataMessage if not already registered, and stores
@@ -276,6 +461,335 @@ public actor Channel {
 
     /// Number of out-of-order envelopes currently buffered — RNS rx_ring depth.
     public var rxRingDepth: Int { inboundBuffer.count }
+
+    /// Channel MDU = outlet MDU - 6, capped at 0xFFFF (RNS `Channel.mdu`, Channel.py:66-78).
+    public var mdu: Int {
+        get async {
+            let m = await link.channelOutletMdu - 6
+            return min(m, 0xFFFF)
+        }
+    }
+
+    /// Full window/sequence/ring snapshot for the bridge `wire_channel_window`.
+    public func windowSnapshot() async -> ChannelWindowSnapshot {
+        await initializeProfileIfNeeded()
+        let outletMdu = await link.channelOutletMdu
+        let txTries = txRing.first?.tries ?? 0
+        return ChannelWindowSnapshot(
+            window: window,
+            windowMin: windowMin,
+            windowMax: windowMax,
+            windowFlexibility: windowFlexibility,
+            nextRxSequence: Int(rxSequence),
+            nextSequence: Int(txSequence),
+            rxRing: inboundBuffer.count,
+            txRing: txRing.count,
+            txTries: txTries,
+            txEnvelopes: txRing.map { Int($0.sequence) },
+            mdu: min(outletMdu - 6, 0xFFFF),
+            outletMdu: outletMdu,
+            messageHandlers: messageCallback != nil ? 1 : 0,
+            mediumRateRounds: mediumRateRounds,
+            fastRateRounds: fastRateRounds
+        )
+    }
+
+    /// Re-fire a delivery and a stale timeout for envelopes NOT in the tx ring, to
+    /// exercise RNS's spurious-message / stale-timeout guards (Channel.py:531-535,
+    /// 555-561). Both must be no-ops: no window growth, no teardown, no throw.
+    public func fireSpuriousCallbacks() async {
+        // Duplicate/late delivery for an unknown packet id: _packet_tx_op finds no
+        // matching envelope and logs "Spurious message" (Channel.py:545-546).
+        await packetDelivered(Data(repeating: 0, count: 32))
+        // Stale timeout for an already-delivered throwaway envelope:
+        // _packet_timeout returns immediately when the packet is DELIVERED
+        // (Channel.py:556-557).
+        let stale = TxEnvelope(sequence: Channel.SEQ_MAX == 0 ? 0 : UInt16(Channel.SEQ_MAX), raw: Data(), dropAck: true)
+        stale.delivered = true
+        await packetTimeout(stale)
+    }
+
+    // MARK: - Internal: send pipeline (RNS Channel.send, Channel.py:586-625)
+
+    private struct SendResult {
+        var rejected: Bool = false
+        var ceType: Int? = nil
+        var error: String? = nil
+        var sent: Bool = false
+        var sequence: UInt16? = nil
+        var envelope: TxEnvelope? = nil
+    }
+
+    /// The synchronous (non-waiting) core of a channel send: window admission,
+    /// sequence reservation, ME_TOO_BIG guard, outlet transmit with rollback, and
+    /// tx-ring emplacement + timer arming. Returns the emplaced envelope (if sent).
+    private func performSend(
+        payload: Data, msgtype: UInt16, dropAck: Bool, failOutlet: Bool
+    ) async -> SendResult {
+        await initializeProfileIfNeeded()
+
+        // is_ready_to_send (Channel.py:471-491): the outlet is always usable; the
+        // gate is purely "outstanding (un-delivered tx-ring envelopes) < window".
+        guard isReadyToSend() else {
+            return SendResult(
+                rejected: true, ceType: ChannelExceptionType.meLinkNotReady.rawValue,
+                error: "Link is not ready", sent: false
+            )
+        }
+
+        // Reserve the next sequence and pack the envelope (Channel.py:592-595).
+        let reserved = txSequence
+        let envelope = Envelope(msgtype: msgtype, sequence: reserved, payload: payload)
+        let raw = envelope.pack()
+
+        // ME_TOO_BIG runs BEFORE the sequence increment (Channel.py:596-598), so a
+        // rejected oversized send leaves next_sequence untouched.
+        let outletMdu = await link.channelOutletMdu
+        if raw.count > outletMdu {
+            return SendResult(
+                rejected: true, ceType: ChannelExceptionType.meTooBig.rawValue,
+                error: "Packed message too big for packet: \(raw.count) > \(outletMdu)",
+                sent: false
+            )
+        }
+
+        // Commit the reservation (Channel.py:599).
+        txSequence = reserved &+ 1
+
+        // outlet.send(raw): build the CHANNEL packet (encrypt once) — or, under
+        // fault injection, pretend the outlet produced no receipt (Channel.py:601).
+        var built: (wire: Data, hash: Data)? = nil
+        if !failOutlet {
+            built = await link.channelBuildPacket(raw)
+        }
+        guard let packet = built else {
+            // "Outlet did not transmit packet" — roll the reservation back and
+            // raise ME_LINK_NOT_READY (Channel.py:603-609).
+            txSequence = reserved
+            return SendResult(
+                rejected: true, ceType: ChannelExceptionType.meLinkNotReady.rawValue,
+                error: "Outlet did not transmit packet", sent: false
+            )
+        }
+
+        // Emplace, then register the delivery callback BEFORE transmitting so the
+        // returning PROOF can never race ahead of the registration (RNS registers
+        // the receipt with Transport synchronously inside Packet.send()).
+        let tx = TxEnvelope(sequence: reserved, raw: raw, dropAck: dropAck)
+        tx.wirePacket = packet.wire
+        tx.packetHash = packet.hash
+        txRing.append(tx)
+        tx.tries += 1
+
+        if !dropAck {
+            let hash = packet.hash
+            await link.channelRegisterDelivery(fullHash: hash) { [weak self] in
+                await self?.packetDelivered(hash)
+            }
+        }
+
+        let transmitted = await link.channelTransmit(packet.wire)
+        if !transmitted {
+            // The outlet failed at the wire: undo emplacement + rollback, matching
+            // the no-receipt branch (Channel.py:603-609).
+            if let idx = txRing.firstIndex(where: { $0 === tx }) {
+                txRing.remove(at: idx)
+            }
+            if !dropAck {
+                await link.channelDeregisterDelivery(fullHash: packet.hash)
+            }
+            txSequence = reserved
+            return SendResult(
+                rejected: true, ceType: ChannelExceptionType.meLinkNotReady.rawValue,
+                error: "Outlet did not transmit packet", sent: false
+            )
+        }
+
+        await armTimeout(tx)
+        return SendResult(sent: true, sequence: reserved, envelope: tx)
+    }
+
+    /// is_ready_to_send (Channel.py:471-491).
+    private func isReadyToSend() -> Bool {
+        var outstanding = 0
+        for env in txRing where !env.delivered {
+            outstanding += 1
+        }
+        return outstanding < window
+    }
+
+    /// Suspend until `tx` is delivered (true) or the link tears down (false), or
+    /// the bridge-supplied timeout elapses (returns the current delivered state).
+    private func awaitEnvelope(_ tx: TxEnvelope, timeout: TimeInterval) async -> Bool {
+        if tx.resolved { return tx.outcomeDelivered }
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            if tx.resolved {
+                cont.resume(returning: tx.outcomeDelivered)
+                return
+            }
+            tx.waiter = cont
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                await self?.resolveWaiterTimeout(tx)
+            }
+        }
+    }
+
+    private func resolveWaiterTimeout(_ tx: TxEnvelope) {
+        guard !tx.resolved else { return }
+        resolveWaiter(tx, delivered: tx.delivered)
+    }
+
+    private func resolveWaiter(_ tx: TxEnvelope, delivered: Bool) {
+        guard !tx.resolved else { return }
+        tx.resolved = true
+        tx.outcomeDelivered = delivered
+        tx.waiter?.resume(returning: delivered)
+        tx.waiter = nil
+    }
+
+    // MARK: - Internal: delivery (RNS _packet_delivered / _packet_tx_op)
+
+    /// Called when a PROOF for a sent CHANNEL packet arrives. Mirrors
+    /// `_packet_delivered` -> `_packet_tx_op(op=lambda: True)` (Channel.py:507-548).
+    private func packetDelivered(_ hash: Data) async {
+        // Read RTT up front (the rate-promotion logic consults the live outlet RTT).
+        let rtt = await link.channelOutletRtt
+
+        guard let idx = txRing.firstIndex(where: { $0.packetHash == hash }) else {
+            // Spurious / duplicate proof: no tracked envelope — do nothing
+            // (Channel.py:545-546).
+            return
+        }
+        let env = txRing.remove(at: idx)
+        env.delivered = true
+        env.timeoutTask?.cancel()
+        env.timeoutTask = nil
+
+        // Grow the window by 1, capped at window_max (Channel.py:516-518).
+        if window < windowMax {
+            window += 1
+        }
+
+        // Rate-round promotion (Channel.py:520-543).
+        if rtt != 0 {
+            if rtt > Channel.RTT_FAST {
+                fastRateRounds = 0
+                if rtt > Channel.RTT_MEDIUM {
+                    mediumRateRounds = 0
+                } else {
+                    mediumRateRounds += 1
+                    if windowMax < Channel.WINDOW_MAX_MEDIUM
+                        && mediumRateRounds == Channel.FAST_RATE_THRESHOLD {
+                        windowMax = Channel.WINDOW_MAX_MEDIUM
+                        windowMin = Channel.WINDOW_MIN_LIMIT_MEDIUM
+                    }
+                }
+            } else {
+                fastRateRounds += 1
+                if windowMax < Channel.WINDOW_MAX_FAST
+                    && fastRateRounds == Channel.FAST_RATE_THRESHOLD {
+                    windowMax = Channel.WINDOW_MAX_FAST
+                    windowMin = Channel.WINDOW_MIN_LIMIT_FAST
+                }
+            }
+        }
+
+        resolveWaiter(env, delivered: true)
+    }
+
+    // MARK: - Internal: timeout / retransmission (RNS _packet_timeout)
+
+    /// Mirrors `_packet_timeout` (Channel.py:563-584): resend with backoff and
+    /// shrink the window, tearing the link down after `maxTries` unanswered tries.
+    private func packetTimeout(_ tx: TxEnvelope) async {
+        // get_packet_state == DELIVERED -> nothing to do (Channel.py:564-565).
+        if tx.delivered { return }
+        guard txRing.contains(where: { $0 === tx }) else { return }
+
+        if tx.tries >= maxTries {
+            // Retry count exceeded: _shutdown() then outlet.timed_out()
+            // (Channel.py:578-582). Tear the link down BEFORE resolving the
+            // envelope's waiter so an observer that reads link_status the instant
+            // the send returns sees CLOSED.
+            let pending = txRing
+            shutdownInternal()
+            await link.channelOutletTimedOut()
+            for e in pending {
+                resolveWaiter(e, delivered: false)
+            }
+            return
+        }
+
+        tx.tries += 1
+
+        // Shrink the window by 1 (floored at window_min), and window_max too but
+        // only while the flexibility guard allows it (Channel.py:573-577).
+        if window > windowMin {
+            window -= 1
+            if windowMax > windowMin + windowFlexibility {
+                windowMax -= 1
+            }
+        }
+
+        // Resend the SAME already-packed packet bytes (stable hash) and re-arm.
+        if let wire = tx.wirePacket {
+            _ = await link.channelTransmit(wire)
+        }
+        await armTimeout(tx)
+    }
+
+    /// Arm (or re-arm) the retransmission timer for `tx`. The timeout grows with
+    /// tries and the current ring depth (RNS `_get_packet_timeout_time`).
+    private func armTimeout(_ tx: TxEnvelope) async {
+        let timeout = await packetTimeoutTime(tries: tx.tries)
+        tx.timeoutTask?.cancel()
+        tx.timeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            if Task.isCancelled { return }
+            await self?.packetTimeout(tx)
+        }
+    }
+
+    /// `_get_packet_timeout_time(tries)` (Channel.py:551-553):
+    /// pow(1.5, tries-1) * max(rtt*2.5, 0.025) * (len(tx_ring)+1.5).
+    private func packetTimeoutTime(tries: Int) async -> TimeInterval {
+        let rtt = await link.channelOutletRtt
+        return pow(1.5, Double(tries - 1)) * max(rtt * 2.5, 0.025) * (Double(txRing.count) + 1.5)
+    }
+
+    // MARK: - Internal: shutdown (RNS _shutdown / _clear_rings, Channel.py:375-390)
+
+    private func shutdownInternal() {
+        shutDown = true
+        // Clear message handlers (RNS _shutdown clears _message_callbacks).
+        messageCallback = nil
+        // Clear the tx + rx rings, cancelling any in-flight retransmission timers.
+        for env in txRing {
+            env.timeoutTask?.cancel()
+            env.timeoutTask = nil
+        }
+        txRing.removeAll()
+        inboundBuffer.removeAll()
+    }
+
+    /// One-time window-profile realization from the link RTT (RNS Channel.__init__
+    /// gate, Channel.py:296-308). A link RTT above RTT_SLOW collapses the channel
+    /// to the degenerate all-1 window; otherwise the non-degenerate slow profile
+    /// (already the stored defaults) holds.
+    private func initializeProfileIfNeeded() async {
+        guard !profileInitialized else { return }
+        profileInitialized = true
+        let rtt = await link.channelOutletRtt
+        if rtt > Channel.RTT_SLOW {
+            window = 1
+            windowMax = 1
+            windowMin = 1
+            windowFlexibility = 1
+        }
+        // else: keep the stored non-degenerate defaults (WINDOW / WINDOW_MAX_SLOW /
+        // WINDOW_MIN / WINDOW_FLEXIBILITY).
+    }
 
     // MARK: - Internal
 

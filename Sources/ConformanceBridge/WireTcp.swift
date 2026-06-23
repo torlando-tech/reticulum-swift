@@ -1109,7 +1109,14 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
                 // cmd_wire_listen's link.get_channel() on link-established
                 // (reference/wire_tcp.py:1268-1272).
                 if openChannel {
-                    _ = await link.getOrCreateChannel()
+                    let channel = await link.getOrCreateChannel()
+                    // Attach a recording handler so the receiver can surface the
+                    // channel payloads it delivered (server-role channel_received).
+                    // Mirrors python cmd_wire_listen's recorder (wire_tcp.py:1268-1289).
+                    let lid = await link.linkId
+                    await wireAttachInboundChannelRecorder(
+                        handle: handle, linkId: lid, channel: channel
+                    )
                 }
             }
         }

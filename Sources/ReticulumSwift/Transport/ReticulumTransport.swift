@@ -1030,6 +1030,17 @@ public actor ReticulumTransport {
             let ifaceId = await link?.attachedInterfaceId
             try await self.sendRawBytes(packetBytes, interfaceId: ifaceId)
         }
+        // Wire the Channel delivery-proof hooks so the link's Channel TX ring can
+        // observe when a CHANNEL packet's PROOF returns (drives window growth /
+        // retransmission). Mirrors RNS registering a PacketReceipt with Transport.
+        await link.setChannelProofHooks(
+            register: { [weak self] truncatedHash, cb in
+                await self?.registerProofCallback(truncatedHash: truncatedHash, callback: cb)
+            },
+            deregister: { [weak self] truncatedHash in
+                await self?.removeProofCallback(truncatedHash: truncatedHash)
+            }
+        )
 
         // Get packet FIRST so we can use it to compute link_id
         let packet = try await link.getLinkRequestPacket()
@@ -2187,6 +2198,17 @@ public actor ReticulumTransport {
             let ifaceId = await link?.attachedInterfaceId
             try await self.sendRawBytes(data, interfaceId: ifaceId)
         }
+        // Wire the Channel delivery-proof hooks (responder side) — see the matching
+        // block on the initiator path. A responder's Channel can also send, so it
+        // needs the same receipt-resolution wiring.
+        await link.setChannelProofHooks(
+            register: { [weak self] truncatedHash, cb in
+                await self?.registerProofCallback(truncatedHash: truncatedHash, callback: cb)
+            },
+            deregister: { [weak self] truncatedHash in
+                await self?.removeProofCallback(truncatedHash: truncatedHash)
+            }
+        )
 
         // Configure link with destination callbacks IMMEDIATELY (before LRRTT).
         // This prevents a race condition where a resource advertisement arrives

@@ -1846,3 +1846,43 @@ the explicit deque ordering / half-space insertion positioning is unnecessary be
 does not depend on iteration order. The stale-drop window (`Channel.py:431-439`, WINDOW_MAX=48) and the
 unpack-before-advance MSGTYPE gate (`Channel.py:429`/`468-469`) are mirrored exactly. `rxRingDepth`
 reports `inboundBuffer.count`, equivalent to RNS's `len(rx_ring)`.
+
+### `Channel` TX reliability layer — outlet split + transport proof-hook injection (fix/conformance-failures 2026-06-23)
+
+**Sites:** `Channel/Channel.swift` (`TxEnvelope`, `performSend`, `sendTracked`, `sendStream`,
+`packetDelivered`, `packetTimeout`, `armTimeout`, `awaitEnvelope`, `shutdownInternal`,
+`initializeProfileIfNeeded`); `Link/Link+Channel.swift` (`channelBuildPacket`, `channelTransmit`,
+`channelRegisterDelivery`/`channelDeregisterDelivery`, `channelOutletTimedOut`, `channelOutletMdu`/
+`channelOutletRtt`); `Link/Link.swift` (`channelProofRegistrar`/`channelProofDeregistrar` +
+`setChannelProofHooks`); `Transport/ReticulumTransport.swift` (both `setSendCallback` sites also call
+`setChannelProofHooks`).
+
+**Python reference:** `RNS/Channel.py:471-625` (`is_ready_to_send`, `_packet_tx_op`, `_packet_timeout`,
+`send`), `:375-390` (`_shutdown`/`_clear_rings`), `:296-308` (window profile), and `:658-740`
+(`LinkChannelOutlet`). RNS's `LinkChannelOutlet` holds a direct reference to the `Link`, and
+`Packet.send()` registers a `PacketReceipt` with `Transport` SYNCHRONOUSLY, so the returning PROOF
+resolves the receipt's delivery/timeout callbacks (`RNS/Packet.py`, `RNS/Transport.py`).
+
+**Reason:** Category (a) language/runtime (actor isolation + per-message encryption). Three structural
+adaptations, all observably equivalent:
+  1. **Build/transmit split.** RNS packs the CHANNEL `Packet` ONCE (encryption done once) and
+     `resend()` re-transmits the same bytes, so the packet hash (the outlet packet id the receipt is
+     keyed on) is stable across tries. Swift's `encrypt` uses a fresh random IV per call, so the outlet
+     is split into `channelBuildPacket` (encrypt+encode ONCE, returns wire bytes + full hash) and
+     `channelTransmit` (re-send the stored bytes). This reproduces RNS's stable-hash retransmission.
+  2. **Proof-hook injection.** The `Channel` actor cannot synchronously reach the transport's
+     receipt table the way RNS's outlet reaches `Transport`. Instead the transport injects two closures
+     (`setChannelProofHooks`) at the same point it wires `sendCallback`; the channel registers a
+     delivery callback keyed by the sent packet's truncated hash BEFORE transmitting (race-free, exactly
+     as RNS registers the receipt inside `Packet.send()` before the PROOF can return). The transport's
+     existing `handleDataProof` matches the inbound PROOF's leading packet hash against this
+     registration — the same resolution RNS performs via `PacketReceipt`.
+  3. **Timer/await model.** RNS drives retransmission off `PacketReceipt` timeout callbacks on a
+     background thread; the port uses per-envelope `Task.sleep` timers and a `CheckedContinuation` so a
+     caller (the conformance bridge) can await an envelope's delivery/teardown. The window growth/shrink,
+     `pow(1.5,tries-1)` backoff, `_max_tries=5` teardown, medium/fast rate-round promotion, ME_TOO_BIG /
+     ME_LINK_NOT_READY / sequence-reservation rollback, and `_shutdown` ring+handler clearing all mirror
+     `Channel.py` line-for-line. The one-time window-profile realization (`initializeProfileIfNeeded`)
+     happens on first send/window-read instead of in `__init__` because the actor cannot read the link
+     RTT synchronously at construction; the stored defaults already equal the non-degenerate profile, so
+     the only observable effect is the degenerate (RTT>RTT_SLOW) downgrade, applied before the first send.

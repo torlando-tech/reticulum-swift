@@ -243,6 +243,29 @@ public actor Link {
     /// Callback for sending packets (set by transport integration)
     var sendCallback: ((Data) async throws -> Void)?
 
+    /// Transport-provided hook registering a delivery-proof callback for a sent
+    /// CHANNEL packet, keyed by the packet's truncated (16-byte) hash. Mirrors how
+    /// RNS's `Packet.send()` registers a `PacketReceipt` with `Transport` so the
+    /// returning PROOF resolves it (RNS/Packet.py / Transport.py). The swift
+    /// `Channel` TX ring uses this to learn when a channel packet was proved by the
+    /// peer (drives window growth / retransmission). Set by the transport at the
+    /// same point it wires `sendCallback`; nil on links not attached to a transport.
+    var channelProofRegistrar: (@Sendable (Data, @escaping @Sendable () async -> Void) async -> Void)?
+
+    /// Transport-provided hook removing a previously-registered channel delivery
+    /// callback (used when a send is rolled back before it ever transmits).
+    var channelProofDeregistrar: (@Sendable (Data) async -> Void)?
+
+    /// Wire the Channel delivery-proof registration hooks. Called by the transport
+    /// when it attaches this link, alongside `setSendCallback`.
+    public func setChannelProofHooks(
+        register: @escaping @Sendable (Data, @escaping @Sendable () async -> Void) async -> Void,
+        deregister: @escaping @Sendable (Data) async -> Void
+    ) {
+        self.channelProofRegistrar = register
+        self.channelProofDeregistrar = deregister
+    }
+
     // MARK: - Request Management
 
     /// Pending requests awaiting response

@@ -140,7 +140,7 @@ public actor RawChannelWriter {
                 streamId: streamId, eof: false,
                 compressed: false, data: chunk
             )
-            try await channel.send(msg)
+            try await channel.sendStream(msg)
             offset = end
         }
     }
@@ -151,6 +151,6 @@ public actor RawChannelWriter {
             streamId: streamId, eof: true,
             compressed: false, data: Data()
         )
-        try await channel.send(msg)
+        try await channel.sendStream(msg)
     }
 }
