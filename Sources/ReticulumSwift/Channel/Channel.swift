@@ -555,7 +555,9 @@ public actor Channel {
 
     /// Full window/sequence/ring snapshot for the bridge `wire_channel_window`.
     public func windowSnapshot() async -> ChannelWindowSnapshot {
-        await initializeProfileIfNeeded()
+        // Read-only probe: do NOT initialize the rate profile here — that would mutate
+        // window/profileInitialized as a side effect of a snapshot read. Report current
+        // state (stored defaults before the first send, profile-adjusted values after).
         let outletMdu = await link.channelOutletMdu
         let txTries = txRing.first?.tries ?? 0
         return ChannelWindowSnapshot(
@@ -587,7 +589,7 @@ public actor Channel {
         // Stale timeout for an already-delivered throwaway envelope:
         // _packet_timeout returns immediately when the packet is DELIVERED
         // (Channel.py:556-557).
-        let stale = TxEnvelope(sequence: Channel.SEQ_MAX == 0 ? 0 : UInt16(Channel.SEQ_MAX), raw: Data(), dropAck: true)
+        let stale = TxEnvelope(sequence: UInt16(Channel.SEQ_MAX), raw: Data(), dropAck: true)
         stale.delivered = true
         await packetTimeout(stale)
     }
@@ -711,9 +713,19 @@ public actor Channel {
                 return
             }
             tx.waiter = cont
-            Task { [weak self] in
+            Task { [weak self, tx] in
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                await self?.resolveWaiterTimeout(tx)
+                if let self {
+                    await self.resolveWaiterTimeout(tx)
+                } else if !tx.resolved {
+                    // The Channel actor was deallocated while a caller was suspended here.
+                    // Resume the continuation directly so it is never abandoned (Swift
+                    // requires exactly-once resume). Safe: with the actor gone, no actor
+                    // code can race this final resolution (TxEnvelope is actor-confined).
+                    tx.resolved = true
+                    tx.waiter?.resume(returning: tx.delivered)
+                    tx.waiter = nil
+                }
             }
         }
     }
