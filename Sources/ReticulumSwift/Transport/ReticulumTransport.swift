@@ -2861,14 +2861,47 @@ public actor ReticulumTransport {
         // Get interface mode
         let mode = getInterfaceMode(for: interfaceId)
 
-        // L2: Rebroadcast detection moved to after validation (inside .recordedAndRebroadcast case)
-
         // Process via announce handler
         let result = await announceHandler.process(
             packet: packet,
             from: interfaceId,
             interfaceMode: mode
         )
+
+        // L2: Local-rebroadcast / passed-on detection (RNS Transport.py:1719-1736).
+        // Runs for ANY VALIDATED HEADER_2 announce carrying a transport_id whose
+        // destination is already in our announce_table — INDEPENDENT of whether the
+        // announce updates the path table. In the reference this detection sits
+        // BEFORE the should_add logic, so a heard rebroadcast that is older / more
+        // hops (and therefore not re-admitted) still counts toward the local
+        // rebroadcast limit and can cancel a pending retry. `.recorded` /
+        // `.recordedAndRebroadcast` / `.ignored(.alreadySeen)` all imply the
+        // signature validated; `.invalidSignature` / `.invalidFormat` /
+        // `.hopLimitExceeded` do not.
+        let announceValidated: Bool
+        switch result {
+        case .recorded, .recordedAndRebroadcast:
+            announceValidated = true
+        case .ignored(let reason):
+            announceValidated = (reason == .alreadySeen)
+        }
+        if transportEnabled, announceValidated,
+           packet.header.headerType == .header2,
+           packet.transportAddress != nil {
+            // RNS increments packet.hops on receive (so its detection compares the
+            // RECEIVED hop count); this port keeps packet.header.hopCount at the
+            // wire value and applies the +1 at each use site (the path record does
+            // the same, AnnounceHandler.swift:295), so add 1 here to get the
+            // received hop count the comparison expects.
+            let detected = await announceTable.recordLocalRebroadcast(
+                destinationHash: packet.destination,
+                incomingHops: packet.header.hopCount + 1
+            )
+            if detected {
+                let hexPrefix = packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()
+                logger.debug("Local rebroadcast detected for \(hexPrefix, privacy: .public)...")
+            }
+        }
 
         // Handle result
         switch result {
@@ -2928,17 +2961,8 @@ public actor ReticulumTransport {
             // The ORIGINAL packet is passed so announce_packet_hash == packet hash.
             await dispatchAnnounceToHandlers(packet: packet, destinationHash: destHash)
 
-            // L2: Local rebroadcast detection (moved here, after validation)
-            // For HEADER_2 announces, check if this is our own rebroadcast heard back
-            if packet.header.headerType == .header2, packet.transportAddress != nil {
-                let detected = await announceTable.recordLocalRebroadcast(
-                    destinationHash: destHash,
-                    incomingHops: packet.header.hopCount
-                )
-                if detected {
-                    logger.debug("Local rebroadcast detected for \(hexPrefix, privacy: .public)...")
-                }
-            }
+            // L2: Local-rebroadcast detection now runs before this switch (hoisted
+            // to fire for any validated HEADER_2 announce, RNS Transport.py:1719-1736).
 
             // C17: Check pending discovery path requests on announce arrival
             if transportEnabled, let prEntry = discoveryPathRequests.removeValue(forKey: destHash) {
@@ -3276,6 +3300,16 @@ public actor ReticulumTransport {
                 await self.periodicTableCleanup()
             }
         }
+    }
+
+    /// Run a single announce-retransmission pass synchronously.
+    ///
+    /// Exposes the otherwise-private `processAnnounceRetransmissions()` (the
+    /// announce branch of RNS jobs(), Transport.py:573-636) so a deterministic
+    /// jobs() pass can be driven without the 1-second timer. Paired with
+    /// `cullTransportTables()` this mirrors a full forced jobs() run.
+    public func runAnnounceRetransmissions() async {
+        await processAnnounceRetransmissions()
     }
 
     /// Stop the periodic announce retransmission task.

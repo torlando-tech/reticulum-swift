@@ -37,7 +37,10 @@ final class BehavioralMockInterface: NetworkInterface, @unchecked Sendable {
     private let lock = NSLock()
 
     init(id: String, name: String, mode: InterfaceMode, mtu: Int,
-         ifacKey: Data? = nil, ifacSize: Int = 0) {
+         ifacKey: Data? = nil, ifacSize: Int = 0,
+         announceRateTarget: TimeInterval? = nil,
+         announceRateGrace: Int = 0,
+         announceRatePenalty: TimeInterval = 0) {
         self.id = id
         self.config = InterfaceConfig(
             id: id,
@@ -47,6 +50,12 @@ final class BehavioralMockInterface: NetworkInterface, @unchecked Sendable {
             mode: mode,
             host: "mock",
             port: 0,
+            // Per-interface announce-rate knobs (RNS Interface.announce_rate_*)
+            // so the production inbound rate limiter (isRateBlocked) runs and the
+            // announce_rate_table becomes observable via read_announce_rate.
+            announceRateTarget: announceRateTarget,
+            announceRateGrace: announceRateGrace,
+            announceRatePenalty: announceRatePenalty,
             bitrate: max(mtu * 8, 0),
             // IFAC (Interface Access Codes): when ifac_netname/ifac_netkey were
             // supplied to behavioral_attach_mock_interface the 64-byte HKDF key
@@ -318,6 +327,14 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         // 16-byte truncated-SHA256 interface hash. Hashing the raw bytes
         // keeps the hash stable across hex-decoding boundaries and avoids
         // the earlier bug where Data(ifaceId.utf8) hashed the ASCII form.
+        // Per-interface announce-rate knobs (RNS Interface.announce_rate_target /
+        // _grace / _penalty). When announce_rate_target is supplied, the
+        // production inbound rate limiter runs and populates the announce_rate_table
+        // that behavioral_read_announce_rate observes.
+        let announceRateTarget = p["announce_rate_target"]?.doubleValue
+        let announceRateGrace = getIntOptional(p, "announce_rate_grace") ?? 0
+        let announceRatePenalty = p["announce_rate_penalty"]?.doubleValue ?? 0
+
         let idBytes = Data((0..<6).map { _ in UInt8.random(in: 0...255) })
         let ifaceId = idBytes.map { String(format: "%02x", $0) }.joined()
         let iface = BehavioralMockInterface(
@@ -326,7 +343,10 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
             mode: parseInterfaceMode(modeRaw),
             mtu: mtu,
             ifacKey: ifacKey,
-            ifacSize: ifacSize
+            ifacSize: ifacSize,
+            announceRateTarget: announceRateTarget,
+            announceRateGrace: announceRateGrace,
+            announceRatePenalty: announceRatePenalty
         )
 
         try blockingAsync {

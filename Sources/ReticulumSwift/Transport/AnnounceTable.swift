@@ -202,10 +202,11 @@ public actor AnnounceTable {
 
             // Check if retransmission is due
             if now > entry.retransmitTimeout {
-                // L1: On retry (retries > 0), use fixed timeout without random jitter
-                // First send (retries == 0) already had jitter applied at insert time
+                // Reschedule to now + PATHFINDER_G + PATHFINDER_RW (fixed, no jitter),
+                // matching Python Transport.py:588 exactly. The reference uses the
+                // full random window deterministically here, NOT a fresh rand().
                 entry.retransmitTimeout = now.addingTimeInterval(
-                    TransportConstants.PATHFINDER_G + (entry.retries == 0 ? Double.random(in: 0...TransportConstants.PATHFINDER_RW) : TransportConstants.PATHFINDER_RW)
+                    TransportConstants.PATHFINDER_G + TransportConstants.PATHFINDER_RW
                 )
                 entry.retries += 1
                 entries[destHash] = entry
@@ -354,6 +355,79 @@ public actor AnnounceTable {
     /// conformance bridge observables, following the `entryTimestamp` precedent.
     public func entryPacketHash(_ destinationHash: Data) -> Data? {
         return entries[destinationHash]?.packet.getFullHash()
+    }
+
+    // MARK: - Entry field accessors (conformance observability)
+    //
+    // Mirror the RNS announce_table[dest] tuple fields (IDX_AT_*,
+    // Transport.py:3559-3567) so the conformance bridge can read the full entry
+    // shape. The Entry struct itself is module-internal; these expose the
+    // individual fields the bridge surfaces in behavioral_read_announce_table.
+
+    /// IDX_AT_RETRIES: retransmission attempts so far, or nil if absent.
+    public func entryRetries(_ destinationHash: Data) -> Int? {
+        return entries[destinationHash]?.retries
+    }
+
+    /// IDX_AT_HOPS: hop count from the original announce, or nil if absent.
+    public func entryHops(_ destinationHash: Data) -> UInt8? {
+        return entries[destinationHash]?.hops
+    }
+
+    /// IDX_AT_RTRNS_TMO: next scheduled retransmission time, or nil if absent.
+    public func entryRetransmitTimeout(_ destinationHash: Data) -> Date? {
+        return entries[destinationHash]?.retransmitTimeout
+    }
+
+    /// IDX_AT_BLCK_RBRD: PATH_RESPONSE-context flag, or nil if absent.
+    public func entryBlockRebroadcasts(_ destinationHash: Data) -> Bool? {
+        return entries[destinationHash]?.blockRebroadcasts
+    }
+
+    /// IDX_AT_RCVD_IF: received_from hash (transport_id or destination_hash;
+    /// despite the index name it is a HASH, not an interface), or nil if absent.
+    public func entryReceivedFrom(_ destinationHash: Data) -> Data? {
+        return entries[destinationHash]?.receivedFrom
+    }
+
+    /// IDX_AT_LCL_RBRD: count of heard-back local rebroadcasts, or nil if absent.
+    public func entryLocalRebroadcasts(_ destinationHash: Data) -> Int? {
+        return entries[destinationHash]?.localRebroadcasts
+    }
+
+    /// IDX_AT_ATTCHD_IF: the attached interface id (or nil when broadcast / the
+    /// entry is absent).
+    public func entryAttachedInterface(_ destinationHash: Data) -> String? {
+        return entries[destinationHash]?.attachedInterfaceId
+    }
+
+    /// Read the announce-rate-limiter state for a destination (the swift analogue
+    /// of RNS.Transport.announce_rate_table[dest], Transport.py:1838-1858), or nil
+    /// if no entry exists. Mirrors the {"last","rate_violations","blocked_until",
+    /// "timestamps"} dict the reference reads.
+    public func rateEntry(for destinationHash: Data)
+        -> (last: Date, rateViolations: Int, blockedUntil: Date, timestamps: [Date])? {
+        guard let e = rateTable[destinationHash] else { return nil }
+        return (e.lastSeen, e.rateViolations, e.blockedUntil, e.timestamps)
+    }
+
+    /// Age an entry's retransmit_timeout and/or timestamp for deterministic
+    /// retransmit tests (RNS IDX_AT_RTRNS_TMO / IDX_AT_TIMESTAMP, the fields
+    /// behavioral_set_announce_timestamp rewinds, Transport.py:587/3000). Both are
+    /// absolute instants; either may be omitted to leave it unchanged.
+    ///
+    /// - Returns: true if an entry existed and was mutated.
+    @discardableResult
+    public func ageEntry(
+        _ destinationHash: Data,
+        retransmitTimeout: Date? = nil,
+        timestamp: Date? = nil
+    ) -> Bool {
+        guard var entry = entries[destinationHash] else { return false }
+        if let retransmitTimeout { entry.retransmitTimeout = retransmitTimeout }
+        if let timestamp { entry.timestamp = timestamp }
+        entries[destinationHash] = entry
+        return true
     }
 
     /// Number of entries in the table.

@@ -206,16 +206,39 @@ func handleBehavioralAnnounceCommand(_ command: String, _ p: [String: JSONValue]
         let inst = try requireBehavioralInstance(handle)
         let dest = try getHex(p, "dest")
 
-        let probe: (found: Bool, ts: Double?, packetHash: Data?) = try blockingAsync {
+        // Snapshot every announce_table[dest] field (IDX_AT_*, Transport.py:
+        // 3559-3567) through the AnnounceTable accessors in a single hop.
+        struct ATProbe {
+            var found = false
+            var ts: Double?
+            var packetHash: Data?
+            var retries: Int?
+            var hops: UInt8?
+            var retransmitTimeout: Double?
+            var localRebroadcasts: Int?
+            var blockRebroadcasts: Bool?
+            var receivedFrom: Data?
+            var attachedInterface: String?
+        }
+        let probe: ATProbe = try blockingAsync {
             let table = await inst.transport.getAnnounceTable()
-            let found = await table.contains(dest)
-            let ts = await table.entryTimestamp(dest)
+            var p = ATProbe()
+            p.found = await table.contains(dest)
+            guard p.found else { return p }
+            p.ts = (await table.entryTimestamp(dest)).map { $0.timeIntervalSince1970 }
             // Real announce_table[dest][IDX_AT_PACKET].packet_hash via the library
             // accessor — the stored packet is the rebroadcast packet (hops+1) but
             // getHashablePart excludes the hop byte, so this equals the dispatched
             // announce's packet hash (test_callback_arity_packet_hash cross-check).
-            let ph = await table.entryPacketHash(dest)
-            return (found, ts.map { $0.timeIntervalSince1970 }, ph)
+            p.packetHash = await table.entryPacketHash(dest)
+            p.retries = await table.entryRetries(dest)
+            p.hops = await table.entryHops(dest)
+            p.retransmitTimeout = (await table.entryRetransmitTimeout(dest)).map { $0.timeIntervalSince1970 }
+            p.localRebroadcasts = await table.entryLocalRebroadcasts(dest)
+            p.blockRebroadcasts = await table.entryBlockRebroadcasts(dest)
+            p.receivedFrom = await table.entryReceivedFrom(dest)
+            p.attachedInterface = await table.entryAttachedInterface(dest)
+            return p
         }
 
         guard probe.found else { return ["found": boolean(false)] }
@@ -223,35 +246,46 @@ func handleBehavioralAnnounceCommand(_ command: String, _ p: [String: JSONValue]
         var r: Result = ["found": boolean(true)]
         r["timestamp"] = probe.ts.map { num($0) } ?? .null
         r["packet_hash"] = probe.packetHash.map { hex($0) } ?? .null
-
-        // LIBRARY-GAP: AnnounceTable.Entry (retries, hops, retransmitTimeout,
-        // receivedFrom, localRebroadcasts, blockRebroadcasts, attachedInterfaceId)
-        // is private; AnnounceTable exposes only contains()/entryTimestamp()/
-        // entryPacketHash(). The remaining RNS announce_table fields
-        // (Transport.py:3559-3567) can't be read, so they're surfaced as null
-        // rather than fabricated. Only packet_hash is asserted by current tests.
-        r["retries"] = .null
-        r["hops"] = .null
-        r["retransmit_timeout"] = .null
-        r["local_rebroadcasts"] = .null
-        r["block_rebroadcasts"] = .null
-        r["received_from"] = .null
-        r["attached_interface"] = .null
+        // RNS announce_table fields (Transport.py:3559-3567). IDX_AT_RCVD_IF
+        // holds received_from — a HASH (transport_id or destination_hash), not an
+        // interface — so it is surfaced as a hex hash; IDX_AT_ATTCHD_IF is the
+        // attached interface's id (or null on a broadcast retransmit).
+        r["retries"] = probe.retries.map { num($0) } ?? .null
+        r["hops"] = probe.hops.map { num(Int($0)) } ?? .null
+        r["retransmit_timeout"] = probe.retransmitTimeout.map { num($0) } ?? .null
+        r["local_rebroadcasts"] = probe.localRebroadcasts.map { num($0) } ?? .null
+        r["block_rebroadcasts"] = probe.blockRebroadcasts.map { boolean($0) } ?? .null
+        r["received_from"] = probe.receivedFrom.map { hex($0) } ?? .null
+        r["attached_interface"] = probe.attachedInterface.map { str($0) } ?? .null
         return r
 
     // Read RNS.Transport.announce_rate_table[dest] (the inbound announce-rate limiter
     // state, Transport.py:1830-1860).
     case "behavioral_read_announce_rate":
         let handle = try getString(p, "handle")
-        _ = try requireBehavioralInstance(handle)
-        _ = try getHex(p, "dest")
+        let inst = try requireBehavioralInstance(handle)
+        let dest = try getHex(p, "dest")
 
-        // LIBRARY-GAP: AnnounceTable.rateTable (the swift analogue of
-        // RNS.Transport.announce_rate_table) is private with no public read accessor
-        // — isRateBlocked() mutates it but nothing surfaces an entry's
-        // last/rate_violations/blocked_until/timestamps. The limiter state cannot be
-        // observed, so we report not-found.
-        return ["found": boolean(false)]
+        // Read the real AnnounceTable rate state (the swift analogue of
+        // RNS.Transport.announce_rate_table[dest], Transport.py:1838-1858),
+        // driven by the production isRateBlocked() on inbound.
+        let rate: (last: Double, rateViolations: Int, blockedUntil: Double, timestamps: [Double])?
+            = try blockingAsync {
+            let table = await inst.transport.getAnnounceTable()
+            guard let e = await table.rateEntry(for: dest) else { return nil }
+            return (e.last.timeIntervalSince1970, e.rateViolations,
+                    e.blockedUntil.timeIntervalSince1970,
+                    e.timestamps.map { $0.timeIntervalSince1970 })
+        }
+
+        guard let rate else { return ["found": boolean(false)] }
+        return [
+            "found": boolean(true),
+            "last": num(rate.last),
+            "rate_violations": num(rate.rateViolations),
+            "blocked_until": num(rate.blockedUntil),
+            "timestamps": .array(rate.timestamps.map { num($0) }),
+        ]
 
     // Age an announce_table[dest] entry for deterministic retransmit tests by setting
     // its retransmit_timeout and/or timestamp (Transport.py:587).
@@ -260,22 +294,22 @@ func handleBehavioralAnnounceCommand(_ command: String, _ p: [String: JSONValue]
         let inst = try requireBehavioralInstance(handle)
         let dest = try getHex(p, "dest")
 
-        let found: Bool = try blockingAsync {
+        // Age the entry's IDX_AT_RTRNS_TMO / IDX_AT_TIMESTAMP in place (mirrors
+        // cmd_behavioral_set_announce_timestamp, Transport.py:587/3000). The values
+        // are absolute epoch seconds; either may be omitted. Setting
+        // retransmit_timeout into the past makes the entry due so a force_cull
+        // retransmit pass fires deterministically.
+        let rtmo = p["retransmit_timeout"]?.doubleValue
+        let tstamp = p["timestamp"]?.doubleValue
+        let set: Bool = try blockingAsync {
             let table = await inst.transport.getAnnounceTable()
-            return await table.contains(dest)
+            return await table.ageEntry(
+                dest,
+                retransmitTimeout: rtmo.map { Date(timeIntervalSince1970: $0) },
+                timestamp: tstamp.map { Date(timeIntervalSince1970: $0) }
+            )
         }
-        guard found else { return ["set": boolean(false)] }
-
-        // LIBRARY-GAP: AnnounceTable exposes no public setter for an entry's
-        // retransmitTimeout / timestamp (RNS IDX_AT_RTRNS_TMO / IDX_AT_TIMESTAMP).
-        // There is no remove+reinsert path that preserves the entry either (insert()
-        // resets timestamp to now() and recomputes the timeout with jitter). So the
-        // aging mutation cannot be applied: presence is reported (so downstream
-        // `found` checks stay meaningful) but the entry is NOT actually aged, and a
-        // force_cull-driven deterministic retransmit will not fire.
-        _ = p["retransmit_timeout"]?.doubleValue
-        _ = p["timestamp"]?.doubleValue
-        return ["set": boolean(true)]
+        return ["set": boolean(set)]
 
     // Register a recording announce handler on the REAL transport
     // (RNS.Transport.register_announce_handler, Transport.py:2465/:2476-2477). The

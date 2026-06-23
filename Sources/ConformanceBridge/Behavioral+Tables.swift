@@ -125,6 +125,11 @@ func handleBehavioralTablesCommand(_ command: String, _ p: [String: JSONValue]) 
         let handle = try getString(p, "handle")
         let inst = try requireBehavioralInstance(handle)
         try blockingAsync {
+            // Announce-retransmit branch FIRST (RNS jobs() runs :573-636 before the
+            // table cull), so a due entry (retransmit_timeout aged into the past via
+            // behavioral_set_announce_timestamp) advances retries / reschedules /
+            // completes deterministically on this synchronous pass.
+            await inst.transport.runAnnounceRetransmissions()
             // Link + reverse table cull (LINK_TIMEOUT / proof-timeout / REVERSE_
             // TIMEOUT arms + the dead-interface arm), Transport.py:670-692.
             await inst.transport.cullTransportTables()
