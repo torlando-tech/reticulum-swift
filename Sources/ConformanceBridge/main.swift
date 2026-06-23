@@ -318,7 +318,14 @@ func handleCommand(_ req: Request) throws -> Result {
 
     case "truncated_hash":
         let data = try getHex(p, "data")
-        return ["hash": hex(Hashing.truncatedHash(data))]
+        // Mirror reference bridge_server.py:749-750 — report BOTH the truncated
+        // hash and the full SHA-256 digest, so callers that derive identifiers from
+        // the full hash (e.g. tunnel_id = full_hash(public_key||interface_hash))
+        // can recompute them without a second command (packet_builders.py:767).
+        return [
+            "hash": hex(Hashing.truncatedHash(data)),
+            "full_hash": hex(Hashing.fullHash(data)),
+        ]
 
     // === 3. Crypto — Key Derivation ===
 
