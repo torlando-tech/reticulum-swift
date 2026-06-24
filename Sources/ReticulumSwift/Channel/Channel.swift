@@ -745,6 +745,22 @@ public actor Channel {
             )
         }
 
+        // Re-check shutDown after the channelBuildPacket await: a concurrent
+        // packetTimeout teardown can run shutdownInternal during that suspension, so
+        // the top-of-send guard alone is not enough. Bail before emplacing/registering
+        // a delivery callback / transmitting onto a torn-down channel, rolling the
+        // reservation back like the no-receipt path above. (The narrower window during
+        // the channelTransmit await below mirrors RNS's own residual — its _shutdown
+        // holds _lock only, not _send_lock, so it can likewise run during RNS's
+        // outlet.send(); the send lock keeps our rollback race-free regardless.)
+        if shutDown {
+            txSequence = reserved
+            return SendResult(
+                rejected: true, ceType: ChannelExceptionType.meLinkNotReady.rawValue,
+                error: "Channel is shut down", sent: false
+            )
+        }
+
         // Emplace, then register the delivery callback BEFORE transmitting so the
         // returning PROOF can never race ahead of the registration (RNS registers
         // the receipt with Transport synchronously inside Packet.send()).

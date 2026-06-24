@@ -2005,7 +2005,11 @@ adaptations, all observably equivalent:
      would otherwise find an empty `txRing`, pass `isReadyToSend()`, and transmit on a dead channel. RNS
      needs no such flag (its `is_ready_to_send` `is_usable` gate is hardcoded `True`, `Channel.py:690`, and
      synchronous teardown can never interleave a send); the guard restores that no-send-after-teardown
-     invariant for the awaiting swift teardown.
+     invariant for the awaiting swift teardown. The guard is checked twice: once after the profile-init /
+     send-lock awaits, and again after the `channelBuildPacket` await (a concurrent `packetTimeout`
+     teardown can land in that suspension), rolling the reservation back on the second hit. The remaining
+     window during the `channelTransmit` await is RNS-parity, not a new gap: RNS's `_shutdown` holds
+     `_lock` only (not `_send_lock`), so it can likewise clear the rings during RNS's own `outlet.send()`.
 
 ---
 
