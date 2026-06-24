@@ -257,16 +257,19 @@ public actor RawChannelWriter {
         let message = StreamDataMessage(
             streamId: streamId, eof: appliedEof, compressed: compSuccess, data: chunk
         )
-        // Consume the one-shot EOF flag: it marks a SINGLE emitted message. RNS does
-        // not reset `_eof` in `write()` (Buffer.py:258) because its `close()` is
-        // terminal — it sets `_eof`, writes exactly once, and never writes again. The
-        // swift port additionally exposes `setEof()` as a public per-message control,
-        // so a sticky flag would stamp EVERY subsequent chunk with EOF (e.g. a
-        // compressible final write that splits across sub-chunks). Resetting here is a
-        // no-op for the close()-terminal path AND for the bridge (which re-asserts
-        // setEof on each final sub-chunk), but makes EOF a correct one-shot marker.
-        eofFlag = false
+        // Send FIRST, then consume the one-shot EOF flag only on success. EOF marks a
+        // SINGLE emitted message: RNS does not reset `_eof` in `write()` (Buffer.py:258)
+        // because its `close()` is terminal (sets `_eof`, writes once, never again),
+        // but the swift port exposes `setEof()` as a public per-message control, so a
+        // sticky flag would stamp EVERY subsequent chunk with EOF (e.g. a compressible
+        // final write that splits across sub-chunks). Consuming AFTER a successful send
+        // also preserves EOF across a REJECTED send: if streamSendMessage throws (e.g.
+        // ME_LINK_NOT_READY after the window wait) nothing went out, so the flag must
+        // survive for the retry — RNS likewise keeps `_eof` when write() returns 0 on
+        // ME_LINK_NOT_READY (Buffer.py:262-266). The reset is a no-op for the
+        // close()-terminal path and the bridge (which re-asserts setEof per sub-chunk).
         let sequence = try await channel.streamSendMessage(message)
+        eofFlag = false
         return StreamWriteOutcome(
             processed: processedLength,
             bytes: chunk.count,
