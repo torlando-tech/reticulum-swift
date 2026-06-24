@@ -6,6 +6,33 @@ file:line, the python reference site, and the reason.
 
 ## Active deviations
 
+### Tunnel-synthesize handler dispatched synchronously on the transport actor
+
+**Sites:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —
+`handleRegularData(_:from:)` (the `tunnelSynthesizeDestination` intercept) and
+`Sources/ReticulumSwift/Transport/ReticulumTransport+Tunnels.swift`
+(`tunnelSynthesizeHandler`, `handleTunnel`).
+
+**Python reference:** `RNS/Transport.py:247-250` (the `tunnel_synthesize`
+destination is registered with `set_packet_callback(tunnel_synthesize_handler)`),
+`:2306-2327` (`tunnel_synthesize_handler`), `:2336-2345` (`handle_tunnel`).
+
+**Reason:** Category (a) — concurrency model. RNS is single-threaded: `inbound`
+delivers a PLAIN packet to the destination's packet callback and the callback
+(`tunnel_synthesize_handler` → `handle_tunnel`) runs to completion *inside*
+`inbound`, so `Transport.tunnels` is populated by the time `inbound` returns.
+reticulum-swift's `DestinationCallbackManager` callback is a synchronous
+`(Data, Packet) -> Void` closure that cannot mutate the `ReticulumTransport`
+actor's state without hopping to it via a detached `Task`, which would race a
+`read_tunnels` that immediately follows `inbound()`. To preserve RNS's
+run-to-completion semantics the swift port intercepts the tunnel-synthesize
+control-destination packet directly in `handleRegularData` (already on the
+transport actor) and calls the handler synchronously, instead of routing it
+through the async callback path. The validate/establish logic, the 176-byte
+exact-length gate, the `full_hash(public_key||interface_hash)` tunnel-id
+derivation, and the receiving-interface binding are byte-for-byte the reference;
+only the dispatch mechanism differs. No wire bytes change.
+
 ### Transport announce-retransmit phase anchor (`announces_last_checked`)
 
 **Sites:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —

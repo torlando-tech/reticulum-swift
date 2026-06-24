@@ -72,6 +72,10 @@ public enum TransportConstants {
     /// Link table stale timeout (Python STALE_TIME * 1.25 ≈ 15 min)
     public static let LINK_TIMEOUT: TimeInterval = 900
 
+    /// Tunnel table entry timeout (8 hours, Python TUNNEL_TIMEOUT = 60*60*8).
+    /// Reference: RNS Transport.py:93.
+    public static let TUNNEL_TIMEOUT: TimeInterval = 60 * 60 * 8
+
     /// Maximum packet hashes tracked for deduplication (Python hashlist_maxsize)
     public static let HASHLIST_MAXSIZE: Int = 1_000_000
 

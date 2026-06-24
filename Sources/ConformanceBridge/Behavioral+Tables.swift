@@ -249,14 +249,30 @@ func handleBehavioralTablesCommand(_ command: String, _ p: [String: JSONValue]) 
         ]
 
     case "behavioral_read_tunnels":
-        // Read the tunnel table (Transport.py:886-920 reference).
+        // Read the REAL tunnel table (reference cmd_behavioral_read_tunnels,
+        // behavioral_transport.py:886-920; RNS Transport.tunnels, Transport.py:119,
+        // IDX_TT_* at :3581-3584). Each entry decomposes to the python shape
+        // {tunnel_id, interface_hash, interface_id, expires, num_paths}. The table
+        // is populated by the validated tunnel-synthesize handshake
+        // (Transport.py:2306-2345) which inbound() drives synchronously, so a
+        // tunnel established by a just-injected synthesize packet is observable here.
         let handle = try getString(p, "handle")
-        _ = try requireBehavioralInstance(handle)
-        // LIBRARY-GAP: reticulum-swift's ReticulumTransport has no tunnel
-        // subsystem — no Transport.tunnels table and no tunnel_synthesize_handler
-        // / handle_tunnel inbound path (RNS ref: Transport.py:2306-2345, IDX_TT_*
-        // at :3581-3584). There is nothing to read; return the empty shape.
-        return ["tunnels": .array([])]
+        let inst = try requireBehavioralInstance(handle)
+        let entries = try blockingAsync { await inst.transport.tunnelsSnapshot() }
+        let tunnels: [JSONValue] = entries.map { e in
+            // interface_hash mirrors read_link_table's iface descriptor (the
+            // 16-byte attach hash); RNS surfaces iface.get_hash() here. Not asserted
+            // by the tunnel tests but provided for python shape parity.
+            let ifaceHash = e.interfaceId.flatMap { behavioralTablesInterfaceHash(forId: $0) }
+            return .dict([
+                "tunnel_id": hex(e.tunnelId),
+                "interface_hash": ifaceHash.map { hex($0) } ?? .null,
+                "interface_id": e.interfaceId.map { str($0) } ?? .null,
+                "expires": num(e.expires.timeIntervalSince1970),
+                "num_paths": num(e.paths.count),
+            ])
+        }
+        return ["tunnels": .array(tunnels)]
 
     case "behavioral_synthesize_tunnel":
         // Emit a tunnel-synthesize packet on an interface (Transport.py:923-954

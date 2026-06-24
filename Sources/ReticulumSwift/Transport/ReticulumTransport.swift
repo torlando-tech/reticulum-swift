@@ -292,6 +292,17 @@ public actor ReticulumTransport {
     /// PLAIN destination for receiving path requests from other nodes
     private var pathRequestDestination: Destination?
 
+    /// PLAIN control destination for receiving tunnel-synthesize packets
+    /// (rnstransport/tunnel/synthesize). Set by `registerTunnelSynthesizeHandler()`.
+    /// Reference: RNS Transport.py:247-250 (tunnel_synthesize_destination).
+    var tunnelSynthesizeDestination: Destination?
+
+    /// Tunnel table — tunnels to other transport instances, keyed by tunnel_id
+    /// (`full_hash(public_key || interface_hash)`). Established by the validated
+    /// tunnel-synthesize handshake and bound to the receiving interface.
+    /// Reference: RNS `Transport.tunnels` (Transport.py:119, IDX_TT_* :3581-3584).
+    var tunnels: [Data: TunnelTableEntry] = [:]
+
     /// C14: Per-interface earliest time the next announce can be sent (bandwidth cap)
     private var announceAllowedAt: [String: Date] = [:]
 
@@ -2739,6 +2750,19 @@ public actor ReticulumTransport {
     private func handleRegularData(_ packet: Packet, from interfaceId: String) async {
         let destHash = packet.destination
         let hexPrefix = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+
+        // RNS Transport.py:247-250 / 2306-2327 — a PLAIN DATA packet addressed to
+        // the rnstransport/tunnel/synthesize control destination is the tunnel
+        // handshake. RNS registers that destination with the synchronous
+        // tunnel_synthesize_handler packet callback; mirror that synchronously on
+        // the transport actor (rather than via the async DestinationCallback path,
+        // whose detached Task would race a read that immediately follows inbound()).
+        // The handler enforces the exact-length gate, validates the carried
+        // signature, and binds the established tunnel to THIS receiving interface.
+        if let tsDest = tunnelSynthesizeDestination, destHash == tsDest.hash {
+            tunnelSynthesizeHandler(data: packet.data, receivingInterfaceId: interfaceId)
+            return
+        }
 
         // Debug: list all registered destinations
         let registeredDests = destinations.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }

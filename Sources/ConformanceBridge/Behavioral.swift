@@ -277,6 +277,13 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
             // test_path_request_answer_grace_delays, ...) see {'found': False}.
             // Mirrors wire_start_tcp_server (WireTcp.swift:471) and PipePeer.
             await transport.registerPathRequestHandler()
+            // Register the RNS `rnstransport.tunnel.synthesize` control destination
+            // so injected tunnel-synthesize packets reach the validate/establish
+            // handler (Transport.py:247-250 -> tunnel_synthesize_handler ->
+            // handle_tunnel). Without this the PLAIN control destination is never
+            // recognized and behavioral_read_tunnels stays empty after a valid
+            // synthesize packet is injected (test_tunnels / exact-length-gate).
+            await transport.registerTunnelSynthesizeHandler()
         }
 
         let handle = Data((0..<8).map { _ in UInt8.random(in: 0...255) }).map { String(format: "%02x", $0) }.joined()
