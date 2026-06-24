@@ -67,26 +67,30 @@ func wireAttachInboundChannelRecorder(handle: String, linkId: Data, channel: Cha
     let linkIdHex = bytesToHex(linkId)
     let key = "\(handle):\(linkIdHex)"
 
+    let state = ChannelRecState(channel: channel)
+
+    // Claim the map slot under the lock BEFORE registering the channel callback.
+    // The previous order (register, THEN store) was a TOCTOU: two racing attachers
+    // both passed the existence check, both called setMessageCallback (the second
+    // OVERWRITING the first), then only one won the map slot — so the stored state
+    // could be the one whose callback was overwritten, leaving recorded messages
+    // flowing into an orphaned state. Deciding the winner under lock first, then
+    // registering only the winner's callback, keeps the active callback and the
+    // stored state in agreement.
     wireChannelLock.lock()
     if wireChannelStates[key] != nil {
         wireChannelLock.unlock()
         return
     }
+    wireChannelStates[key] = state
     wireChannelLock.unlock()
 
-    let state = ChannelRecState(channel: channel)
     await channel.register(WireChannelMessage.self)
     await channel.setMessageCallback { message in
         if let m = message as? WireChannelMessage {
             state.record(m.data)
         }
     }
-
-    wireChannelLock.lock()
-    if wireChannelStates[key] == nil {
-        wireChannelStates[key] = state
-    }
-    wireChannelLock.unlock()
 }
 
 // MARK: - Helpers
@@ -133,6 +137,17 @@ private func channelEnsureState(
     let channel: Channel = try blockingAsync { await link.getOrCreateChannel() }
     let state = ChannelRecState(channel: channel)
 
+    // Claim the map slot under lock BEFORE registering the callback (same TOCTOU fix
+    // as wireAttachInboundChannelRecorder): a racer must not register a callback that
+    // overwrites the winner's while the loser's state is the one stored/returned.
+    wireChannelLock.lock()
+    if let raced = wireChannelStates[key] {
+        wireChannelLock.unlock()
+        return raced
+    }
+    wireChannelStates[key] = state
+    wireChannelLock.unlock()
+
     // register_message_type(_WireChannelMessage) + add_message_handler(recorder).
     try blockingAsync {
         await channel.register(WireChannelMessage.self)
@@ -142,14 +157,6 @@ private func channelEnsureState(
             }
         }
     }
-
-    wireChannelLock.lock()
-    if let raced = wireChannelStates[key] {
-        wireChannelLock.unlock()
-        return raced
-    }
-    wireChannelStates[key] = state
-    wireChannelLock.unlock()
     return state
 }
 
