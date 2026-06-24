@@ -179,4 +179,24 @@ final class ChannelHardeningTests: XCTestCase {
             "Two concurrent sends must reserve distinct sequences (the send lock " +
             "serialises the reservation); aliasing would leave nextSequence at 1.")
     }
+
+    // MARK: - RawChannelWriter: EOF is a one-shot flag
+
+    /// setEof(true) must mark exactly ONE emitted StreamDataMessage. A sticky flag
+    /// (the pre-fix behaviour) would stamp EOF onto every subsequent write too —
+    /// wrong for a stream whose final write splits, or any reuse of the writer.
+    func testWriterEofFlagIsOneShot() async throws {
+        let link = try await makeActiveLink()
+        await link.setSendCallback { _ in }
+        let channel = await link.getOrCreateChannel()
+        let (_, writer) = await channel.createBuffer(streamId: 7)
+
+        await writer.setEof(true)
+        let first = try await writer.writeChunk(Data([0x01, 0x02, 0x03]))
+        let second = try await writer.writeChunk(Data([0x04, 0x05, 0x06]))
+
+        XCTAssertTrue(first.eof, "First write after setEof(true) must carry EOF")
+        XCTAssertFalse(second.eof,
+            "EOF must be one-shot — the second write must NOT inherit the flag.")
+    }
 }

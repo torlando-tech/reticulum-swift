@@ -253,15 +253,25 @@ public actor RawChannelWriter {
             processedLength = chunk.count
         }
 
+        let appliedEof = eofFlag
         let message = StreamDataMessage(
-            streamId: streamId, eof: eofFlag, compressed: compSuccess, data: chunk
+            streamId: streamId, eof: appliedEof, compressed: compSuccess, data: chunk
         )
+        // Consume the one-shot EOF flag: it marks a SINGLE emitted message. RNS does
+        // not reset `_eof` in `write()` (Buffer.py:258) because its `close()` is
+        // terminal — it sets `_eof`, writes exactly once, and never writes again. The
+        // swift port additionally exposes `setEof()` as a public per-message control,
+        // so a sticky flag would stamp EVERY subsequent chunk with EOF (e.g. a
+        // compressible final write that splits across sub-chunks). Resetting here is a
+        // no-op for the close()-terminal path AND for the bridge (which re-asserts
+        // setEof on each final sub-chunk), but makes EOF a correct one-shot marker.
+        eofFlag = false
         let sequence = try await channel.streamSendMessage(message)
         return StreamWriteOutcome(
             processed: processedLength,
             bytes: chunk.count,
             compressed: compSuccess,
-            eof: eofFlag,
+            eof: appliedEof,
             sequence: sequence
         )
     }

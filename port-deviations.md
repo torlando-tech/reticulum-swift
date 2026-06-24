@@ -2024,6 +2024,16 @@ decompression bound mirror `Buffer.py` exactly. Two structural adaptations, obse
      drain-to-empty wait is performed by the bridge `wire_buffer_stream` loop, which polls
      `Channel.windowSnapshot().txRing` until 0 — the same settle the python command performs around its
      `RawChannelWriter.close()`.
+  3. **One-shot EOF flag + public `setEof()` (greploop hardening 2026-06-24).** RNS `write()` builds
+     `StreamDataMessage(..., self._eof, ...)` and never resets `_eof` (`Buffer.py:258`); it does not need
+     to, because `_eof` is set only inside the terminal `close()` (`Buffer.py:278`) which writes exactly
+     once and never writes again. The swift port additionally exposes `setEof(_:)` as a public per-message
+     control (used by the conformance bridge's `eof_with_data` path), so a sticky `eofFlag` would stamp
+     EOF onto every subsequent emitted message — e.g. a compressible final write that `writeChunk` splits
+     across sub-chunks. `writeChunk` therefore consumes the flag (`eofFlag = false`) right after building
+     the message, making EOF a correct one-shot marker. This is a no-op for the `close()`-terminal path
+     and for the bridge (which re-asserts `setEof` per final sub-chunk), so observable behaviour for every
+     RNS-faithful usage is unchanged.
 
 ---
 
