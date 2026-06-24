@@ -227,6 +227,18 @@ public actor Channel {
     /// Set once `_shutdown` has run (RNS clears handlers + rings on teardown).
     private var shutDown = false
 
+    /// Send serialization, mirroring RNS `self._send_lock` (Channel.py:288/606).
+    /// RNS holds `_send_lock` across the WHOLE `send()` — reserve, outlet transmit,
+    /// and tx-ring emplace — so only one send runs end-to-end at a time. The swift
+    /// actor's isolation is the `_lock` (RLock) equivalent for synchronous regions,
+    /// but the outlet transmit is `await`-based, so the actor would let a second
+    /// `performSend` interleave at a suspension point. This FIFO hand-off mutex is
+    /// the language-necessity equivalent that a threading.Lock can't express here.
+    /// Documented in port-deviations.md. `false` = free; ownership is handed
+    /// directly to the next waiter on release (the resumed waiter does not re-check).
+    private var sendLocked = false
+    private var sendLockWaiters: [CheckedContinuation<Void, Never>] = []
+
     /// TX retransmission ring (RNS `_tx_ring`).
     private var txRing: [TxEnvelope] = []
 
@@ -444,6 +456,24 @@ public actor Channel {
                 }
             }
 
+            // (2b) PORT DEVIATION (defensive hardening — see port-deviations.md):
+            // bound the forward receive window. RNS's _rx_ring is an unbounded deque
+            // (Channel.py:290) with no cap on FORWARD (sequence >= next_rx) emplacement,
+            // so a peer ignoring the flow-control window could buffer up to SEQ_MODULUS
+            // (64Ki) undelivered messages. A conformant sender never has more than
+            // window_max (<= WINDOW_MAX_FAST) envelopes outstanding, so any sequence
+            // MORE than WINDOW_MAX_FAST ahead of next_rx_sequence is out-of-window and
+            // dropped. This never rejects traffic a reference RNS peer would send (its
+            // furthest in-flight sequence is below next_rx + window_max <= next_rx +
+            // WINDOW_MAX_FAST), and it keeps the same inclusive boundary as the wrapped
+            // stale-drop above. `&-` is the mod-2^16 forward distance (handles wrap).
+            let nextRx = rxSequence
+            let forwardDistance = envelope.sequence &- nextRx
+            if forwardDistance > UInt16(Channel.WINDOW_MAX_FAST) {
+                logger.debug("Dropping out-of-window channel sequence \(envelope.sequence) (\(forwardDistance) ahead of \(nextRx))")
+                return
+            }
+
             // (3) Emplace with KEEP-FIRST de-duplication (Channel.py:398-400:
             // _emplace_envelope returns False for a sequence already present, so
             // the first-seen envelope is retained and the later copy discarded).
@@ -605,12 +635,48 @@ public actor Channel {
         var envelope: TxEnvelope? = nil
     }
 
+    /// Acquire the send lock (RNS `self._send_lock`, Channel.py:606). Either grabs
+    /// the free lock or suspends FIFO until a prior send hands it over. Only the
+    /// fresh-send path takes this lock; RNS `_packet_delivered`/`_packet_timeout`
+    /// (and their resends) run under `_lock` only, so the swift equivalents
+    /// (`packetDelivered`/`packetTimeout`) must NOT acquire it.
+    private func acquireSendLock() async {
+        if !sendLocked {
+            sendLocked = true
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            sendLockWaiters.append(cont)
+        }
+        // Resumed by releaseSendLock, which transfers ownership directly: the lock
+        // stays held (sendLocked == true) and is now ours.
+    }
+
+    /// Release the send lock. If a waiter is queued, ownership is handed directly to
+    /// the next (the lock stays held); otherwise the lock goes free.
+    private func releaseSendLock() {
+        if sendLockWaiters.isEmpty {
+            sendLocked = false
+        } else {
+            let cont = sendLockWaiters.removeFirst()
+            cont.resume()
+        }
+    }
+
     /// The synchronous (non-waiting) core of a channel send: window admission,
     /// sequence reservation, ME_TOO_BIG guard, outlet transmit with rollback, and
     /// tx-ring emplacement + timer arming. Returns the emplaced envelope (if sent).
     private func performSend(
         payload: Data, msgtype: UInt16, dropAck: Bool, failOutlet: Bool
     ) async -> SendResult {
+        // Serialise the entire send under the send lock (RNS self._send_lock,
+        // Channel.py:606): reserve -> outlet transmit -> emplace must run end-to-end
+        // without another send interleaving at one of the awaits below. This makes
+        // the sequence reservation AND the no-receipt rollback (txSequence = reserved)
+        // atomic exactly as RNS's lock does.
+        await acquireSendLock()
+        defer { releaseSendLock() }
+
         await initializeProfileIfNeeded()
 
         // is_ready_to_send (Channel.py:471-491): the outlet is always usable; the
@@ -623,6 +689,10 @@ public actor Channel {
         }
 
         // Reserve the next sequence and pack the envelope (Channel.py:592-595).
+        // This whole reserve -> size-check -> commit -> transmit -> emplace span is
+        // serialised by the send lock acquired at the top of performSend (mirroring
+        // RNS's self._send_lock, Channel.py:606), so the `await link.channelOutletMdu`
+        // below cannot interleave a concurrent send that reserves the same sequence.
         let reserved = txSequence
         let envelope = Envelope(msgtype: msgtype, sequence: reserved, payload: payload)
         let raw = envelope.pack()
@@ -809,6 +879,18 @@ public actor Channel {
             // the send returns sees CLOSED.
             let pending = txRing
             shutdownInternal()
+            // Mirror RNS _clear_rings (Channel.py:382-385), which drops each tx
+            // envelope's outlet delivered/timeout callbacks. shutdownInternal cancels
+            // the local timeout Tasks but is synchronous, so it cannot await the
+            // delivery deregistration; do it here. Without this the Transport keeps
+            // the per-packet delivery registration (a leak) and a late PROOF would
+            // invoke packetDelivered on the torn-down channel. dropAck envelopes
+            // never registered a callback (performSend registers only when !dropAck).
+            for e in pending where !e.dropAck {
+                if let h = e.packetHash {
+                    await link.channelDeregisterDelivery(fullHash: h)
+                }
+            }
             await link.channelOutletTimedOut()
             for e in pending {
                 resolveWaiter(e, delivered: false)

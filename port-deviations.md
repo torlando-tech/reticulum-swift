@@ -1930,6 +1930,18 @@ does not depend on iteration order. The stale-drop window (`Channel.py:431-439`,
 unpack-before-advance MSGTYPE gate (`Channel.py:429`/`468-469`) are mirrored exactly. `rxRingDepth`
 reports `inboundBuffer.count`, equivalent to RNS's `len(rx_ring)`.
 
+**Added defensive forward-window bound (greploop hardening 2026-06-24).** RNS's `_rx_ring`
+(`Channel.py:290`) is an unbounded `collections.deque` — the stale-drop only rejects sequences BEHIND
+`next_rx_sequence`; FORWARD emplacement (`sequence >= next_rx`) is uncapped, so a peer ignoring the
+flow-control window could grow the ring up to `SEQ_MODULUS` (64Ki) undelivered messages. `receive(data:)`
+now drops any sequence whose mod-2^16 forward distance from `rxSequence` exceeds `WINDOW_MAX_FAST` (48),
+bounding the buffer to ≤49 entries. This is interop-safe: a conformant sender never has more than
+`window_max` (≤ `WINDOW_MAX_FAST`) envelopes outstanding, so its furthest in-flight sequence is below
+`next_rx + WINDOW_MAX_FAST` and is never rejected. The drop threshold uses the SAME inclusive boundary as
+the wrapped stale-drop branch above (keep distance ≤ 48, drop > 48), so the two checks agree at the edge.
+Category (a)-adjacent hardening: a bound RNS lacks, but a no-op for every sequence a reference RNS peer
+can emit.
+
 ### `Channel` TX reliability layer — outlet split + transport proof-hook injection (fix/conformance-failures 2026-06-23)
 
 **Sites:** `Channel/Channel.swift` (`TxEnvelope`, `performSend`, `sendTracked`, `sendStream`,
@@ -1969,6 +1981,24 @@ adaptations, all observably equivalent:
      happens on first send/window-read instead of in `__init__` because the actor cannot read the link
      RTT synchronously at construction; the stored defaults already equal the non-degenerate profile, so
      the only observable effect is the degenerate (RTT>RTT_SLOW) downgrade, applied before the first send.
+  4. **Send serialization (`acquireSendLock`/`releaseSendLock`, added greploop hardening 2026-06-24).**
+     RNS `send()` holds `self._send_lock` (a `threading.Lock`, `Channel.py:288/606`) across the ENTIRE
+     send — `is_ready_to_send` → reserve → `outlet.send()` → emplace — so only one send runs end-to-end
+     and both the sequence reservation AND the no-receipt rollback (`self._next_sequence =
+     reserved_sequence`, `Channel.py:608`) are atomic. The swift actor's isolation is the `_lock` (RLock)
+     equivalent for synchronous regions only; because `channelOutletMdu`/`channelBuildPacket`/
+     `channelTransmit` are `await`-based, a second `performSend` (reachable from `send`/`sendStream`/
+     `sendTracked`/`streamSendMessage`) would otherwise interleave at a suspension point and reserve the
+     SAME sequence, or clobber the rollback. A `threading.Lock` cannot express a critical section held
+     across `await`, so `performSend` now wraps its body in a FIFO hand-off async mutex (`sendLocked` +
+     `sendLockWaiters`): acquire grabs the free lock or suspends; release hands ownership directly to the
+     next waiter (the lock stays held, the resumed waiter does not re-check). Only the fresh-send path
+     takes it — `packetDelivered`/`packetTimeout` and the timeout-driven resend run under `_lock` only in
+     RNS (`_send_lock` is NOT held there), so their swift equivalents must not acquire it. `shutdownInternal`
+     additionally deregisters each tx envelope's transport-side delivery callback (the `async`
+     `channelDeregisterDelivery`, done in the `packetTimeout` teardown since `shutdownInternal` is sync),
+     mirroring `_clear_rings` (`Channel.py:382-385`) dropping each packet's delivered/timeout callbacks —
+     without it the registration leaks and a late PROOF could fire `packetDelivered` on a dead channel.
 
 ---
 
