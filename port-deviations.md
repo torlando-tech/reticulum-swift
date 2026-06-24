@@ -1995,6 +1995,10 @@ adaptations, all observably equivalent:
      next waiter (the lock stays held, the resumed waiter does not re-check). Only the fresh-send path
      takes it — `packetDelivered`/`packetTimeout` and the timeout-driven resend run under `_lock` only in
      RNS (`_send_lock` is NOT held there), so their swift equivalents must not acquire it. `shutdownInternal`
+     also drains `sendLockWaiters` (resumes + clears every parked acquirer, mirroring the deallocation
+     rescue on `awaitEnvelope`'s waiter), so a queued send's `CheckedContinuation` is always resumed on
+     teardown — the resumed acquirers then reject via the `shutDown` guard, so the transient multiple-owner
+     hand-off is harmless. `shutdownInternal`
      additionally deregisters each tx envelope's transport-side delivery callback (the `async`
      `channelDeregisterDelivery`, done in the `packetTimeout` teardown since `shutdownInternal` is sync),
      mirroring `_clear_rings` (`Channel.py:382-385`) dropping each packet's delivered/timeout callbacks —

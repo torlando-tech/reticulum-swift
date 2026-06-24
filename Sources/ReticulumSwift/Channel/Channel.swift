@@ -982,6 +982,18 @@ public actor Channel {
         }
         txRing.removeAll()
         inboundBuffer.removeAll()
+        // Drain any sends parked on the send lock so their CheckedContinuations are
+        // always resumed (mirrors the deallocation rescue on awaitEnvelope's waiter):
+        // each resumed acquirer proceeds and is then rejected by the shutDown guard in
+        // performSend, so the broken hand-off (several "owners" at once) is harmless —
+        // no send can emit on a torn-down channel. Without this a waiter could leak its
+        // continuation if the actor were ever torn down with sends still queued.
+        let waiters = sendLockWaiters
+        sendLockWaiters.removeAll()
+        sendLocked = false
+        for cont in waiters {
+            cont.resume()
+        }
     }
 
     /// One-time window-profile realization from the link RTT (RNS Channel.__init__
