@@ -1999,6 +1999,13 @@ adaptations, all observably equivalent:
      `channelDeregisterDelivery`, done in the `packetTimeout` teardown since `shutdownInternal` is sync),
      mirroring `_clear_rings` (`Channel.py:382-385`) dropping each packet's delivered/timeout callbacks —
      without it the registration leaks and a late PROOF could fire `packetDelivered` on a dead channel.
+     Because that deregistration (and `channelOutletTimedOut`) AWAIT — releasing the actor mid-teardown,
+     where RNS's `_shutdown` is synchronous and atomic under `_lock` (`Channel.py:375-377`) — `performSend`
+     also guards on the `shutDown` flag after its own awaits: a send queued during the teardown window
+     would otherwise find an empty `txRing`, pass `isReadyToSend()`, and transmit on a dead channel. RNS
+     needs no such flag (its `is_ready_to_send` `is_usable` gate is hardcoded `True`, `Channel.py:690`, and
+     synchronous teardown can never interleave a send); the guard restores that no-send-after-teardown
+     invariant for the awaiting swift teardown.
 
 ---
 

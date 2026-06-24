@@ -679,6 +679,24 @@ public actor Channel {
 
         await initializeProfileIfNeeded()
 
+        // A torn-down channel must not emit new envelopes. RNS relies on _shutdown
+        // being SYNCHRONOUS (it runs atomically under _lock, Channel.py:375-377), so
+        // a send can never interleave a COMPLETED teardown — and RNS keeps no
+        // shutdown flag because it never needs one (is_ready_to_send's is_usable gate
+        // is hardcoded True, Channel.py:690). The swift teardown, by contrast, awaits
+        // (channelDeregisterDelivery / channelOutletTimedOut release the actor
+        // mid-shutdown), so a send queued during that window would otherwise find an
+        // empty txRing, pass isReadyToSend(), and transmit on a dead channel. Guard on
+        // the shutDown flag set by shutdownInternal to restore RNS's invariant. This
+        // sits after the awaits above so a teardown that landed while we waited on the
+        // send lock / profile init is observed.
+        guard !shutDown else {
+            return SendResult(
+                rejected: true, ceType: ChannelExceptionType.meLinkNotReady.rawValue,
+                error: "Channel is shut down", sent: false
+            )
+        }
+
         // is_ready_to_send (Channel.py:471-491): the outlet is always usable; the
         // gate is purely "outstanding (un-delivered tx-ring envelopes) < window".
         guard isReadyToSend() else {

@@ -199,4 +199,34 @@ final class ChannelHardeningTests: XCTestCase {
         XCTAssertFalse(second.eof,
             "EOF must be one-shot — the second write must NOT inherit the flag.")
     }
+
+    // MARK: - performSend: rejects after channel teardown (#1 shutDown guard)
+
+    /// A send after the channel has torn down must be REJECTED, not transmitted on a
+    /// dead channel. Drives the real teardown path end to end: a tracked send whose
+    /// delivery PROOF never arrives (bare link, no transport proof hooks) times out
+    /// through MAX_TRIES, which runs packetTimeout -> shutdownInternal (setting
+    /// shutDown). A subsequent send() must then reject with channelNotReady — the
+    /// shutDown guard in performSend. Without it, the empty txRing would pass
+    /// isReadyToSend() and a new envelope would go out on the closed channel.
+    func testSendRejectedAfterChannelTeardown() async throws {
+        let link = try await makeActiveLink()
+        await link.setSendCallback { _ in }   // transmit "succeeds"; no PROOF ever returns
+        let channel = await link.getOrCreateChannel()
+
+        let outcome = await channel.sendTracked(
+            payload: Data([0x01]), msgtype: TestChannelMessage.MSGTYPE,
+            dropAck: false, failOutlet: false, timeout: 5.0
+        )
+        XCTAssertFalse(outcome.delivered, "No proof arrives, so the send is never delivered")
+
+        // Channel is now torn down (MAX_TRIES exceeded). A fresh send must reject.
+        do {
+            try await channel.send(TestChannelMessage(marker: 0x02))
+            XCTFail("send() on a torn-down channel must throw, not transmit")
+        } catch let e as ChannelError {
+            XCTAssertEqual(e, .channelNotReady,
+                "Post-teardown send must reject with channelNotReady (shutDown guard).")
+        }
+    }
 }
