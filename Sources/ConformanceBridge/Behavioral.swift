@@ -37,6 +37,7 @@ final class BehavioralMockInterface: NetworkInterface, @unchecked Sendable {
     private let lock = NSLock()
 
     init(id: String, name: String, mode: InterfaceMode, mtu: Int,
+         bitrate: Int? = nil, announceCap: Double? = nil,
          ifacKey: Data? = nil, ifacSize: Int = 0,
          announceRateTarget: TimeInterval? = nil,
          announceRateGrace: Int = 0,
@@ -56,7 +57,14 @@ final class BehavioralMockInterface: NetworkInterface, @unchecked Sendable {
             announceRateTarget: announceRateTarget,
             announceRateGrace: announceRateGrace,
             announceRatePenalty: announceRatePenalty,
-            bitrate: max(mtu * 8, 0),
+            // Mirror the reference mock (behavioral_transport.py:173 `self.bitrate =
+            // 10_000_000 if bitrate is None else int(bitrate)`): a default 10 Mbit/s
+            // link so the announce_cap egress spacing `(len*8/bitrate)/announce_cap`
+            // is negligible unless a test deliberately lowers bitrate / announce_cap.
+            // (The previous mtu*8 default made the cap ~15s and silently swallowed
+            // every forwarded announce after the first within a test's drain window.)
+            bitrate: bitrate ?? 10_000_000,
+            announceCap: announceCap ?? TransportConstants.ANNOUNCE_CAP,
             // IFAC (Interface Access Codes): when ifac_netname/ifac_netkey were
             // supplied to behavioral_attach_mock_interface the 64-byte HKDF key
             // and access-code size ride on the config so transport.addInterface
@@ -343,6 +351,12 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         let announceRateTarget = p["announce_rate_target"]?.doubleValue
         let announceRateGrace = getIntOptional(p, "announce_rate_grace") ?? 0
         let announceRatePenalty = p["announce_rate_penalty"]?.doubleValue ?? 0
+        // Per-interface announce-egress knobs (RNS Interface.bitrate / announce_cap).
+        // When absent the constructor falls back to the reference mock defaults
+        // (bitrate 10 Mbit/s, announce_cap = ANNOUNCE_CAP). A test lowers these to
+        // widen the announce_cap egress spacing (behavioral_transport.py:163,211-212).
+        let bitrate = getIntOptional(p, "bitrate")
+        let announceCap = p["announce_cap"]?.doubleValue
 
         let idBytes = Data((0..<6).map { _ in UInt8.random(in: 0...255) })
         let ifaceId = idBytes.map { String(format: "%02x", $0) }.joined()
@@ -351,6 +365,8 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
             name: name,
             mode: parseInterfaceMode(modeRaw),
             mtu: mtu,
+            bitrate: bitrate,
+            announceCap: announceCap,
             ifacKey: ifacKey,
             ifacSize: ifacSize,
             announceRateTarget: announceRateTarget,

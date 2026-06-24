@@ -6,6 +6,34 @@ file:line, the python reference site, and the reason.
 
 ## Active deviations
 
+### Transport announce-retransmit phase anchor (`announces_last_checked`)
+
+**Sites:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —
+`startRetransmissionLoop()` (`announcesLastChecked` back-dated anchor) and
+`processAnnounceRetransmissions(force:)` (the `ANNOUNCES_CHECK_INTERVAL` gate).
+
+**Python reference:** `RNS/Transport.py:181` (`announces_last_checked = 0.0`),
+`:574`/`:636` (the announce-retransmit branch runs at most once per
+`announces_check_interval = 1.0`s and unconditionally re-stamps
+`announces_last_checked` after each sweep), `:500-503` (`jobloop`).
+
+**Reason:** Category (a) — runtime model. RNS's `Transport` is a process-wide
+singleton, so `announces_last_checked` is global and persists for the whole
+process; the once-per-second announce sweep is therefore phased arbitrarily
+relative to any individual heard announce, and the reference's own behavioral
+`test_announce_rebroadcast_wire_format` (which sleeps exactly 1.0s then drains)
+is correspondingly phase-fragile — it fails the reference in isolation and in a
+full `tests/behavioral/` run, passing only when prior tests happen to align the
+global phase. reticulum-swift instead constructs a FRESH `ReticulumTransport`
+per conformance behavioral handle, so the phase would re-anchor every test and
+deterministically race the sweep against the test's drain. The gate value
+(1.0s) and steady-state cadence match RNS exactly; the only deviation is that
+the per-transport anchor is back-dated so the FIRST sweep lands ~0.75s after
+start — inside a forwarded announce's `[0, PATHFINDER_RW=0.5]`s due window plus
+margin, before a 1.0s rebroadcast drain, and after the sub-0.5s drain windows of
+the last-hop / forwarding tests. This makes the swift behavior deterministic
+where RNS is luck-of-phase; it changes no wire bytes and no steady-state timing.
+
 ### ConformanceBridge `crypto_provider_op` — single crypto provider
 
 **Sites:** `Sources/ConformanceBridge/Ext+Crypto.swift` — `handleCryptoExtCommand`,

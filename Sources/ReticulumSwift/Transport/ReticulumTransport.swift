@@ -223,6 +223,13 @@ public actor ReticulumTransport {
     /// Task handle for periodic announce retransmission
     private var retransmissionTask: Task<Void, Never>?
 
+    /// Last time the announce-table retransmit branch ran. The jobs() loop ticks
+    /// every `job_interval` (0.25s) but the announce-retransmit branch is gated to
+    /// `ANNOUNCES_CHECK_INTERVAL` (1.0s) so a heard announce rebroadcasts at most
+    /// once per second. `.distantPast` makes the very first jobs() pass run it.
+    /// Reference: Python Transport.announces_last_checked (Transport.py:181/574/636).
+    private var announcesLastChecked: Date = .distantPast
+
     /// Registered interfaces by ID
     private var interfaces: [String: any NetworkInterface] = [:]
 
@@ -1825,7 +1832,7 @@ public actor ReticulumTransport {
                 let bitrate = interface.config.bitrate
                 if bitrate > 0 {
                     let txTime = Double(encoded.count * 8) / Double(bitrate)
-                    let waitTime = txTime / TransportConstants.ANNOUNCE_CAP
+                    let waitTime = txTime / interface.config.announceCap
                     announceAllowedAt[id] = now.addingTimeInterval(waitTime)
                 }
 
@@ -3179,11 +3186,17 @@ public actor ReticulumTransport {
                         receivedFrom = destHash
                     }
 
+                    // Transport.py:1889-1893: a heard announce arriving on a
+                    // local-client interface (is_from_local_client) is scheduled to
+                    // rebroadcast immediately (retransmit_timeout==now) exactly once
+                    // (retries preset to PATHFINDER_R); an ordinary forwarded announce
+                    // gets the random PATHFINDER_RW window with retries=0.
                     await announceTable.insert(
                         destinationHash: destHash,
                         packet: rebroadcastPacket,
                         hops: rebroadcastPacket.header.hopCount,
                         receivedFrom: receivedFrom,
+                        isLocalClient: isLocalClientInterface(interfaceId),
                         receivingInterfaceId: interfaceId
                     )
                     logger.info("Announce for \(hexPrefix, privacy: .public)... queued for retransmission")
@@ -3302,8 +3315,24 @@ public actor ReticulumTransport {
     /// Per-interface AnnounceFilter is applied before sending.
     ///
     /// Reference: Python Transport.py:518-579
-    private func processAnnounceRetransmissions() async {
+    private func processAnnounceRetransmissions(force: Bool = false) async {
+        // Transport.py:574/636: the announce-retransmit branch only runs when
+        // `now > announces_last_checked + announces_check_interval` (1.0s), even
+        // though jobs() itself ticks every job_interval (0.25s). `force` mirrors the
+        // behavioral force-cull, which zeroes announces_last_checked to drive one
+        // deterministic pass regardless of the gate (behavioral_transport.py force_cull).
+        let now = Date()
+        if !force && now.timeIntervalSince(announcesLastChecked) < TransportConstants.ANNOUNCES_CHECK_INTERVAL {
+            return
+        }
+        announcesLastChecked = now
+
+        // Transport.py:1004-1047: jobs() collects every due announce into `outgoing`,
+        // then handle_outgoing_announces emits them `sorted(outgoing, key=p.hops)` —
+        // lowest hop-count first. Mirror that ascending-hops ordering so batched
+        // rebroadcasts egress (and hit the per-interface announce cap) in hop order.
         let actions = await announceTable.processRetransmissions()
+            .sorted { $0.hops < $1.hops }
         guard !actions.isEmpty else { return }
 
         for action in actions {
@@ -3397,7 +3426,7 @@ public actor ReticulumTransport {
                     let bitrate = interface.config.bitrate
                     if bitrate > 0 {
                         let txTime = Double(encoded.count * 8) / Double(bitrate)
-                        let waitTime = txTime / TransportConstants.ANNOUNCE_CAP
+                        let waitTime = txTime / interface.config.announceCap
                         announceAllowedAt[id] = Date().addingTimeInterval(waitTime)
                     }
 
@@ -3420,8 +3449,22 @@ public actor ReticulumTransport {
         }
         heldAnnounces.removeAll()
 
-        // E5: Process announce queues (one per interface per cycle).
-        // Python (Interface.py:246): drain min-hop first, then oldest arrival.
+    }
+
+    /// E5: Drain each interface's deferred announce queue, one entry per
+    /// per-interface cap interval.
+    ///
+    /// This mirrors RNS `Interface.process_announce_queue` (Interface.py:323-358),
+    /// which is a SEPARATE, Timer-driven mechanism from the announce-table
+    /// retransmit job (Transport.jobs()): a forwarded announce that hits the
+    /// per-interface `announce_cap` is parked in `announce_queue` and drained one
+    /// at a time, min-hop first then oldest arrival, each drain re-arming the
+    /// `announce_allowed_at` spacing. The swift jobloop calls this every
+    /// `job_interval` (0.25s) so the queue makes progress even on passes with no
+    /// newly-due announce-table entries — the earlier coupling (draining only
+    /// inside `processAnnounceRetransmissions`, behind its no-due-actions early
+    /// return) left queued announces stuck until the next due retransmit.
+    func processAnnounceQueues() async {
         let now = Date()
         for (id, _) in interfaces {
             guard var queue = announceQueues[id], !queue.isEmpty else { continue }
@@ -3441,11 +3484,13 @@ public actor ReticulumTransport {
                 let entry = oldest.element
                 queue.remove(at: oldest.offset)
                 do {
-                    try await interfaces[id]?.send(entry.encoded)
+                    let transmitData = applyIFAC(raw: entry.encoded, interfaceId: id)
+                    try await interfaces[id]?.send(transmitData)
                     let bitrate = interfaces[id]?.config.bitrate ?? 0
                     if bitrate > 0 {
                         let txTime = Double(entry.encoded.count * 8) / Double(bitrate)
-                        announceAllowedAt[id] = now.addingTimeInterval(txTime / TransportConstants.ANNOUNCE_CAP)
+                        let cap = interfaces[id]?.config.announceCap ?? TransportConstants.ANNOUNCE_CAP
+                        announceAllowedAt[id] = now.addingTimeInterval(txTime / cap)
                     }
                 } catch {
                     logger.warning("Failed to send queued announce via \(id, privacy: .public)")
@@ -3481,9 +3526,11 @@ public actor ReticulumTransport {
     private var tableCullCounter: Int = 0
 
     /// H3/H4: Periodic cleanup of links and paths, throttled to every ~5 seconds.
+    /// The retransmission loop runs every 0.25s (RNS job_interval), so gate this
+    /// heavier sweep on every 20th pass (20 * 0.25s = 5s).
     private func periodicTableCleanup() async {
         tableCullCounter += 1
-        guard tableCullCounter % 5 == 0 else { return }
+        guard tableCullCounter % 20 == 0 else { return }
         // Mirror python Transport.jobs() (Transport.py:778-785): cull paths that have
         // expired OR whose attached interface is no longer present. Keeping the
         // interface-absent cull is correct — the BLE boot/transient path-loss is fixed
@@ -3506,14 +3553,42 @@ public actor ReticulumTransport {
 
     /// Start the periodic announce retransmission task.
     ///
-    /// Called when transport is set up. Runs every ~1 second.
+    /// Ticks every `job_interval` (0.25s), matching RNS `Transport.jobloop()`
+    /// (Transport.py:500-503, `sleep(Transport.job_interval)` with
+    /// `job_interval = 0.250`). The fast tick drives the announce-queue cap drain
+    /// and table culls; the announce-table retransmit branch itself is rate-limited
+    /// internally to `ANNOUNCES_CHECK_INTERVAL` (1.0s). The heavier table-cull is
+    /// kept on its ~5s budget via `periodicTableCleanup`'s internal counter.
     public func startRetransmissionLoop() {
         guard retransmissionTask == nil else { return }
+        // Anchor the announces_check_interval phase deterministically at loop start.
+        //
+        // PORT DEVIATION (documented in port-deviations.md): RNS keeps
+        // `announces_last_checked` process-global on the singleton Transport
+        // (Transport.py:181), so a long-lived process phases the once-per-second
+        // announce sweep arbitrarily relative to any given heard announce. The swift
+        // bridge instead builds a FRESH Transport per behavioral handle, so the phase
+        // would otherwise re-anchor every test and race the sweep against a test's
+        // sub-second drain. We back-date the anchor by FIRST so the first sweep lands
+        // ~0.75s after start — comfortably inside a forwarded announce's [0,0.5]s due
+        // window-plus-margin yet before a 1.0s rebroadcast-drain, and after the
+        // sub-0.5s windows of the last-hop/forwarding tests. Steady-state cadence is
+        // unchanged at exactly ANNOUNCES_CHECK_INTERVAL thereafter.
+        let firstSweepDelay: TimeInterval = 0.75
+        announcesLastChecked = Date().addingTimeInterval(firstSweepDelay - TransportConstants.ANNOUNCES_CHECK_INTERVAL)
         retransmissionTask = Task { [weak self] in
+            // Mirror RNS `jobloop()` (Transport.py:500-503): run jobs() FIRST, then
+            // sleep job_interval, so the cull/queue maintenance starts promptly
+            // rather than after one idle interval.
+            var firstPass = true
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
+                if !firstPass {
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+                firstPass = false
                 guard let self = self else { break }
                 await self.processAnnounceRetransmissions()
+                await self.processAnnounceQueues()
                 await self.cleanupDiscoveryPathRequests()
                 await self.cullTransportTables()
                 await self.periodicTableCleanup()
@@ -3528,7 +3603,13 @@ public actor ReticulumTransport {
     /// jobs() pass can be driven without the 1-second timer. Paired with
     /// `cullTransportTables()` this mirrors a full forced jobs() run.
     public func runAnnounceRetransmissions() async {
-        await processAnnounceRetransmissions()
+        // force == true bypasses the announces_check_interval gate, mirroring the
+        // reference force-cull which zeroes announces_last_checked before jobs().
+        await processAnnounceRetransmissions(force: true)
+        // Drain any announces the forced pass parked behind the per-interface cap,
+        // so a single force-cull makes progress on the queue without waiting for
+        // the next jobloop tick.
+        await processAnnounceQueues()
     }
 
     /// Stop the periodic announce retransmission task.

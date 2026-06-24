@@ -101,6 +101,13 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
     /// Reference: Python Interface.bitrate
     public var bitrate: Int
 
+    /// C14: Per-interface announce bandwidth cap as a FRACTION of link bandwidth.
+    /// Used in the egress-spacing calc `announce_allowed_at = now + (tx_time / announce_cap)`.
+    /// Defaults to RNS `Reticulum.ANNOUNCE_CAP/100 = 0.02` (Reticulum.py:1052), but a
+    /// per-interface config can override it (a smaller cap widens the spacing).
+    /// Reference: Python Interface.announce_cap (Transport.py:1257 / Interface.py:347).
+    public var announceCap: Double
+
     /// E8: IFAC (Interface Access Code) signature size in bytes.
     /// 0 means no IFAC validation on this interface.
     /// Reference: Python Interface.ifac_size
@@ -155,6 +162,7 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         announceRateGrace: Int = 0,
         announceRatePenalty: TimeInterval = 0,
         bitrate: Int = 0,
+        announceCap: Double = TransportConstants.ANNOUNCE_CAP,
         ifacSize: Int = 0,
         ifacKey: Data? = nil,
         fixedMtu: Int? = nil,
@@ -172,6 +180,7 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         self.announceRateGrace = announceRateGrace
         self.announceRatePenalty = announceRatePenalty
         self.bitrate = bitrate
+        self.announceCap = announceCap
         self.ifacSize = ifacSize
         self.ifacKey = ifacKey
         self.fixedMtu = fixedMtu
@@ -198,6 +207,7 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         announceRateGrace = try container.decodeIfPresent(Int.self, forKey: .announceRateGrace) ?? 0
         announceRatePenalty = try container.decodeIfPresent(TimeInterval.self, forKey: .announceRatePenalty) ?? 0
         bitrate = try container.decodeIfPresent(Int.self, forKey: .bitrate) ?? 0
+        announceCap = try container.decodeIfPresent(Double.self, forKey: .announceCap) ?? TransportConstants.ANNOUNCE_CAP
         ifacSize = try container.decodeIfPresent(Int.self, forKey: .ifacSize) ?? 0
         ifacKey = try container.decodeIfPresent(Data.self, forKey: .ifacKey)
         // Backward-compatible: old plists predate the MTU fields. Default
@@ -211,7 +221,7 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case id, name, type, enabled, mode, host, port, ifac
         case announceRateTarget, announceRateGrace, announceRatePenalty
-        case bitrate, ifacSize, ifacKey
+        case bitrate, announceCap, ifacSize, ifacKey
         case fixedMtu, autoconfigureMtu
     }
 

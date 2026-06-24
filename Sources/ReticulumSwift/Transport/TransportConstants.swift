@@ -54,6 +54,13 @@ public enum TransportConstants {
     /// Announce bandwidth cap fraction (2% of bitrate)
     public static let ANNOUNCE_CAP: Double = 0.02
 
+    /// Minimum interval (seconds) between announce-table retransmit sweeps.
+    /// The jobs() loop runs every `job_interval` (0.25s), but the announce-
+    /// retransmit branch itself is rate-limited to this interval so a heard
+    /// announce is rebroadcast at most once per second.
+    /// Reference: Python Transport.announces_check_interval (Transport.py:182/574/636).
+    public static let ANNOUNCES_CHECK_INTERVAL: TimeInterval = 1.0
+
     /// Maximum rate timestamps kept per destination for rate limiting
     public static let MAX_RATE_TIMESTAMPS: Int = 16
 
