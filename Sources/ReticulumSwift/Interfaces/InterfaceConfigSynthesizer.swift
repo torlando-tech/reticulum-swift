@@ -118,14 +118,45 @@ public final class ConfigSection {
 /// ConfigObj. Blank lines and `#`-prefixed comment lines are skipped.
 public enum ConfigParser {
 
+    /// Strip a ConfigObj inline comment: the line content runs up to the first `#`
+    /// that is NOT inside a single/double-quoted span. Mirrors configobj's
+    /// `_keyword` value tail + `_valueexp` / `_nolistvalue` / `_sectionmarker`
+    /// trailing `\s*(\#.*)?$` (configobj.py:1077-1124): an unquoted `#` (with or
+    /// without leading whitespace) begins the inline comment, while a `#` inside
+    /// quotes is literal. Applied per-line so it covers both `key = value # c` and
+    /// `[[name]] # c`; a line that is wholly a comment strips to empty and is skipped.
+    static func stripInlineComment(_ raw: String) -> String {
+        var inSingle = false
+        var inDouble = false
+        var idx = raw.startIndex
+        while idx < raw.endIndex {
+            let ch = raw[idx]
+            if ch == "\"" && !inSingle {
+                inDouble.toggle()
+            } else if ch == "'" && !inDouble {
+                inSingle.toggle()
+            } else if ch == "#" && !inSingle && !inDouble {
+                return String(raw[raw.startIndex..<idx])
+            }
+            idx = raw.index(after: idx)
+        }
+        return raw
+    }
+
     public static func parse(_ text: String) -> ConfigSection {
         let root = ConfigSection()
         // Ancestor stack: (depth, section). Root is depth 0.
         var stack: [(depth: Int, section: ConfigSection)] = [(0, root)]
 
         for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.isEmpty || line.hasPrefix("#") { continue }
+            // Strip the inline comment (quote-aware) BEFORE structural parsing, so an
+            // inline-commented value like `bitrate = 9600  # uplink` yields `9600`
+            // (not `9600  # uplink`, which would fail as_int) and a commented section
+            // header `[[iface]]  # note` still parses. A whole-line comment strips to
+            // empty and is skipped by the isEmpty guard below.
+            let line = stripInlineComment(rawLine.trimmingCharacters(in: .whitespaces))
+                .trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
 
             if line.hasPrefix("[") {
                 // Section header: depth == number of leading '[' brackets.
