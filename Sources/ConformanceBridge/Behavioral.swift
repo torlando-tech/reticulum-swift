@@ -239,6 +239,18 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
     switch command {
 
     case "behavioral_start":
+        // reticulum-swift is a leaf endpoint with no LocalClientInterface, so it
+        // cannot be a CLIENT of a shared instance. Reject that request rather than
+        // silently starting a standalone node (which would then fail the
+        // filter-bypass assertions), so the conformance harness's capability-skip
+        // recognises the shared-instance gap — consistent with the wire
+        // start_tcp_server(share_instance=...) path (WireTcp.swift:462).
+        if getBoolOptional(p, "connected_to_shared_instance") ?? false {
+            throw BridgeError.invalidData(
+                "share_instance unsupported: reticulum-swift has no LocalServerInterface/LocalClientInterface (cannot connect to a shared instance)"
+            )
+        }
+
         // enable_transport defaults to true per the reference impl.
         let enableTransport = getBoolOptional(p, "enable_transport") ?? true
         let seedHex = getHexOptional(p, "identity_seed")
