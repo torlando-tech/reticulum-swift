@@ -106,8 +106,9 @@ jobs:
           python-version: "3.12"
 
       # The suite's own deps (pytest, msgpack, pytest-xdist for -n auto, …) plus
-      # pytest-timeout for the per-test cap below.
-      - run: pip install -r reticulum-conformance/requirements.txt pytest-timeout
+      # pytest-timeout for the per-test cap and pytest-rerunfailures for the few
+      # inherently non-deterministic cases (below).
+      - run: pip install -r reticulum-conformance/requirements.txt pytest-timeout pytest-rerunfailures
 
       - name: Run conformance module (${{ matrix.module }})
         working-directory: reticulum-conformance
@@ -131,9 +132,18 @@ jobs:
         # tests/lxmf/ is the LXMF-layer suite (its own CI target) and is excluded
         # from the `core` module above. -n auto parallelises within the module;
         # --timeout=180 caps any single wedged case (e.g. resource-multihop).
+        #
+        # --reruns 2 retries a FAILED case up to twice. A handful of conformance
+        # cases are inherently non-deterministic — notably the proof-of-work stamp
+        # tests (e.g. test_default_stamp_cost_14): a "cost-6" announce builds a
+        # stamp whose ACHIEVED value is random ≥6, so it lands ≥14 (and is accepted
+        # by a default-14 receiver) ~1/256 of the time, in both swift AND the
+        # reference. Reruns rescue these without masking real gaps — a deterministic
+        # failure still fails all three attempts and stays red.
         run: >-
           python3 -m pytest ${{ matrix.paths }} --impl=swift
           -p skip_unsupported -n auto -v -rs --tb=short --timeout=180
+          --reruns 2 --reruns-delay 1
 
   # IFAC pipe integration (the swift PipePeer talks to the python reference over a
   # pipe). Previously this ran as a second STEP after the conformance step, so a
