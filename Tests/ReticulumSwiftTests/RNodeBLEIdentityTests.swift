@@ -88,6 +88,15 @@ final class RNodeBLEIdentityTests: XCTestCase {
             BLETransport(deviceName: "legacy").restorationIdentifier,
             BLEConstants.RESTORE_IDENTIFIER_KEY
         )
+
+        let options = BLETransport.centralManagerOptions(
+            restorationIdentifier: first.restorationIdentifier
+        )
+        XCTAssertEqual(
+            options[CBCentralManagerOptionRestoreIdentifierKey] as? String,
+            "com.columba.ble.rnode.AAAAAAAA",
+            "the custom namespace must reach CBCentralManager options"
+        )
     }
 
     // MARK: - A3: RNode failure reason surfaces in getInterfaceSnapshots

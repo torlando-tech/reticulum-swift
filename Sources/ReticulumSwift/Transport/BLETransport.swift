@@ -84,6 +84,13 @@ public final class BLETransport: Transport {
         return false
     }
 
+    /// Options passed verbatim to the CoreBluetooth manager constructor.
+    /// Kept as a pure helper so restoration namespace wiring is testable
+    /// without requiring live Bluetooth hardware.
+    static func centralManagerOptions(restorationIdentifier: String) -> [String: Any] {
+        [CBCentralManagerOptionRestoreIdentifierKey: restorationIdentifier]
+    }
+
     /// Logger for BLE transport events.
     fileprivate let logger: Logger
 
@@ -154,7 +161,9 @@ public final class BLETransport: Transport {
             self.centralManager = CBCentralManager(
                 delegate: self.delegateWrapper,
                 queue: self.bleQueue,
-                options: [CBCentralManagerOptionRestoreIdentifierKey: self.restorationIdentifier]
+                options: Self.centralManagerOptions(
+                    restorationIdentifier: self.restorationIdentifier
+                )
             )
         }
     }
