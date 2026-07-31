@@ -71,6 +71,25 @@ final class RNodeBLEIdentityTests: XCTestCase {
         XCTAssertFalse(BLETransport(deviceName: "RNode", deviceIdentifier: id).isScanOnly)
     }
 
+    func testRestorationIdentifierCanBeStablePerPhysicalSession() {
+        let first = BLETransport(
+            deviceName: "RNode A",
+            restorationIdentifier: "com.columba.ble.rnode.AAAAAAAA"
+        )
+        let second = BLETransport(
+            deviceName: "RNode B",
+            restorationIdentifier: "com.columba.ble.rnode.BBBBBBBB"
+        )
+
+        XCTAssertEqual(first.restorationIdentifier, "com.columba.ble.rnode.AAAAAAAA")
+        XCTAssertEqual(second.restorationIdentifier, "com.columba.ble.rnode.BBBBBBBB")
+        XCTAssertNotEqual(first.restorationIdentifier, second.restorationIdentifier)
+        XCTAssertEqual(
+            BLETransport(deviceName: "legacy").restorationIdentifier,
+            BLEConstants.RESTORE_IDENTIFIER_KEY
+        )
+    }
+
     // MARK: - A3: RNode failure reason surfaces in getInterfaceSnapshots
 
     func testInterfaceSnapshotCarriesRNodeError() async throws {

@@ -62,6 +62,11 @@ public final class BLETransport: Transport {
     /// changed advertised names.
     private let targetDeviceIdentifier: UUID?
 
+    /// CoreBluetooth state-restoration namespace for this central manager.
+    /// Callers hosting multiple concurrent transports must provide one stable,
+    /// unique value per physical-session role.
+    public let restorationIdentifier: String
+
     /// True when no target is set (device-picker discovery mode): scan + report peripherals
     /// via `onPeripheralDiscovered` but never auto-connect, and arm no connection timeout.
     var isScanOnly: Bool { targetDeviceName == nil && targetDeviceIdentifier == nil }
@@ -122,10 +127,17 @@ public final class BLETransport: Transport {
     ///
     /// - Parameters:
     ///   - deviceName: Optional target device name for filtered connection.
+    ///   - restorationIdentifier: Stable CoreBluetooth restoration namespace.
     ///   - subsystem: Logger subsystem (default: "com.columba.core").
-    public init(deviceName: String? = nil, deviceIdentifier: UUID? = nil, subsystem: String = "com.columba.core") {
+    public init(
+        deviceName: String? = nil,
+        deviceIdentifier: UUID? = nil,
+        restorationIdentifier: String = BLEConstants.RESTORE_IDENTIFIER_KEY,
+        subsystem: String = "com.columba.core"
+    ) {
         self.targetDeviceName = deviceName
         self.targetDeviceIdentifier = deviceIdentifier
+        self.restorationIdentifier = restorationIdentifier
         self.logger = Logger(subsystem: subsystem, category: "BLETransport")
 
         if let id = deviceIdentifier {
@@ -142,7 +154,7 @@ public final class BLETransport: Transport {
             self.centralManager = CBCentralManager(
                 delegate: self.delegateWrapper,
                 queue: self.bleQueue,
-                options: [CBCentralManagerOptionRestoreIdentifierKey: BLEConstants.RESTORE_IDENTIFIER_KEY]
+                options: [CBCentralManagerOptionRestoreIdentifierKey: self.restorationIdentifier]
             )
         }
     }
