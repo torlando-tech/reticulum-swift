@@ -63,6 +63,15 @@ final class WireInstance: @unchecked Sendable {
     // (reference/wire_tcp.py cmd_wire_resource_send / cmd_wire_resource_cancel).
     var outResources: [String: Resource] = [:]
 
+    // GROUP symmetric Token keys created/loaded by wire_group_create, keyed by
+    // the GROUP destination hash hex. Mirrors python wire_tcp.py inst["group_dests"]
+    // (cmd_wire_group_create :5286), but stores the raw 64-byte AES-256-CBC Token
+    // key rather than a Destination object (reticulum-swift Destination has no
+    // GROUP symmetric key slot — the GROUP path is RNS's Token directly, exactly
+    // as Ext+Destination.swift destination_group_encrypt does). Backs the sibling
+    // wire_group_encrypt / wire_group_decrypt commands.
+    var groupKeys: [String: Data] = [:]
+
     // MARK: Captured reticulum_config posture knobs
     //
     // RNS resolves these once at Reticulum.__init__ / __apply_config time and
@@ -141,9 +150,55 @@ final class WireListener: @unchecked Sendable {
     // consistent should the upstream pattern change.
     private var _seenResourceHashes: Set<Data> = []
 
+    // MARK: Receiver-side Channel / Buffer observation state
+    //
+    // Populated by wire_listen's link-established hook on each inbound (responder)
+    // link, mirroring python cmd_wire_listen's per-listener buffer_state /
+    // proof_log / channel (reference/wire_tcp.py:1311-1326,1461-1498).
+
+    /// The inbound link's Channel (set when an inbound link opens one). Backs
+    /// wire_listener_channel_rx (the receiver-side rx sequence state).
+    private var _inboundChannel: Channel?
+    /// RawChannelReaders registered per receiver-relative stream id (default +
+    /// any buffer_stream_ids). Backs wire_buffer_received.
+    private var _bufferReaders: [UInt16: RawChannelReader] = [:]
+    /// Context byte of every inbound packet the receiver PROVED, in order. A
+    /// CHANNEL (0x0E) entry appears only when a channel is open (Link.py:1172).
+    private var _proofLog: [Int] = []
+
     init(destination: Destination, identity: Identity) {
         self.destination = destination
         self.identity = identity
+    }
+
+    func setInboundChannel(_ channel: Channel) {
+        lock.lock(); defer { lock.unlock() }
+        _inboundChannel = channel
+    }
+
+    func inboundChannel() -> Channel? {
+        lock.lock(); defer { lock.unlock() }
+        return _inboundChannel
+    }
+
+    func setBufferReader(_ reader: RawChannelReader, for streamId: UInt16) {
+        lock.lock(); defer { lock.unlock() }
+        _bufferReaders[streamId] = reader
+    }
+
+    func bufferReader(for streamId: UInt16) -> RawChannelReader? {
+        lock.lock(); defer { lock.unlock() }
+        return _bufferReaders[streamId]
+    }
+
+    func appendProof(context: Int) {
+        lock.lock(); defer { lock.unlock() }
+        _proofLog.append(context)
+    }
+
+    func proofLog() -> [Int] {
+        lock.lock(); defer { lock.unlock() }
+        return _proofLog
     }
 
     func append(packetData: Data) {
@@ -390,6 +445,23 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
 
     case "wire_start_tcp_server":
         resetWireState()
+
+        // Shared-instance master: reticulum-swift has no LocalServerInterface /
+        // LocalClientInterface (RNS Interfaces/LocalInterface.py) and no
+        // Transport.local_client_interfaces wiring over a real loopback transport,
+        // so it cannot host a shared instance other bridge processes attach to.
+        // Surface this as an explicit BridgeError (mirroring the config_parse_interface
+        // pattern) instead of silently omitting `shared_instance_port` from the
+        // response — the latter crashes the conftest with an opaque int(None)
+        // TypeError (tests/wire/conftest.py:241/:198). The byte-level master-side
+        // routing rules ARE implemented for the behavioral harness
+        // (tests/behavioral/test_local_client.py); only the live cross-process
+        // LocalServer/LocalClient transport is missing.
+        if getBoolOptional(p, "share_instance") ?? false {
+            throw BridgeError.invalidData(
+                "share_instance unsupported: reticulum-swift has no LocalServerInterface/LocalClientInterface (shared-instance master over a loopback transport)"
+            )
+        }
 
         let networkName = getStringOptional(p, "network_name") ?? ""
         let passphrase = getStringOptional(p, "passphrase") ?? ""
@@ -1018,6 +1090,22 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         // to auto-prove (tests/wire/test_opportunistic_proof.py). Default PROVE_NONE
         // is left untouched so the LXMF/Columba opportunistic path is not double-proofed.
         let proofStrategyStr = (getStringOptional(p, "proof_strategy") ?? "none").lowercased()
+        // open_channel (default True): whether the link-established hook opens a
+        // Channel on each inbound link. Mirrors python cmd_wire_listen
+        // (reference/wire_tcp.py:1268-1272): an open channel makes the receiver
+        // PROVE inbound CHANNEL-context packets (Link.py:1172), which resolves the
+        // sender's PacketReceipt so it stops retransmitting; open_channel=False
+        // reproduces a peer with NO channel, where an inbound CHANNEL packet is
+        // dropped WITHOUT a proof (Link.py:1166-1167).
+        let openChannel = getBoolOptional(p, "open_channel") ?? true
+        // buffer_stream_ids (default none): extra receiver-relative stream ids to
+        // register RawChannelReaders for, in addition to the default stream 0.
+        // Drives the multi-reader stream-id filtering gap (reference/wire_tcp.py:
+        // 1273-1276,1494-1496).
+        let extraStreamIds: [UInt16] = (p["buffer_stream_ids"]?.arrayValue ?? [])
+            .compactMap { $0.intValue }
+            .filter { $0 >= 0 && $0 <= Int(StreamDataMessage.STREAM_ID_MAX) }
+            .map { UInt16($0) }
 
         let inst = try requireInstance(handle)
 
@@ -1070,6 +1158,14 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
                 await link.setPacketCallback { data, _packet in
                     listener.append(packetData: data)
                 }
+                // Receiver-side proof log: record the context byte of every packet
+                // this inbound link PROVES, so wire_listener_proof_log can show
+                // ZERO CHANNEL (0x0E) proofs for a no-channel listener and >=1 for
+                // a channel listener (Link.py:1166-1173). Mirrors python wrapping
+                // link.prove_packet (reference/wire_tcp.py:1431-1441).
+                await link.setProofObserver { context in
+                    listener.appendProof(context: context)
+                }
                 // Honor the requested resource strategy (RNS/Link.py:1087-1098):
                 // .acceptAll accepts every advertisement, .acceptNone drops them
                 // silently (no parts flow), .acceptApp consults the callback's
@@ -1084,6 +1180,36 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
                     listener: listener, strategy: resourceStrategy
                 )
                 await link.setResourceCallbacks(callbacks)
+                // Open a Channel on the inbound link when requested (default), so
+                // the receiver PROVES inbound CHANNEL-context packets
+                // (ReticulumTransport CHANNEL branch / Link.py:1172). Without an
+                // open channel the prove is (correctly) skipped (Link.py:1166-1167)
+                // and a reference sender retransmits to teardown. Mirrors python
+                // cmd_wire_listen's link.get_channel() on link-established
+                // (reference/wire_tcp.py:1268-1272).
+                if openChannel {
+                    let channel = await link.getOrCreateChannel()
+                    // Attach a recording handler so the receiver can surface the
+                    // channel payloads it delivered (server-role channel_received).
+                    // Mirrors python cmd_wire_listen's recorder (wire_tcp.py:1268-1289).
+                    let lid = await link.linkId
+                    await wireAttachInboundChannelRecorder(
+                        handle: handle, linkId: lid, channel: channel
+                    )
+                    // Buffer (RawChannelReader): reassemble StreamDataMessage
+                    // streams + detect the MAX_CHUNK_LEN decompression-bomb abort.
+                    // Register the default-stream reader plus any extra
+                    // receiver-relative stream ids (multi-reader stream-id
+                    // filtering). Mirrors python _ensure_buffer_reader
+                    // (reference/wire_tcp.py:1490-1496,1563-1593).
+                    listener.setInboundChannel(channel)
+                    let defaultReader = await channel.registerStreamReader(streamId: 0)
+                    listener.setBufferReader(defaultReader, for: 0)
+                    for sid in extraStreamIds {
+                        let reader = await channel.registerStreamReader(streamId: sid)
+                        listener.setBufferReader(reader, for: sid)
+                    }
+                }
             }
         }
 
@@ -1394,6 +1520,20 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         }
         let out = listener.drainResources().map { JSONValue.string(bytesToHex($0)) }
         return ["resources": .array(out)]
+
+    // MARK: wire_start_local_client
+
+    case "wire_start_local_client":
+        // Attaching as a shared-instance local CLIENT requires a
+        // LocalClientInterface (RNS Interfaces/LocalInterface.py) connecting to a
+        // master's LocalServerInterface over a loopback transport, plus the
+        // client-side is_connected_to_shared_instance posture (Reticulum.py:385-387)
+        // and the outbound HEADER_2 wrap to a hops==1 destination
+        // (Transport.py:1146-1164). None of that transport plumbing exists in this
+        // port yet. Fail explicitly rather than with an opaque downstream error.
+        throw BridgeError.invalidData(
+            "wire_start_local_client unsupported: reticulum-swift has no LocalClientInterface / shared-instance client posture"
+        )
 
     default:
         // Route any wire_* command not matched above into the per-cluster

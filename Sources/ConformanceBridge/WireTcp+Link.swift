@@ -369,42 +369,32 @@ func handleWireLinkCommand(_ command: String, _ p: [String: JSONValue]) throws -
         guard let link = try wlinkFindAny(inst, linkIdHex) else {
             throw BridgeError.invalidData("Unknown link_id: \(linkIdHex)")
         }
-        // Snapshot the real last_inbound / last_data timestamps BEFORE injecting,
-        // then drive the REAL keepalive receive path. Link.processKeepalive does
-        // the actual state work: a non-initiator receiving 0xFF refreshes
-        // last_inbound (NOT last_data), recovers STALE->ACTIVE, and echoes 0xFE;
-        // an initiator drops its own 0xFF echo, advancing neither timestamp
-        // (Link.processKeepalive / Link.py:974/:978-980/:1149-1153).
-        let before: (LinkState, Bool, Date?, Date?) = try blockingAsync {
-            (await link.state, await link.initiator,
-             await link.lastInboundAt, await link.lastDataAt)
-        }
-        let (stateBefore, initiator, inboundBefore, dataBefore) = before
-        try blockingAsync { await link.processKeepalive(value) }
-        let after: (LinkState, Date?, Date?) = try blockingAsync {
-            (await link.state, await link.lastInboundAt, await link.lastDataAt)
-        }
-        let (stateAfter, inboundAfter, dataAfter) = after
-        // last_inbound_advanced / last_data_advanced read from the real Link
-        // timestamps (Link.lastInboundAt/lastDataAt), mirroring python's
-        // `(link.last_inbound or 0) > before`. The emitted 0xFE answer byte is
-        // still derived from the deterministic echo rule (a non-initiator answers
-        // a 0xFF with exactly 0xFE — Link.py:1151), matching processKeepalive.
+        // Drive the REAL keepalive receive path through Link.probeKeepalive, which
+        // runs Link.processKeepalive and captures the before/after last_inbound /
+        // last_data deltas ATOMICALLY inside a single actor execution. Measuring
+        // the delta this way (rather than via separate `await` snapshots around the
+        // call) makes the probe race-free: on a live link the keepalive task or a
+        // real inbound 0xFE echo from the peer could otherwise advance last_inbound
+        // between a wall-clock before/after snapshot and mis-report the initiator's
+        // own-echo drop. processKeepalive itself is unchanged: a non-initiator
+        // receiving 0xFF refreshes last_inbound (NOT last_data), recovers
+        // STALE->ACTIVE, and echoes 0xFE; an initiator drops its own 0xFF echo,
+        // advancing neither timestamp (Link.py:974/:978-980/:1149-1153).
+        let probe = try blockingAsync { await link.probeKeepalive(value) }
+        let initiator = probe.initiator
+        // The emitted 0xFE answer byte is derived from the deterministic echo rule
+        // (a non-initiator answers a 0xFF with exactly 0xFE — Link.py:1151),
+        // matching processKeepalive.
         let valueByte = value.first
         let answered = (!initiator && valueByte == LinkConstants.KEEPALIVE_INITIATOR)
-        func advanced(_ b: Date?, _ a: Date?) -> Bool {
-            guard let a = a else { return false }
-            guard let b = b else { return true }
-            return a > b
-        }
         return [
             "response": answered ? str("fe") : .null,
             "answered": boolean(answered),
             "initiator": boolean(initiator),
-            "last_inbound_advanced": boolean(advanced(inboundBefore, inboundAfter)),
-            "last_data_advanced": boolean(advanced(dataBefore, dataAfter)),
-            "status_before": .int(wlinkStatusCode(stateBefore)),
-            "status_after": .int(wlinkStatusCode(stateAfter)),
+            "last_inbound_advanced": boolean(probe.lastInboundAdvanced),
+            "last_data_advanced": boolean(probe.lastDataAdvanced),
+            "status_before": .int(wlinkStatusCode(probe.stateBefore)),
+            "status_after": .int(wlinkStatusCode(probe.stateAfter)),
         ]
 
     // MARK: wire_last_keepalive

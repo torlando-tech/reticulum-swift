@@ -24,6 +24,10 @@ public enum ChannelError: Error, Sendable, Equatable {
     case channelNotReady
     case maxRetriesExceeded
     case messageTooLarge(size: Int, max: Int)
+    /// A compressed `StreamDataMessage` chunk decompressed past
+    /// `RawChannelWriter.MAX_CHUNK_LEN` (Buffer.py:95-97 raises
+    /// `IOError("Decompressed buffer chunk exceeds maximum legitimate size")`).
+    case decompressionBoundExceeded
 }
 
 // MARK: - MessageBase Protocol

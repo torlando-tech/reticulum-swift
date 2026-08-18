@@ -223,6 +223,13 @@ public actor ReticulumTransport {
     /// Task handle for periodic announce retransmission
     private var retransmissionTask: Task<Void, Never>?
 
+    /// Last time the announce-table retransmit branch ran. The jobs() loop ticks
+    /// every `job_interval` (0.25s) but the announce-retransmit branch is gated to
+    /// `ANNOUNCES_CHECK_INTERVAL` (1.0s) so a heard announce rebroadcasts at most
+    /// once per second. `.distantPast` makes the very first jobs() pass run it.
+    /// Reference: Python Transport.announces_last_checked (Transport.py:181/574/636).
+    private var announcesLastChecked: Date = .distantPast
+
     /// Registered interfaces by ID
     private var interfaces: [String: any NetworkInterface] = [:]
 
@@ -231,6 +238,13 @@ public actor ReticulumTransport {
 
     /// Registered local destinations by hash
     private var destinations: [Data: Destination] = [:]
+
+    /// Interface IDs that are local-client interfaces (shared-instance clients).
+    /// Mirrors Python `Transport.local_client_interfaces` (Transport.py:164).
+    /// A path request arriving on a local-client interface is answered
+    /// immediately (retransmit_timeout = now, no PATH_REQUEST_GRACE) per
+    /// Transport.py:2973-2974 / from_local_client().
+    private var localClientInterfaceIds: Set<String> = []
 
     /// Logger for transport events
     private let logger: Logger
@@ -278,6 +292,17 @@ public actor ReticulumTransport {
     /// PLAIN destination for receiving path requests from other nodes
     private var pathRequestDestination: Destination?
 
+    /// PLAIN control destination for receiving tunnel-synthesize packets
+    /// (rnstransport/tunnel/synthesize). Set by `registerTunnelSynthesizeHandler()`.
+    /// Reference: RNS Transport.py:247-250 (tunnel_synthesize_destination).
+    var tunnelSynthesizeDestination: Destination?
+
+    /// Tunnel table — tunnels to other transport instances, keyed by tunnel_id
+    /// (`full_hash(public_key || interface_hash)`). Established by the validated
+    /// tunnel-synthesize handshake and bound to the receiving interface.
+    /// Reference: RNS `Transport.tunnels` (Transport.py:119, IDX_TT_* :3581-3584).
+    var tunnels: [Data: TunnelTableEntry] = [:]
+
     /// C14: Per-interface earliest time the next announce can be sent (bandwidth cap)
     private var announceAllowedAt: [String: Date] = [:]
 
@@ -297,6 +322,30 @@ public actor ReticulumTransport {
 
     /// E12: Pending local path requests (dest hash → receiving interface ID)
     private var pendingLocalPathRequests: [Data: String] = [:]
+
+    /// RNS `Transport.blackholed_identities` (Transport.py:123): the set of
+    /// announcing-identity hashes whose inbound announces are invalidated and
+    /// dropped in `Identity.validate_announce` (Identity.py:567-569) BEFORE any
+    /// path is learned. Populated via `blackholeIdentity` / cleared via
+    /// `unblackholeIdentity`; consulted in `processAnnounce`.
+    private var blackholedIdentities: Set<Data> = []
+
+    /// Add an identity hash to the blackhole set (RNS Transport.blackhole_identity,
+    /// Transport.py:3399-3413). Subsequent announces from this identity are dropped.
+    public func blackholeIdentity(_ identityHash: Data) {
+        blackholedIdentities.insert(identityHash)
+    }
+
+    /// Remove an identity hash from the blackhole set (RNS Transport.unblackhole_identity,
+    /// Transport.py:3415-3428).
+    public func unblackholeIdentity(_ identityHash: Data) {
+        blackholedIdentities.remove(identityHash)
+    }
+
+    /// Whether an identity hash is currently blackholed.
+    public func isIdentityBlackholed(_ identityHash: Data) -> Bool {
+        blackholedIdentities.contains(identityHash)
+    }
 
     /// E13: Receipt-based proof validation.
     ///
@@ -498,6 +547,23 @@ public actor ReticulumTransport {
         await interface.disconnect()
         interfaces.removeValue(forKey: id)
         delegateWrappers.removeValue(forKey: id)
+        localClientInterfaceIds.remove(id)
+    }
+
+    /// Register an interface as a local-client interface (shared-instance
+    /// client connection). Mirrors appending to Python
+    /// `Transport.local_client_interfaces` (Transport.py:164, populated by
+    /// LocalInterface accept). Path requests arriving on such an interface
+    /// are answered immediately (see respondWithCachedPath).
+    public func markLocalClientInterface(id: String) {
+        localClientInterfaceIds.insert(id)
+    }
+
+    /// Whether `id` is a registered local-client interface.
+    /// Mirrors `packet.receiving_interface in Transport.local_client_interfaces`
+    /// (Transport.from_local_client, Transport.py:1479-1510).
+    func isLocalClientInterface(_ id: String) -> Bool {
+        localClientInterfaceIds.contains(id)
     }
 
     /// Add an AutoInterface with peer lifecycle management.
@@ -982,6 +1048,17 @@ public actor ReticulumTransport {
             let ifaceId = await link?.attachedInterfaceId
             try await self.sendRawBytes(packetBytes, interfaceId: ifaceId)
         }
+        // Wire the Channel delivery-proof hooks so the link's Channel TX ring can
+        // observe when a CHANNEL packet's PROOF returns (drives window growth /
+        // retransmission). Mirrors RNS registering a PacketReceipt with Transport.
+        await link.setChannelProofHooks(
+            register: { [weak self] truncatedHash, cb in
+                await self?.registerProofCallback(truncatedHash: truncatedHash, callback: cb)
+            },
+            deregister: { [weak self] truncatedHash in
+                await self?.removeProofCallback(truncatedHash: truncatedHash)
+            }
+        )
 
         // Get packet FIRST so we can use it to compute link_id
         let packet = try await link.getLinkRequestPacket()
@@ -1766,7 +1843,7 @@ public actor ReticulumTransport {
                 let bitrate = interface.config.bitrate
                 if bitrate > 0 {
                     let txTime = Double(encoded.count * 8) / Double(bitrate)
-                    let waitTime = txTime / TransportConstants.ANNOUNCE_CAP
+                    let waitTime = txTime / interface.config.announceCap
                     announceAllowedAt[id] = now.addingTimeInterval(waitTime)
                 }
 
@@ -1972,6 +2049,18 @@ public actor ReticulumTransport {
             }
         }
 
+        // RNS Transport.py:1516-1530 — PLAIN-broadcast shared-instance fanout.
+        // A PLAIN BROADCAST packet is never injected into transport; instead, if it
+        // came from a local client it is repeated on every OTHER interface, and if it
+        // came from a normal interface it is pushed to the local-client interfaces
+        // only. Control destinations (e.g. the path-request PLAIN destination) are
+        // excluded (`if not packet.destination_hash in Transport.control_hashes`).
+        if packet.header.destinationType == .plain,
+           packet.header.transportType == .broadcast,
+           !controlHashes.contains(destHash) {
+            await fanoutPlainBroadcast(packet: packet, from: interfaceId)
+        }
+
         // Route based on packet type
         switch packet.header.packetType {
         case .announce:
@@ -2139,6 +2228,17 @@ public actor ReticulumTransport {
             let ifaceId = await link?.attachedInterfaceId
             try await self.sendRawBytes(data, interfaceId: ifaceId)
         }
+        // Wire the Channel delivery-proof hooks (responder side) — see the matching
+        // block on the initiator path. A responder's Channel can also send, so it
+        // needs the same receipt-resolution wiring.
+        await link.setChannelProofHooks(
+            register: { [weak self] truncatedHash, cb in
+                await self?.registerProofCallback(truncatedHash: truncatedHash, callback: cb)
+            },
+            deregister: { [weak self] truncatedHash in
+                await self?.removeProofCallback(truncatedHash: truncatedHash)
+            }
+        )
 
         // Configure link with destination callbacks IMMEDIATELY (before LRRTT).
         // This prevents a race condition where a resource advertisement arrives
@@ -2439,7 +2539,32 @@ public actor ReticulumTransport {
         }
 
         // CHANNEL (0x0E) - typed message channel data (encrypted)
+        // Mirrors RNS Link.receive CHANNEL branch (Link.py:1165-1173):
+        //   elif packet.context == RNS.Packet.CHANNEL:
+        //       if not self._channel:
+        //           RNS.log("Channel data received without open channel", ...)
+        //       else:
+        //           packet.prove()
+        //           plaintext = self.decrypt(packet.data)
+        //           if plaintext != None:
+        //               self.__update_phy_stats(packet)
+        //               self._channel._receive(plaintext)
+        // The packet is only processed — and crucially PROVED — when the link
+        // has an open channel; with no channel it is dropped WITHOUT a proof
+        // (Link.py:1166-1167). RNS proves CHANNEL packets UNCONDITIONALLY when a
+        // channel is open (Link.py:1172) — unlike the DATA branch below, it does
+        // NOT consult the destination's proof_strategy. Proving lets the sender's
+        // PacketReceipt resolve, so it stops retransmitting (otherwise 5 retries
+        // → link teardown). provePacket guards initiator-side proving internally
+        // (an initiator would sign with the wrong key), hence `try?` as in the
+        // DATA branch. Prove is done before decrypt to match RNS ordering;
+        // provePacket signs the wire packet's full hash, independent of decrypt.
         if packet.context == PacketContext.CHANNEL {
+            guard await link.hasOpenChannel else {
+                logger.debug("Channel data received without open channel")
+                return
+            }
+            try? await link.provePacket(packet)
             do {
                 let plaintext = try await link.decrypt(packet.data)
                 await link.handleChannelData(plaintext)
@@ -2626,12 +2751,41 @@ public actor ReticulumTransport {
         let destHash = packet.destination
         let hexPrefix = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
 
+        // RNS Transport.py:247-250 / 2306-2327 — a PLAIN DATA packet addressed to
+        // the rnstransport/tunnel/synthesize control destination is the tunnel
+        // handshake. RNS registers that destination with the synchronous
+        // tunnel_synthesize_handler packet callback; mirror that synchronously on
+        // the transport actor (rather than via the async DestinationCallback path,
+        // whose detached Task would race a read that immediately follows inbound()).
+        // The handler enforces the exact-length gate, validates the carried
+        // signature, and binds the established tunnel to THIS receiving interface.
+        if let tsDest = tunnelSynthesizeDestination, destHash == tsDest.hash {
+            tunnelSynthesizeHandler(data: packet.data, receivingInterfaceId: interfaceId)
+            return
+        }
+
         // Debug: list all registered destinations
         let registeredDests = destinations.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
         logger.debug("handleRegularData: destHash=\(hexPrefix), registeredDests=\(registeredDests), destType=\(String(describing: packet.header.destinationType))")
 
         // Check if destination is local
         guard let destination = destinations[destHash] else {
+            // for_local_client (RNS Transport.py:1511/1545-1581): a non-announce
+            // packet whose destination is held at hops==0 via a local-client
+            // interface is routed back to that client. The hops==0 sentinel exists
+            // only because the local-client decrement (Transport.py:1479-1480) made
+            // the attached app look master-originated. RNS regenerates the
+            // transport_id stripped on the previous hop (:1545-1546); the
+            // remaining_hops==0 relay branch (:1575-1579) strips transport headers,
+            // so the wire re-emission stays HEADER_1 with the hop count incremented —
+            // which is exactly forwardDataPacket's hopCount==0 branch.
+            if !localClientInterfaceIds.isEmpty,
+               let pathEntry = await pathTable.lookup(destinationHash: destHash),
+               pathEntry.hopCount == 0,
+               isLocalClientInterface(pathEntry.interfaceId) {
+                await forwardDataPacket(packet, from: interfaceId)
+                return
+            }
             // Not local — try forwarding if transport is enabled and this is a HEADER_2 addressed to us
             if transportEnabled,
                packet.header.headerType == .header2,
@@ -2833,17 +2987,76 @@ public actor ReticulumTransport {
             return
         }
 
+        // Blackhole gate (RNS Identity.validate_announce, Identity.py:567-569): if
+        // the announcing identity's hash is in Transport.blackholed_identities
+        // (Transport.py:123), the announce is invalidated and dropped before any
+        // path is learned. The announced identity hash is truncated_hash(public_key),
+        // where public_key is the leading 64 (KEYSIZE//8) bytes of the announce
+        // payload — the same slice validate_announce takes (Identity.py:535). Only
+        // typed (non-PLAIN) destinations carry identity key material.
+        if !blackholedIdentities.isEmpty,
+           packet.header.destinationType != .plain,
+           packet.data.count >= 64 {
+            let publicKey = Data(packet.data.prefix(64))
+            let announcedIdentityHash = Hashing.truncatedHash(publicKey)
+            if blackholedIdentities.contains(announcedIdentityHash) {
+                let hexPrefix = announcedIdentityHash.prefix(4).map { String(format: "%02x", $0) }.joined()
+                logger.debug("Dropped announce from blackholed identity \(hexPrefix, privacy: .public)...")
+                onDiagnostic?("[ANNOUNCE] Dropped announce from blackholed identity")
+                return
+            }
+        }
+
         // Get interface mode
         let mode = getInterfaceMode(for: interfaceId)
 
-        // L2: Rebroadcast detection moved to after validation (inside .recordedAndRebroadcast case)
+        // RNS local-client hop decrement (Transport.py:1455/1479-1480): an announce
+        // heard from a shared-instance local client is stored at its wire hop count
+        // (net-zero +1/-1), making the destination look master-originated.
+        let isFromLocalClient = isLocalClientInterface(interfaceId)
 
         // Process via announce handler
         let result = await announceHandler.process(
             packet: packet,
             from: interfaceId,
-            interfaceMode: mode
+            interfaceMode: mode,
+            hopDecrement: isFromLocalClient
         )
+
+        // L2: Local-rebroadcast / passed-on detection (RNS Transport.py:1719-1736).
+        // Runs for ANY VALIDATED HEADER_2 announce carrying a transport_id whose
+        // destination is already in our announce_table — INDEPENDENT of whether the
+        // announce updates the path table. In the reference this detection sits
+        // BEFORE the should_add logic, so a heard rebroadcast that is older / more
+        // hops (and therefore not re-admitted) still counts toward the local
+        // rebroadcast limit and can cancel a pending retry. `.recorded` /
+        // `.recordedAndRebroadcast` / `.ignored(.alreadySeen)` all imply the
+        // signature validated; `.invalidSignature` / `.invalidFormat` /
+        // `.hopLimitExceeded` do not.
+        let announceValidated: Bool
+        switch result {
+        case .recorded, .recordedAndRebroadcast:
+            announceValidated = true
+        case .ignored(let reason):
+            announceValidated = (reason == .alreadySeen)
+        }
+        if transportEnabled, announceValidated,
+           packet.header.headerType == .header2,
+           packet.transportAddress != nil {
+            // RNS increments packet.hops on receive (so its detection compares the
+            // RECEIVED hop count); this port keeps packet.header.hopCount at the
+            // wire value and applies the +1 at each use site (the path record does
+            // the same, AnnounceHandler.swift:295), so add 1 here to get the
+            // received hop count the comparison expects.
+            let detected = await announceTable.recordLocalRebroadcast(
+                destinationHash: packet.destination,
+                incomingHops: packet.header.hopCount + 1
+            )
+            if detected {
+                let hexPrefix = packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()
+                logger.debug("Local rebroadcast detected for \(hexPrefix, privacy: .public)...")
+            }
+        }
 
         // Handle result
         switch result {
@@ -2859,6 +3072,12 @@ public actor ReticulumTransport {
             // deliver to app handlers (e.g. LXMF lxmf.delivery / lxmf.propagation).
             // The ORIGINAL packet is passed so announce_packet_hash == packet hash.
             await dispatchAnnounceToHandlers(packet: packet, destinationHash: destHash)
+
+            // RNS Transport.py:1931-1976 — re-emit every accepted announce to our
+            // attached local clients immediately, rewritten to HEADER_2/TRANSPORT
+            // with our own identity as transport_id so they see the destination as
+            // 1-hop reachable via this shared instance.
+            await reEmitAnnounceToLocalClients(packet: packet, receivingInterfaceId: interfaceId, isFromLocalClient: isFromLocalClient)
 
             // C17: Check pending discovery path requests on announce arrival
             if transportEnabled, let prEntry = discoveryPathRequests.removeValue(forKey: destHash) {
@@ -2903,17 +3122,14 @@ public actor ReticulumTransport {
             // The ORIGINAL packet is passed so announce_packet_hash == packet hash.
             await dispatchAnnounceToHandlers(packet: packet, destinationHash: destHash)
 
-            // L2: Local rebroadcast detection (moved here, after validation)
-            // For HEADER_2 announces, check if this is our own rebroadcast heard back
-            if packet.header.headerType == .header2, packet.transportAddress != nil {
-                let detected = await announceTable.recordLocalRebroadcast(
-                    destinationHash: destHash,
-                    incomingHops: packet.header.hopCount
-                )
-                if detected {
-                    logger.debug("Local rebroadcast detected for \(hexPrefix, privacy: .public)...")
-                }
-            }
+            // RNS Transport.py:1931-1976 — re-emit every accepted announce to our
+            // attached local clients immediately (HEADER_2/TRANSPORT, our identity as
+            // transport_id). Independent of transport_enabled and of the normal
+            // announce-table rebroadcast below.
+            await reEmitAnnounceToLocalClients(packet: packet, receivingInterfaceId: interfaceId, isFromLocalClient: isFromLocalClient)
+
+            // L2: Local-rebroadcast detection now runs before this switch (hoisted
+            // to fire for any validated HEADER_2 announce, RNS Transport.py:1719-1736).
 
             // C17: Check pending discovery path requests on announce arrival
             if transportEnabled, let prEntry = discoveryPathRequests.removeValue(forKey: destHash) {
@@ -2994,11 +3210,17 @@ public actor ReticulumTransport {
                         receivedFrom = destHash
                     }
 
+                    // Transport.py:1889-1893: a heard announce arriving on a
+                    // local-client interface (is_from_local_client) is scheduled to
+                    // rebroadcast immediately (retransmit_timeout==now) exactly once
+                    // (retries preset to PATHFINDER_R); an ordinary forwarded announce
+                    // gets the random PATHFINDER_RW window with retries=0.
                     await announceTable.insert(
                         destinationHash: destHash,
                         packet: rebroadcastPacket,
                         hops: rebroadcastPacket.header.hopCount,
                         receivedFrom: receivedFrom,
+                        isLocalClient: isLocalClientInterface(interfaceId),
                         receivingInterfaceId: interfaceId
                     )
                     logger.info("Announce for \(hexPrefix, privacy: .public)... queued for retransmission")
@@ -3027,6 +3249,89 @@ public actor ReticulumTransport {
         }
     }
 
+    /// Destination hashes of control-plane destinations that are exempt from the
+    /// PLAIN-broadcast shared-instance fanout and the general relay (RNS
+    /// `Transport.control_hashes`, populated from `control_destinations` at
+    /// Transport.start()). RNS registers the path-request and tunnel-synthesize
+    /// PLAIN destinations as control destinations, so both are carved out here —
+    /// independent of whether this port has a handler bound for each.
+    private lazy var controlHashes: Set<Data> = {
+        var hashes: Set<Data> = []
+        hashes.insert(Destination(plainAppName: "rnstransport", aspects: ["path", "request"]).hash)
+        hashes.insert(Destination(plainAppName: "rnstransport", aspects: ["tunnel", "synthesize"]).hash)
+        return hashes
+    }()
+
+    /// Fan out a PLAIN BROADCAST packet across the shared-instance boundary.
+    ///
+    /// Mirrors RNS Transport.py:1516-1530. PLAIN broadcasts are never injected into
+    /// transport: a broadcast that arrived FROM a local client is repeated on every
+    /// other attached interface; one that arrived on a normal interface is pushed to
+    /// the local-client interfaces only. The original bytes are forwarded verbatim.
+    private func fanoutPlainBroadcast(packet: Packet, from interfaceId: String) async {
+        let raw = packet.encode()
+        if isLocalClientInterface(interfaceId) {
+            // From a local client: send on all interfaces except the originator.
+            for (otherId, iface) in interfaces {
+                guard otherId != interfaceId, iface.state == .connected else { continue }
+                try? await sendToInterface(raw, interfaceId: otherId)
+            }
+        } else {
+            // From a normal interface: push to the local clients only.
+            for localId in localClientInterfaceIds {
+                guard let iface = interfaces[localId], iface.state == .connected else { continue }
+                try? await sendToInterface(raw, interfaceId: localId)
+            }
+        }
+    }
+
+    /// Re-emit an accepted announce to every attached local client immediately.
+    ///
+    /// Mirrors RNS Transport.py:1931-1976 (the `if len(local_client_interfaces)`
+    /// block inside the should_add announce path). Each local client receives a
+    /// fresh announce rewritten to HEADER_2 / TRANSPORT carrying THIS instance's
+    /// identity as the transport_id, so a client behind the shared instance learns
+    /// the destination as 1-hop reachable via its LocalClientInterface. The packet
+    /// is never re-emitted to the interface it arrived on. The hop count is the
+    /// post-increment value RNS carries at this point: +1 for the receive, minus 1
+    /// again if the source was itself a local client (Transport.py:1455/1479-1480).
+    private func reEmitAnnounceToLocalClients(packet: Packet, receivingInterfaceId: String, isFromLocalClient: Bool) async {
+        guard !localClientInterfaceIds.isEmpty else { return }
+        guard let transportId = transportIdentityHash else { return }
+
+        // packet.hops after the inbound +1 / local-client -1 net (Transport.py:1957/1975).
+        let reEmitHops = packet.header.hopCount &+ (isFromLocalClient ? 0 : 1)
+
+        for localInterfaceId in localClientInterfaceIds {
+            // RNS: `if packet.receiving_interface != local_interface`
+            guard localInterfaceId != receivingInterfaceId else { continue }
+            guard let iface = interfaces[localInterfaceId], iface.state == .connected else { continue }
+
+            let header = PacketHeader(
+                headerType: .header2,
+                hasContext: packet.header.hasContext,
+                hasIFAC: false,
+                transportType: .transport,
+                destinationType: packet.header.destinationType,
+                packetType: .announce,
+                hopCount: reEmitHops
+            )
+            let reEmit = Packet(
+                header: header,
+                destination: packet.destination,
+                transportAddress: transportId,
+                context: packet.context,
+                data: packet.data
+            )
+            do {
+                try await sendToInterface(reEmit.encode(), interfaceId: localInterfaceId)
+                onDiagnostic?("[TRANSPORT] Re-emitted announce for \(packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()) to local client \(localInterfaceId)")
+            } catch {
+                onDiagnostic?("[TRANSPORT] Failed to re-emit announce to local client \(localInterfaceId): \(error)")
+            }
+        }
+    }
+
     /// Retransmit announces from the announce table as HEADER_2 packets.
     ///
     /// Called periodically (~1s) to process queued announce retransmissions.
@@ -3034,8 +3339,24 @@ public actor ReticulumTransport {
     /// Per-interface AnnounceFilter is applied before sending.
     ///
     /// Reference: Python Transport.py:518-579
-    private func processAnnounceRetransmissions() async {
+    private func processAnnounceRetransmissions(force: Bool = false) async {
+        // Transport.py:574/636: the announce-retransmit branch only runs when
+        // `now > announces_last_checked + announces_check_interval` (1.0s), even
+        // though jobs() itself ticks every job_interval (0.25s). `force` mirrors the
+        // behavioral force-cull, which zeroes announces_last_checked to drive one
+        // deterministic pass regardless of the gate (behavioral_transport.py force_cull).
+        let now = Date()
+        if !force && now.timeIntervalSince(announcesLastChecked) < TransportConstants.ANNOUNCES_CHECK_INTERVAL {
+            return
+        }
+        announcesLastChecked = now
+
+        // Transport.py:1004-1047: jobs() collects every due announce into `outgoing`,
+        // then handle_outgoing_announces emits them `sorted(outgoing, key=p.hops)` —
+        // lowest hop-count first. Mirror that ascending-hops ordering so batched
+        // rebroadcasts egress (and hit the per-interface announce cap) in hop order.
         let actions = await announceTable.processRetransmissions()
+            .sorted { $0.hops < $1.hops }
         guard !actions.isEmpty else { return }
 
         for action in actions {
@@ -3129,7 +3450,7 @@ public actor ReticulumTransport {
                     let bitrate = interface.config.bitrate
                     if bitrate > 0 {
                         let txTime = Double(encoded.count * 8) / Double(bitrate)
-                        let waitTime = txTime / TransportConstants.ANNOUNCE_CAP
+                        let waitTime = txTime / interface.config.announceCap
                         announceAllowedAt[id] = Date().addingTimeInterval(waitTime)
                     }
 
@@ -3152,8 +3473,22 @@ public actor ReticulumTransport {
         }
         heldAnnounces.removeAll()
 
-        // E5: Process announce queues (one per interface per cycle).
-        // Python (Interface.py:246): drain min-hop first, then oldest arrival.
+    }
+
+    /// E5: Drain each interface's deferred announce queue, one entry per
+    /// per-interface cap interval.
+    ///
+    /// This mirrors RNS `Interface.process_announce_queue` (Interface.py:323-358),
+    /// which is a SEPARATE, Timer-driven mechanism from the announce-table
+    /// retransmit job (Transport.jobs()): a forwarded announce that hits the
+    /// per-interface `announce_cap` is parked in `announce_queue` and drained one
+    /// at a time, min-hop first then oldest arrival, each drain re-arming the
+    /// `announce_allowed_at` spacing. The swift jobloop calls this every
+    /// `job_interval` (0.25s) so the queue makes progress even on passes with no
+    /// newly-due announce-table entries — the earlier coupling (draining only
+    /// inside `processAnnounceRetransmissions`, behind its no-due-actions early
+    /// return) left queued announces stuck until the next due retransmit.
+    func processAnnounceQueues() async {
         let now = Date()
         for (id, _) in interfaces {
             guard var queue = announceQueues[id], !queue.isEmpty else { continue }
@@ -3173,11 +3508,13 @@ public actor ReticulumTransport {
                 let entry = oldest.element
                 queue.remove(at: oldest.offset)
                 do {
-                    try await interfaces[id]?.send(entry.encoded)
+                    let transmitData = applyIFAC(raw: entry.encoded, interfaceId: id)
+                    try await interfaces[id]?.send(transmitData)
                     let bitrate = interfaces[id]?.config.bitrate ?? 0
                     if bitrate > 0 {
                         let txTime = Double(entry.encoded.count * 8) / Double(bitrate)
-                        announceAllowedAt[id] = now.addingTimeInterval(txTime / TransportConstants.ANNOUNCE_CAP)
+                        let cap = interfaces[id]?.config.announceCap ?? TransportConstants.ANNOUNCE_CAP
+                        announceAllowedAt[id] = now.addingTimeInterval(txTime / cap)
                     }
                 } catch {
                     logger.warning("Failed to send queued announce via \(id, privacy: .public)")
@@ -3213,9 +3550,11 @@ public actor ReticulumTransport {
     private var tableCullCounter: Int = 0
 
     /// H3/H4: Periodic cleanup of links and paths, throttled to every ~5 seconds.
+    /// The retransmission loop runs every 0.25s (RNS job_interval), so gate this
+    /// heavier sweep on every 20th pass (20 * 0.25s = 5s).
     private func periodicTableCleanup() async {
         tableCullCounter += 1
-        guard tableCullCounter % 5 == 0 else { return }
+        guard tableCullCounter % 20 == 0 else { return }
         // Mirror python Transport.jobs() (Transport.py:778-785): cull paths that have
         // expired OR whose attached interface is no longer present. Keeping the
         // interface-absent cull is correct — the BLE boot/transient path-loss is fixed
@@ -3238,19 +3577,63 @@ public actor ReticulumTransport {
 
     /// Start the periodic announce retransmission task.
     ///
-    /// Called when transport is set up. Runs every ~1 second.
+    /// Ticks every `job_interval` (0.25s), matching RNS `Transport.jobloop()`
+    /// (Transport.py:500-503, `sleep(Transport.job_interval)` with
+    /// `job_interval = 0.250`). The fast tick drives the announce-queue cap drain
+    /// and table culls; the announce-table retransmit branch itself is rate-limited
+    /// internally to `ANNOUNCES_CHECK_INTERVAL` (1.0s). The heavier table-cull is
+    /// kept on its ~5s budget via `periodicTableCleanup`'s internal counter.
     public func startRetransmissionLoop() {
         guard retransmissionTask == nil else { return }
+        // Anchor the announces_check_interval phase deterministically at loop start.
+        //
+        // PORT DEVIATION (documented in port-deviations.md): RNS keeps
+        // `announces_last_checked` process-global on the singleton Transport
+        // (Transport.py:181), so a long-lived process phases the once-per-second
+        // announce sweep arbitrarily relative to any given heard announce. The swift
+        // bridge instead builds a FRESH Transport per behavioral handle, so the phase
+        // would otherwise re-anchor every test and race the sweep against a test's
+        // sub-second drain. We back-date the anchor by FIRST so the first sweep lands
+        // ~0.75s after start — comfortably inside a forwarded announce's [0,0.5]s due
+        // window-plus-margin yet before a 1.0s rebroadcast-drain, and after the
+        // sub-0.5s windows of the last-hop/forwarding tests. Steady-state cadence is
+        // unchanged at exactly ANNOUNCES_CHECK_INTERVAL thereafter.
+        let firstSweepDelay: TimeInterval = 0.75
+        announcesLastChecked = Date().addingTimeInterval(firstSweepDelay - TransportConstants.ANNOUNCES_CHECK_INTERVAL)
         retransmissionTask = Task { [weak self] in
+            // Mirror RNS `jobloop()` (Transport.py:500-503): run jobs() FIRST, then
+            // sleep job_interval, so the cull/queue maintenance starts promptly
+            // rather than after one idle interval.
+            var firstPass = true
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
+                if !firstPass {
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+                firstPass = false
                 guard let self = self else { break }
                 await self.processAnnounceRetransmissions()
+                await self.processAnnounceQueues()
                 await self.cleanupDiscoveryPathRequests()
                 await self.cullTransportTables()
                 await self.periodicTableCleanup()
             }
         }
+    }
+
+    /// Run a single announce-retransmission pass synchronously.
+    ///
+    /// Exposes the otherwise-private `processAnnounceRetransmissions()` (the
+    /// announce branch of RNS jobs(), Transport.py:573-636) so a deterministic
+    /// jobs() pass can be driven without the 1-second timer. Paired with
+    /// `cullTransportTables()` this mirrors a full forced jobs() run.
+    public func runAnnounceRetransmissions() async {
+        // force == true bypasses the announces_check_interval gate, mirroring the
+        // reference force-cull which zeroes announces_last_checked before jobs().
+        await processAnnounceRetransmissions(force: true)
+        // Drain any announces the forced pass parked behind the per-interface cap,
+        // so a single force-cull makes progress on the queue without waiting for
+        // the next jobloop tick.
+        await processAnnounceQueues()
     }
 
     /// Stop the periodic announce retransmission task.
@@ -4141,9 +4524,21 @@ public actor ReticulumTransport {
             data: cachedData
         )
 
-        // E6: Capture interface mode before Task (actor-isolated)
+        // E6: Capture interface mode before Task (actor-isolated).
+        //
+        // The retransmit grace mirrors Python Transport.py:2973-2987 exactly:
+        //   - local-client requestor          -> now            (delay 0)
+        //   - FULL/other arrival              -> now + GRACE     (0.4s)
+        //   - ROAMING arrival                 -> now + GRACE+RG  (1.9s)
+        // and crucially NO PATHFINDER_RW random window is added — a path-request
+        // answer uses a *fixed* delay, unlike a heard-announce reinsert
+        // (Transport.py:1871). The `pathRequestAnswer` flag selects that fixed
+        // path in AnnounceTable.insert and sets retries = PATHFINDER_R (2968).
+        let isLocalClientRequest = attachedInterfaceId.map { isLocalClientInterface($0) } ?? false
         let isRoaming = attachedInterfaceId.flatMap { getInterfaceMode(for: $0) } == .roaming
-        let extraDelay = Self.PATH_REQUEST_GRACE + (isRoaming ? TransportConstants.PATH_REQUEST_RG : 0)
+        let extraDelay: TimeInterval = isLocalClientRequest
+            ? 0
+            : Self.PATH_REQUEST_GRACE + (isRoaming ? TransportConstants.PATH_REQUEST_RG : 0)
 
         Task { [weak self] in
             guard let self = self else { return }
@@ -4158,6 +4553,7 @@ public actor ReticulumTransport {
                 receivedFrom: destinationHash,
                 blockRebroadcasts: true,
                 attachedInterfaceId: attachedInterfaceId,
+                pathRequestAnswer: true,
                 extraDelay: extraDelay
             )
         }

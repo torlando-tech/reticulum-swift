@@ -71,12 +71,16 @@ final class ChannelTests: XCTestCase {
         }
     }
 
-    func testEnvelopePayloadTruncated() {
-        // Header says 10 bytes payload but only 2 provided
+    func testEnvelopePayloadIsRawTail() throws {
+        // RNS Channel.Envelope.unpack takes the payload as ALL bytes after the
+        // 6-byte header (`raw = self.raw[6:]`, Channel.py:181) — the advertised
+        // length field (bytes 4-5) is NEVER consulted on receive. A header that
+        // over-advertises 10 bytes while only 2 follow must still decode to those
+        // 2 tail bytes, not throw or truncate.
         let data = Data([0x00, 0x01, 0x00, 0x00, 0x00, 0x0A, 0xAA, 0xBB])
-        XCTAssertThrowsError(try Envelope.unpack(from: data)) { error in
-            XCTAssertEqual(error as? ChannelError, .payloadTruncated)
-        }
+        let unpacked = try Envelope.unpack(from: data)
+        XCTAssertEqual(unpacked.msgtype, 0x0001)
+        XCTAssertEqual(unpacked.payload, Data([0xAA, 0xBB]))
     }
 
     func testEnvelopeEmptyPayload() throws {
@@ -150,14 +154,34 @@ final class ChannelTests: XCTestCase {
     }
 
     func testStreamDataMessageAllFlags() throws {
+        // A compressed StreamDataMessage carries a REAL bz2 chunk on the wire;
+        // unpack inflates it back (Buffer.py:94-97). Construct the message the way
+        // RawChannelWriter.write does — `data` is the bz2.compress of the chunk —
+        // and verify the round-trip restores the original bytes with all flags.
+        let original = Data(repeating: 0x5A, count: 256)
+        let compressed = try ResourceCompression.bz2Compress(original, blockSize: 9)
         let msg = StreamDataMessage(streamId: 100, eof: true, compressed: true,
-                                     data: Data([0xAA]))
+                                     data: compressed)
         let packed = try msg.pack()
         let unpacked = try StreamDataMessage.unpack(from: packed)
         XCTAssertEqual(unpacked.streamId, 100)
         XCTAssertTrue(unpacked.eof)
         XCTAssertTrue(unpacked.compressed)
-        XCTAssertEqual(unpacked.data, Data([0xAA]))
+        XCTAssertEqual(unpacked.data, original)
+    }
+
+    func testStreamDataMessageDecompressionBound() throws {
+        // A compressed chunk that would inflate past MAX_CHUNK_LEN (16384) must
+        // raise at unpack (Buffer.py:95-97), so a conformant reader aborts rather
+        // than silently truncating.
+        let oversize = Data(count: RawChannelWriter.MAX_CHUNK_LEN + 1)
+        let compressed = try ResourceCompression.bz2Compress(oversize, blockSize: 9)
+        let msg = StreamDataMessage(streamId: 0, eof: false, compressed: true,
+                                     data: compressed)
+        let packed = try msg.pack()
+        XCTAssertThrowsError(try StreamDataMessage.unpack(from: packed)) { error in
+            XCTAssertEqual(error as? ChannelError, .decompressionBoundExceeded)
+        }
     }
 
     func testStreamDataMessageTooShort() {

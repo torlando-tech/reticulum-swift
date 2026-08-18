@@ -516,7 +516,14 @@ final class TransportForwardingTests: XCTestCase {
     // MARK: - Table Cleanup Tests
 
     func testStaleEntryCleanup() async throws {
-        let (transport, _, _, _, _) = try await makeForwardingTransport()
+        // Build a transport WITHOUT enabling transport mode, so no background jobs
+        // loop runs. setTransportEnabled(true) starts that loop, which now culls on
+        // its first pass immediately (mirroring RNS jobloop(): run jobs, then sleep,
+        // rather than sleeping a full interval first). A running culler would race
+        // the manual cull under test — culling these stale entries between the two
+        // pre-cull count reads below. This test exercises the manual
+        // cullTransportTables() API in isolation.
+        let transport = ReticulumTransport(pathTable: PathTable())
 
         // Insert stale entries via a helper that runs inside the actor
         await transport.insertStaleTransportEntries()

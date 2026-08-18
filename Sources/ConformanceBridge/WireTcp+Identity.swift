@@ -64,31 +64,89 @@ func handleWireIdentityCommand(_ command: String, _ p: [String: JSONValue]) thro
         let appName = try getString(p, "app_name")
         let aspects = getStringArray(p, "aspects")
         let keyHex = getHexOptional(p, "key")
-        _ = try requireInstance(handle)
+        let inst = try requireInstance(handle)
 
         // RNS.Destination(None, IN, GROUP, app_name, *aspects): GROUP hash is
         // identity-independent — truncated_hash(name_hash). Swift's
         // Destination.plainHash is byte-identical (name-only hash).
         let destHash = Destination.plainHash(appName: appName, aspects: aspects)
 
-        // create_keys() / load_private_key(): the GROUP key is a 32-byte symmetric
-        // Token key (RNS Cryptography.Fernet.generate_key() == os.urandom(32)).
-        // When `key` is supplied we echo it back (load_private_key →
-        // get_private_key round-trips the same bytes); otherwise generate 32 bytes.
-        // LIBRARY-GAP: reticulum-swift Destination has no symmetric GROUP key /
-        // Token encrypt+decrypt, and the shared WireInstance has no group store,
-        // so this returns the correct {destination_hash, key} but cannot back the
-        // sibling wire_group_encrypt / wire_group_decrypt commands.
+        // create_keys() / load_private_key(): the GROUP key is a symmetric Token
+        // key. RNS Destination.create_keys() -> Token.generate_key() defaults to
+        // AES_256_CBC == os.urandom(64) (Token.py:53-55), i.e. a 64-byte key
+        // (32-byte HMAC signing key + 32-byte AES-256 key), NOT 32. When `key`
+        // is supplied we echo it back (load_private_key -> get_private_key
+        // round-trips the same bytes); otherwise generate 64 fresh bytes.
+        // The key is retained on the WireInstance group store (keyed by the GROUP
+        // destination hash hex) so wire_group_encrypt / wire_group_decrypt can
+        // back it with the library Token type (AES-256-CBC + HMAC), exactly as
+        // Ext+Destination.swift destination_group_encrypt does.
         let key: Data
         if let provided = keyHex, !provided.isEmpty {
             key = provided
         } else {
-            key = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+            key = Data((0..<64).map { _ in UInt8.random(in: 0...255) })
         }
+        wireLock.lock()
+        inst.groupKeys[bytesToHex(destHash)] = key
+        wireLock.unlock()
         return [
             "destination_hash": hex(destHash),
             "key": hex(key),
         ]
+
+    // MARK: wire_group_encrypt
+
+    case "wire_group_encrypt":
+        // RNS Destination.encrypt() for a GROUP destination -> prv.encrypt() ->
+        // Token(key).encrypt() (Destination.py:602-651). Look up the symmetric key
+        // by GROUP destination hash, then Token(derivedKey:).encrypt(). Fresh
+        // per-message IV (Token.encrypt -> os.urandom) makes repeat ciphertext
+        // differ. Mirrors Ext+Destination.swift:303-307 + python cmd_wire_group_encrypt.
+        let handle = try getString(p, "handle")
+        let destHashHex = try getString(p, "destination_hash")
+        let plaintext = try getHex(p, "plaintext")
+        let inst = try requireInstance(handle)
+
+        wireLock.lock()
+        let groupKey = inst.groupKeys[destHashHex.lowercased()]
+        wireLock.unlock()
+        guard let keyBytes = groupKey else {
+            throw BridgeError.invalidData("No GROUP destination \(destHashHex) on handle \(handle)")
+        }
+        let token = try Token(derivedKey: keyBytes)
+        let ciphertext = try token.encrypt(plaintext)
+        return ["ciphertext": hex(ciphertext)]
+
+    // MARK: wire_group_decrypt
+
+    case "wire_group_decrypt":
+        // RNS Destination.decrypt() for a GROUP destination -> prv.decrypt() ->
+        // Token(key).decrypt(); on Token HMAC auth failure RNS returns None rather
+        // than garbage (Destination.py:647-651). Mirror that: Token decrypt success
+        // -> {decrypted:true, plaintext}; any TokenError (wrong key -> HMAC verify
+        // fails) -> {decrypted:false}. Mirrors python cmd_wire_group_decrypt.
+        let handle = try getString(p, "handle")
+        let destHashHex = try getString(p, "destination_hash")
+        let ciphertext = try getHex(p, "ciphertext")
+        let inst = try requireInstance(handle)
+
+        wireLock.lock()
+        let groupKey = inst.groupKeys[destHashHex.lowercased()]
+        wireLock.unlock()
+        guard let keyBytes = groupKey else {
+            throw BridgeError.invalidData("No GROUP destination \(destHashHex) on handle \(handle)")
+        }
+        let token = try Token(derivedKey: keyBytes)
+        do {
+            let plaintext = try token.decrypt(ciphertext)
+            return [
+                "decrypted": boolean(true),
+                "plaintext": hex(plaintext),
+            ]
+        } catch is TokenError {
+            return ["decrypted": boolean(false)]
+        }
 
     // MARK: wire_ifac_compute
 

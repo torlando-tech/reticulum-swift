@@ -304,6 +304,11 @@ func handleBehavioralBlackholeCommand(_ command: String, _ p: [String: JSONValue
             state.setEntry(identityHash, BlackholeEntry(source: inst.identity.hash, until: until, reason: reason))
             persistBlackhole(state, selfHash: inst.identity.hash)
             try removeBlackholedPaths(inst, state.blackholedHashSet())
+            // Populate the live ReticulumTransport.blackholed_identities set so a
+            // FUTURE announce from this identity is dropped in the validate_announce
+            // blackhole gate (Identity.py:567-569) before any path is learned — the
+            // inbound-drop side effect of Transport.blackhole_identity (Transport.py:123).
+            try blockingAsync { await inst.transport.blackholeIdentity(identityHash) }
             blackholed = true
         }
         return ["blackholed": boolean(blackholed)]
@@ -321,6 +326,9 @@ func handleBehavioralBlackholeCommand(_ command: String, _ p: [String: JSONValue
         let lifted = state.remove(identityHash)
         if lifted {
             persistBlackhole(state, selfHash: inst.identity.hash)
+            // Lift the live ReticulumTransport blackhole gate too, so subsequent
+            // announces from this identity are learned again (Transport.unblackhole_identity).
+            try blockingAsync { await inst.transport.unblackholeIdentity(identityHash) }
         }
         return ["lifted": boolean(lifted)]
 

@@ -243,6 +243,29 @@ public actor Link {
     /// Callback for sending packets (set by transport integration)
     var sendCallback: ((Data) async throws -> Void)?
 
+    /// Transport-provided hook registering a delivery-proof callback for a sent
+    /// CHANNEL packet, keyed by the packet's truncated (16-byte) hash. Mirrors how
+    /// RNS's `Packet.send()` registers a `PacketReceipt` with `Transport` so the
+    /// returning PROOF resolves it (RNS/Packet.py / Transport.py). The swift
+    /// `Channel` TX ring uses this to learn when a channel packet was proved by the
+    /// peer (drives window growth / retransmission). Set by the transport at the
+    /// same point it wires `sendCallback`; nil on links not attached to a transport.
+    var channelProofRegistrar: (@Sendable (Data, @escaping @Sendable () async -> Void) async -> Void)?
+
+    /// Transport-provided hook removing a previously-registered channel delivery
+    /// callback (used when a send is rolled back before it ever transmits).
+    var channelProofDeregistrar: (@Sendable (Data) async -> Void)?
+
+    /// Wire the Channel delivery-proof registration hooks. Called by the transport
+    /// when it attaches this link, alongside `setSendCallback`.
+    public func setChannelProofHooks(
+        register: @escaping @Sendable (Data, @escaping @Sendable () async -> Void) async -> Void,
+        deregister: @escaping @Sendable (Data) async -> Void
+    ) {
+        self.channelProofRegistrar = register
+        self.channelProofDeregistrar = deregister
+    }
+
     // MARK: - Request Management
 
     /// Pending requests awaiting response
@@ -325,6 +348,18 @@ public actor Link {
     /// Called for context 0x00 (DATA) packets before LXMF routing.
     /// LXST and other protocols use this for raw link data delivery.
     private var packetCallback: (@Sendable (Data, Packet) async -> Void)?
+
+    /// Optional observer invoked with the context byte of every packet this link
+    /// PROVES (inside `provePacket`). The conformance receiver wraps RNS's
+    /// `link.prove_packet` the same way (reference/wire_tcp.py:1431-1441) to build
+    /// a server-side proof log — a CHANNEL (0x0E) entry appears only when a
+    /// channel is open (Link.py:1172), never for a no-channel link (Link.py:1166).
+    private var proofObserver: (@Sendable (Int) -> Void)?
+
+    /// Install the proof observer (see `proofObserver`).
+    public func setProofObserver(_ observer: (@Sendable (Int) -> Void)?) {
+        self.proofObserver = observer
+    }
 
     /// Whether a packet callback is registered on this link.
     public var hasPacketCallback: Bool {
@@ -1140,6 +1175,40 @@ public actor Link {
         }
     }
 
+    /// Conformance-probe helper: run `processKeepalive` and report whether THIS
+    /// call advanced `lastInbound` / `lastDataAt`, measured atomically within a
+    /// single actor execution.
+    ///
+    /// `processKeepalive` is synchronous and this method takes no suspension point
+    /// between the before/after snapshots, so the live keepalive task or a real
+    /// inbound 0xFE echo from the peer cannot interleave and perturb the
+    /// measurement (the bridge previously compared timestamps captured across
+    /// separate `await` hops, which an interleaved inbound keepalive raced). Pure
+    /// observation: behaviour of `processKeepalive` itself is unchanged.
+    ///
+    /// Returns the initiator flag, whether each timestamp advanced, and the link
+    /// state before/after (for STALE→ACTIVE recovery observation).
+    public func probeKeepalive(_ data: Data)
+        -> (initiator: Bool, lastInboundAdvanced: Bool, lastDataAdvanced: Bool,
+            stateBefore: LinkState, stateAfter: LinkState) {
+        let inboundBefore = lastInbound
+        let dataBefore = lastDataAt
+        let stateBefore = state
+        processKeepalive(data)
+        let inboundAfter = lastInbound
+        let dataAfter = lastDataAt
+        let stateAfter = state
+        func advanced(_ b: Date?, _ a: Date?) -> Bool {
+            guard let a = a else { return false }
+            guard let b = b else { return true }
+            return a > b
+        }
+        return (initiator,
+                advanced(inboundBefore, inboundAfter),
+                advanced(dataBefore, dataAfter),
+                stateBefore, stateAfter)
+    }
+
     /// Stop keep-alive task.
     private func stopKeepalive() {
         keepaliveTask?.cancel()
@@ -1742,6 +1811,11 @@ public actor Link {
         }
         guard state.isEstablished else { throw LinkError.notActive }
         guard let sendCallback else { throw LinkError.transportNotAvailable }
+
+        // Record the proved packet's context byte for any installed observer
+        // (the conformance receiver-side proof log). Mirrors the python harness
+        // wrapping link.prove_packet (reference/wire_tcp.py:1433-1439).
+        proofObserver?(Int(packet.context))
 
         let packetHash = packet.getFullHash()
         let signature = try localIdentity.sign(packetHash)

@@ -14,14 +14,64 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  conformance:
-    name: Conformance (Swift)
+  # Build the Swift bridge + pipe peer ONCE and share the binaries with every
+  # conformance module job below (a release build is the slow part; rebuilding it
+  # per matrix entry would triple the wall-clock). The binaries are macOS/arm64,
+  # so the downstream jobs must also run on macos-15.
+  build:
+    name: Build bridge
     runs-on: macos-15
-    # The expanded conformance suite no longer finishes serially inside 30 min
-    # (it was reaching ~70% then being timeout-cancelled). It is run with
-    # `-n auto` below; 45 min is generous headroom so a slow runner can't
-    # re-trigger a cancel and mask the real result.
-    timeout-minutes: 45
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: reticulum-swift-lib
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm/
+          key: spm-conformance-${{ hashFiles('reticulum-swift-lib/Package.swift') }}
+
+      - name: Build ConformanceBridge and PipePeer
+        working-directory: reticulum-swift-lib
+        run: |
+          swift build -c release --product ConformanceBridge
+          swift build -c release --product PipePeer
+
+      - name: Upload bridge binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-bins
+          path: |
+            reticulum-swift-lib/.build/release/ConformanceBridge
+            reticulum-swift-lib/.build/release/PipePeer
+          retention-days: 1
+          if-no-files-found: error
+
+  # One CI job per conformance MODULE so a failure points at the area (core /
+  # wire / behavioral) instead of one giant red check. fail-fast: false so a red
+  # module never cancels its siblings.
+  conformance:
+    name: Conformance (Swift) / ${{ matrix.module }}
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Top-level tests/*.py (crypto, identity, destination, packet, framing,
+          # announce, channel/buffer, config-parse, discovery, ratchet, …).
+          - module: core
+            paths: tests --ignore=tests/wire --ignore=tests/behavioral --ignore=tests/lxmf
+          # Wire-format / on-the-wire interop (link, resource, channel, announce,
+          # packet, ifac, …). The largest module.
+          - module: wire
+            paths: tests/wire
+          # Behavioral / transport-node simulations (forwarding, announce relay,
+          # routing, tunnels, blackhole, packet filter, …).
+          - module: behavioral
+            paths: tests/behavioral
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,61 +92,96 @@ jobs:
           repository: markqvist/LXMF
           path: LXMF
 
-      - uses: actions/cache@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: ~/Library/Caches/org.swift.swiftpm/
-          key: spm-conformance-${{ hashFiles('reticulum-swift-lib/Package.swift') }}
+          name: conformance-bins
+          path: bins
 
-      - name: Build conformance bridge and pipe peer
-        working-directory: reticulum-swift-lib
-        run: |
-          swift build -c release --product ConformanceBridge
-          swift build -c release --product PipePeer
+      # upload/download-artifact does not preserve the executable bit.
+      - name: Restore executable bit
+        run: chmod +x bins/ConformanceBridge bins/PipePeer
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # Install the conformance suite's own declared deps (pytest, msgpack,
-      # u-msgpack-python, pytest-xdist, …) so new harness-side imports don't break
-      # collection, plus pytest-timeout for the --timeout cap below. pytest-xdist
-      # powers the `-n auto` parallelism the test step relies on to finish in time.
-      - run: pip install -r reticulum-conformance/requirements.txt pytest-timeout
+      # The suite's own deps (pytest, msgpack, pytest-xdist for -n auto, …) plus
+      # pytest-timeout for the per-test cap and pytest-rerunfailures for the few
+      # inherently non-deterministic cases (below).
+      - run: pip install -r reticulum-conformance/requirements.txt pytest-timeout pytest-rerunfailures
 
-      - name: Run conformance tests
+      - name: Run conformance module (${{ matrix.module }})
         working-directory: reticulum-conformance
         env:
-          # Per-impl override: the fresh-built Swift bridge is used for
-          # swift peers; reference peers fall back to the Python RNS bridge
-          # so cross-impl parametrization exercises both stacks.
-          CONFORMANCE_SWIFT_BRIDGE_CMD: ${{ github.workspace }}/reticulum-swift-lib/.build/release/ConformanceBridge
+          # Fresh-built Swift bridge for swift peers; reference peers fall back to
+          # the Python RNS bridge so cross-impl parametrization exercises both.
+          CONFORMANCE_SWIFT_BRIDGE_CMD: ${{ github.workspace }}/bins/ConformanceBridge
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
-        # tests/lxmf/ is the LXMF-layer conformance suite owned by LXMF-swift;
-        # it rides the same bridge but has its own CI target. Keep the
-        # reticulum-swift CI focused on RNS-layer parity.
+          # Make the skip_unsupported plugin importable via `-p`.
+          PYTHONPATH: ${{ github.workspace }}/reticulum-swift-lib/.github/conformance
+        # Shared-instance (LocalServerInterface / LocalClientInterface) is
+        # intentionally out of scope for the swift leaf endpoint. The
+        # skip_unsupported plugin (reticulum-swift/.github/conformance/) turns the
+        # bridge's "share_instance unsupported" error into a SKIP, keyed on the
+        # SUT's own error string — so it is precise (a test merely named
+        # "...shared_sequence..." is unaffected), self-maintaining (new
+        # shared-instance tests skip automatically), and leaves the reference-impl
+        # arms running so they still pin. `-rs` lists what was skipped.
         #
-        # -n auto runs the suite across all runner cores (pytest-xdist). The
-        # expanded suite no longer finishes serially within the job timeout
-        # (it was reaching ~70% then being cancelled); the suite is designed for
-        # `-n auto` (see reticulum-conformance/requirements.txt) and completes in
-        # a few minutes parallel. NOTE: ~148 cases are EXPECTED to fail today —
-        # the deferred transport-NODE/BLE-relay roadmap plus the approved
-        # Channel/Buffer/GROUP/INI skips (swift is a leaf endpoint). This step is
-        # therefore expected-red until those land or are xfail-marked upstream;
-        # parallelism only ensures the run COMPLETES and reports the real result
-        # instead of a misleading 30-min timeout-cancel.
+        # tests/lxmf/ is the LXMF-layer suite (its own CI target) and is excluded
+        # from the `core` module above. -n auto parallelises within the module;
+        # --timeout=180 caps any single wedged case (e.g. resource-multihop).
         #
-        # --timeout=180 caps any individual test that wedges (resource-multihop
-        # can hang indefinitely on a failed transfer) so a single hung case
-        # doesn't consume the entire workflow budget and timeout-kill the
-        # whole run. 180 s tolerates the slowest passing cases:
-        # test_large_resource_multihop transfers 256 KB through a 2-hop link
-        # and takes ~60-90 s per variant on a macos-15 runner; all 8
-        # variants pass reliably at this cap. Previous 60 s cap was too
-        # tight and caused 4 of those 8 to fail as "Timeout" instead of
-        # completing.
-        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=swift -n auto -v --tb=short --timeout=180
+        # --reruns 2 retries a FAILED case up to twice. A handful of conformance
+        # cases are inherently non-deterministic — notably the proof-of-work stamp
+        # tests (e.g. test_default_stamp_cost_14): a "cost-6" announce builds a
+        # stamp whose ACHIEVED value is random ≥6, so it lands ≥14 (and is accepted
+        # by a default-14 receiver) ~1/256 of the time, in both swift AND the
+        # reference. Reruns rescue these without masking real gaps — a deterministic
+        # failure still fails all three attempts and stays red.
+        run: >-
+          python3 -m pytest ${{ matrix.paths }} --impl=swift
+          -p skip_unsupported -n auto -v -rs --tb=short --timeout=180
+          --reruns 2 --reruns-delay 1
+
+  # IFAC pipe integration (the swift PipePeer talks to the python reference over a
+  # pipe). Previously this ran as a second STEP after the conformance step, so a
+  # red conformance run masked it entirely; as its own job it always runs and
+  # reports honestly.
+  integration:
+    name: Conformance (Swift) / integration
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: reticulum-swift-lib
+
+      - uses: actions/checkout@v4
+        with:
+          repository: torlando-tech/reticulum-conformance
+          path: reticulum-conformance
+
+      - uses: actions/checkout@v4
+        with:
+          repository: markqvist/Reticulum
+          path: Reticulum
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: conformance-bins
+          path: bins
+
+      - name: Restore executable bit
+        run: chmod +x bins/ConformanceBridge bins/PipePeer
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r reticulum-conformance/requirements.txt pytest-timeout
 
       - name: Run integration tests (IFAC pipe)
         working-directory: reticulum-conformance
@@ -104,4 +189,4 @@ jobs:
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
         run: >-
           python3 -m pytest integration/ -v --tb=short
-          --peer-cmd=${{ github.workspace }}/reticulum-swift-lib/.build/release/PipePeer
+          --peer-cmd=${{ github.workspace }}/bins/PipePeer

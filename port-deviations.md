@@ -6,6 +6,61 @@ file:line, the python reference site, and the reason.
 
 ## Active deviations
 
+### Tunnel-synthesize handler dispatched synchronously on the transport actor
+
+**Sites:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —
+`handleRegularData(_:from:)` (the `tunnelSynthesizeDestination` intercept) and
+`Sources/ReticulumSwift/Transport/ReticulumTransport+Tunnels.swift`
+(`tunnelSynthesizeHandler`, `handleTunnel`).
+
+**Python reference:** `RNS/Transport.py:247-250` (the `tunnel_synthesize`
+destination is registered with `set_packet_callback(tunnel_synthesize_handler)`),
+`:2306-2327` (`tunnel_synthesize_handler`), `:2336-2345` (`handle_tunnel`).
+
+**Reason:** Category (a) — concurrency model. RNS is single-threaded: `inbound`
+delivers a PLAIN packet to the destination's packet callback and the callback
+(`tunnel_synthesize_handler` → `handle_tunnel`) runs to completion *inside*
+`inbound`, so `Transport.tunnels` is populated by the time `inbound` returns.
+reticulum-swift's `DestinationCallbackManager` callback is a synchronous
+`(Data, Packet) -> Void` closure that cannot mutate the `ReticulumTransport`
+actor's state without hopping to it via a detached `Task`, which would race a
+`read_tunnels` that immediately follows `inbound()`. To preserve RNS's
+run-to-completion semantics the swift port intercepts the tunnel-synthesize
+control-destination packet directly in `handleRegularData` (already on the
+transport actor) and calls the handler synchronously, instead of routing it
+through the async callback path. The validate/establish logic, the 176-byte
+exact-length gate, the `full_hash(public_key||interface_hash)` tunnel-id
+derivation, and the receiving-interface binding are byte-for-byte the reference;
+only the dispatch mechanism differs. No wire bytes change.
+
+### Transport announce-retransmit phase anchor (`announces_last_checked`)
+
+**Sites:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —
+`startRetransmissionLoop()` (`announcesLastChecked` back-dated anchor) and
+`processAnnounceRetransmissions(force:)` (the `ANNOUNCES_CHECK_INTERVAL` gate).
+
+**Python reference:** `RNS/Transport.py:181` (`announces_last_checked = 0.0`),
+`:574`/`:636` (the announce-retransmit branch runs at most once per
+`announces_check_interval = 1.0`s and unconditionally re-stamps
+`announces_last_checked` after each sweep), `:500-503` (`jobloop`).
+
+**Reason:** Category (a) — runtime model. RNS's `Transport` is a process-wide
+singleton, so `announces_last_checked` is global and persists for the whole
+process; the once-per-second announce sweep is therefore phased arbitrarily
+relative to any individual heard announce, and the reference's own behavioral
+`test_announce_rebroadcast_wire_format` (which sleeps exactly 1.0s then drains)
+is correspondingly phase-fragile — it fails the reference in isolation and in a
+full `tests/behavioral/` run, passing only when prior tests happen to align the
+global phase. reticulum-swift instead constructs a FRESH `ReticulumTransport`
+per conformance behavioral handle, so the phase would re-anchor every test and
+deterministically race the sweep against the test's drain. The gate value
+(1.0s) and steady-state cadence match RNS exactly; the only deviation is that
+the per-transport anchor is back-dated so the FIRST sweep lands ~0.75s after
+start — inside a forwarded announce's `[0, PATHFINDER_RW=0.5]`s due window plus
+margin, before a 1.0s rebroadcast drain, and after the sub-0.5s drain windows of
+the last-hop / forwarding tests. This makes the swift behavior deterministic
+where RNS is luck-of-phase; it changes no wire bytes and no steady-state timing.
+
 ### ConformanceBridge `crypto_provider_op` — single crypto provider
 
 **Sites:** `Sources/ConformanceBridge/Ext+Crypto.swift` — `handleCryptoExtCommand`,
@@ -22,6 +77,34 @@ bridge command accepts and validates the `provider` arg (`internal`/`pyca`) for
 API parity but maps both onto the same implementation. The conformance test only
 asserts the two providers produce identical output against fixed NIST/RFC vectors,
 which a single shared implementation satisfies trivially. No protocol bytes differ.
+
+### ConformanceBridge `config_parse_interface` — focused `_synthesize_interface` port
+
+**Sites:** `Sources/ReticulumSwift/Interfaces/InterfaceConfigSynthesizer.swift`
+(`ConfigParser`, `InterfaceConfigSynthesizer`); driven by
+`Sources/ConformanceBridge/Ext+Interface.swift` — `config_parse_interface` case.
+
+**Python reference:** `RNS/Reticulum.py:685-1034` (`Reticulum._synthesize_interface`)
+plus `RNS.vendor.configobj.ConfigObj`, exercised by
+`reticulum-conformance/reference/bridge_server.py` `cmd_config_parse_interface`
+over the no-op `ConfigParseProbeInterface` (`DEFAULT_IFAC_SIZE = 16`,
+`AUTOCONFIGURE_MTU = False`, seed `bitrate = 62500`).
+
+**Reason:** Category (a) — scope. reticulum-swift has no ConfigObj INI parser and
+no full `_synthesize_interface` (its `InterfaceConfig` is a Codable struct, not an
+INI pipeline). The port reproduces the config-derived RULES under conformance
+*exactly* against the reference site — interface_mode alias selection + precedence
+(incl. the upstream `c["mode"]` KeyError quirk at Reticulum.py:701), the
+discoverable->gateway/AP forcing, the bitrate/announce_cap/ifac_size bound checks,
+the discovery announce-interval floor/default, the ic_* ingress-control knobs, and
+IFAC networkname/passphrase credential resolution. It deliberately does NOT model
+the full interface-class dispatch (Reticulum.py:928-996) or
+`Transport.add_interface`/`final_init`; instead it hardcodes the probe interface's
+class constants (`DEFAULT_IFAC_SIZE == 16`, seed bitrate 62500, no
+AUTOCONFIGURE_MTU re-size), which is the exact interface the reference command
+synthesizes onto — so the read-back attributes match RNS byte-for-byte for the
+keys under test. No protocol bytes differ; values outside the probe's constants
+(other interface types) are out of scope for this command.
 
 ### `ReticulumTransport.onInterfacePeerSpawned` / `onInterfaceConnected` (new feature)
 
@@ -1723,6 +1806,28 @@ bridge can prove an inbound frame was accepted+recorded (count delta) for the in
 IFAC-gate tests. No behavioral change. `PacketHashlist.count`/`shouldAccept` were
 already public; only the actor-held instance was internal.
 
+### `Transport.linkTableSnapshot()` / `seedLinkTableEntry(key:entry:)` / `reverseTableSnapshot()` / `seedReverseTableEntry(key:entry:)` accessors
+
+**Site:** `Transport/ReticulumTransport+Transport.swift` (after `cullTransportTables()`).
+
+**Python reference:** `RNS/Transport.py` `link_table` / `reverse_table` are plain dict
+attributes mutated/read directly (under `link_table_lock` / `reverse_table_lock`) by the
+forwarding paths and, in the conformance harness, by
+`reference/behavioral_transport.py` `cmd_behavioral_seed_link_table` /
+`_seed_reverse_table` (`RNS.Transport.link_table[dest] = link_entry`) and
+`_read_link_table` / `_read_reverse_table` (`table.items()` iteration).
+
+**Reason:** Category (a) language/runtime. The swift `linkTable` / `reverseTable` are
+actor-isolated `var`s on `ReticulumTransport`; an out-of-module caller (the bridge)
+cannot do python's direct `Transport.link_table[key] = entry` / `dict.items()` across the
+actor boundary. These four accessors are the actor-isolation-required equivalent of that
+direct dict access — pure seed mutators + value-copy snapshots over the *same* tables the
+production inbound-deferral / hop-count gate / PROOF return-routing / cull already use.
+No routing behavior is added. Mirrors the existing `packetHashlistCount()` /
+`getPathTable()` accessor precedent. Wires `behavioral_seed_link_table` /
+`behavioral_read_link_table` / `behavioral_seed_reverse_table` /
+`behavioral_read_reverse_table` to the real tables (previously LIBRARY-GAP shadows/no-ops).
+
 ### `AnnounceTable.entryPacketHash(_:)` accessor
 
 **Site:** `Transport/AnnounceTable.swift` (additive accessor mirroring the existing
@@ -1802,3 +1907,168 @@ remote process-aborts from any authenticated peer, reachable even on a `resource
 node. The fixes make hostile input a clean decode-failure / dropped-advertisement (mirroring RNS's
 graceful drop) and are NO-OPS for every valid value, so behaviour matches RNS for all reachable
 non-malicious inputs. Found by a proactive bug-class sweep, not by a reviewer.
+
+### `Channel` receive buffer — sequence-keyed dictionary vs RNS sorted rx_ring deque (fix/conformance-failures 2026-06-23)
+
+**Site:** `Channel/Channel.swift` — `Channel.inboundBuffer: [UInt16: Envelope]`, `Channel.receive(data:)`
+(emplace + contiguous-drain), `Channel.rxRingDepth`.
+
+**Python reference:** `RNS/Channel.py:392-413` (`_emplace_envelope` — sorted-deque insertion with the
+half-space modular ordering check) and `:447-466` (`_receive` contiguous-run drain that scans the
+ordered `rx_ring` deque once per receive).
+
+**Reason:** Category (a) language/runtime data-structure choice. RNS keeps received out-of-order
+envelopes in a `collections.deque` kept in ascending sequence order (with a half-space wrap check so a
+numerically-smaller wrapped-forward sequence is appended rather than inserted early), then drains the
+contiguous run by scanning that ordered deque. This port stores the same envelopes in a dictionary
+keyed by sequence and drains the contiguous run by looking up the next expected sequence directly
+(`removeValue(forKey: rxSequence)` in a wrapping-increment loop). The observable behaviour is
+identical — keep-first de-duplication (a key already present is not overwritten, mirroring
+`_emplace_envelope` returning `False`), in-order contiguous delivery, and correct 0xFFFF->0 wrap — but
+the explicit deque ordering / half-space insertion positioning is unnecessary because exact-key lookup
+does not depend on iteration order. The stale-drop window (`Channel.py:431-439`, WINDOW_MAX=48) and the
+unpack-before-advance MSGTYPE gate (`Channel.py:429`/`468-469`) are mirrored exactly. `rxRingDepth`
+reports `inboundBuffer.count`, equivalent to RNS's `len(rx_ring)`.
+
+**Added defensive forward-window bound (greploop hardening 2026-06-24).** RNS's `_rx_ring`
+(`Channel.py:290`) is an unbounded `collections.deque` — the stale-drop only rejects sequences BEHIND
+`next_rx_sequence`; FORWARD emplacement (`sequence >= next_rx`) is uncapped, so a peer ignoring the
+flow-control window could grow the ring up to `SEQ_MODULUS` (64Ki) undelivered messages. `receive(data:)`
+now drops any sequence whose mod-2^16 forward distance from `rxSequence` exceeds `WINDOW_MAX_FAST` (48),
+bounding the buffer to ≤49 entries. This is interop-safe: a conformant sender never has more than
+`window_max` (≤ `WINDOW_MAX_FAST`) envelopes outstanding, so its furthest in-flight sequence is below
+`next_rx + WINDOW_MAX_FAST` and is never rejected. The drop threshold uses the SAME inclusive boundary as
+the wrapped stale-drop branch above (keep distance ≤ 48, drop > 48), so the two checks agree at the edge.
+Category (a)-adjacent hardening: a bound RNS lacks, but a no-op for every sequence a reference RNS peer
+can emit.
+
+### `Channel` TX reliability layer — outlet split + transport proof-hook injection (fix/conformance-failures 2026-06-23)
+
+**Sites:** `Channel/Channel.swift` (`TxEnvelope`, `performSend`, `sendTracked`, `sendStream`,
+`packetDelivered`, `packetTimeout`, `armTimeout`, `awaitEnvelope`, `shutdownInternal`,
+`initializeProfileIfNeeded`); `Link/Link+Channel.swift` (`channelBuildPacket`, `channelTransmit`,
+`channelRegisterDelivery`/`channelDeregisterDelivery`, `channelOutletTimedOut`, `channelOutletMdu`/
+`channelOutletRtt`); `Link/Link.swift` (`channelProofRegistrar`/`channelProofDeregistrar` +
+`setChannelProofHooks`); `Transport/ReticulumTransport.swift` (both `setSendCallback` sites also call
+`setChannelProofHooks`).
+
+**Python reference:** `RNS/Channel.py:471-625` (`is_ready_to_send`, `_packet_tx_op`, `_packet_timeout`,
+`send`), `:375-390` (`_shutdown`/`_clear_rings`), `:296-308` (window profile), and `:658-740`
+(`LinkChannelOutlet`). RNS's `LinkChannelOutlet` holds a direct reference to the `Link`, and
+`Packet.send()` registers a `PacketReceipt` with `Transport` SYNCHRONOUSLY, so the returning PROOF
+resolves the receipt's delivery/timeout callbacks (`RNS/Packet.py`, `RNS/Transport.py`).
+
+**Reason:** Category (a) language/runtime (actor isolation + per-message encryption). Three structural
+adaptations, all observably equivalent:
+  1. **Build/transmit split.** RNS packs the CHANNEL `Packet` ONCE (encryption done once) and
+     `resend()` re-transmits the same bytes, so the packet hash (the outlet packet id the receipt is
+     keyed on) is stable across tries. Swift's `encrypt` uses a fresh random IV per call, so the outlet
+     is split into `channelBuildPacket` (encrypt+encode ONCE, returns wire bytes + full hash) and
+     `channelTransmit` (re-send the stored bytes). This reproduces RNS's stable-hash retransmission.
+  2. **Proof-hook injection.** The `Channel` actor cannot synchronously reach the transport's
+     receipt table the way RNS's outlet reaches `Transport`. Instead the transport injects two closures
+     (`setChannelProofHooks`) at the same point it wires `sendCallback`; the channel registers a
+     delivery callback keyed by the sent packet's truncated hash BEFORE transmitting (race-free, exactly
+     as RNS registers the receipt inside `Packet.send()` before the PROOF can return). The transport's
+     existing `handleDataProof` matches the inbound PROOF's leading packet hash against this
+     registration — the same resolution RNS performs via `PacketReceipt`.
+  3. **Timer/await model.** RNS drives retransmission off `PacketReceipt` timeout callbacks on a
+     background thread; the port uses per-envelope `Task.sleep` timers and a `CheckedContinuation` so a
+     caller (the conformance bridge) can await an envelope's delivery/teardown. The window growth/shrink,
+     `pow(1.5,tries-1)` backoff, `_max_tries=5` teardown, medium/fast rate-round promotion, ME_TOO_BIG /
+     ME_LINK_NOT_READY / sequence-reservation rollback, and `_shutdown` ring+handler clearing all mirror
+     `Channel.py` line-for-line. The one-time window-profile realization (`initializeProfileIfNeeded`)
+     happens on first send/window-read instead of in `__init__` because the actor cannot read the link
+     RTT synchronously at construction; the stored defaults already equal the non-degenerate profile, so
+     the only observable effect is the degenerate (RTT>RTT_SLOW) downgrade, applied before the first send.
+  4. **Send serialization (`acquireSendLock`/`releaseSendLock`, added greploop hardening 2026-06-24).**
+     RNS `send()` holds `self._send_lock` (a `threading.Lock`, `Channel.py:288/606`) across the ENTIRE
+     send — `is_ready_to_send` → reserve → `outlet.send()` → emplace — so only one send runs end-to-end
+     and both the sequence reservation AND the no-receipt rollback (`self._next_sequence =
+     reserved_sequence`, `Channel.py:608`) are atomic. The swift actor's isolation is the `_lock` (RLock)
+     equivalent for synchronous regions only; because `channelOutletMdu`/`channelBuildPacket`/
+     `channelTransmit` are `await`-based, a second `performSend` (reachable from `send`/`sendStream`/
+     `sendTracked`/`streamSendMessage`) would otherwise interleave at a suspension point and reserve the
+     SAME sequence, or clobber the rollback. A `threading.Lock` cannot express a critical section held
+     across `await`, so `performSend` now wraps its body in a FIFO hand-off async mutex (`sendLocked` +
+     `sendLockWaiters`): acquire grabs the free lock or suspends; release hands ownership directly to the
+     next waiter (the lock stays held, the resumed waiter does not re-check). Only the fresh-send path
+     takes it — `packetDelivered`/`packetTimeout` and the timeout-driven resend run under `_lock` only in
+     RNS (`_send_lock` is NOT held there), so their swift equivalents must not acquire it. `shutdownInternal`
+     also drains `sendLockWaiters` (resumes + clears every parked acquirer, mirroring the deallocation
+     rescue on `awaitEnvelope`'s waiter), so a queued send's `CheckedContinuation` is always resumed on
+     teardown — the resumed acquirers then reject via the `shutDown` guard, so the transient multiple-owner
+     hand-off is harmless. `shutdownInternal`
+     additionally deregisters each tx envelope's transport-side delivery callback (the `async`
+     `channelDeregisterDelivery`, done in the `packetTimeout` teardown since `shutdownInternal` is sync),
+     mirroring `_clear_rings` (`Channel.py:382-385`) dropping each packet's delivered/timeout callbacks —
+     without it the registration leaks and a late PROOF could fire `packetDelivered` on a dead channel.
+     Because that deregistration (and `channelOutletTimedOut`) AWAIT — releasing the actor mid-teardown,
+     where RNS's `_shutdown` is synchronous and atomic under `_lock` (`Channel.py:375-377`) — `performSend`
+     also guards on the `shutDown` flag after its own awaits: a send queued during the teardown window
+     would otherwise find an empty `txRing`, pass `isReadyToSend()`, and transmit on a dead channel. RNS
+     needs no such flag (its `is_ready_to_send` `is_usable` gate is hardcoded `True`, `Channel.py:690`, and
+     synchronous teardown can never interleave a send); the guard restores that no-send-after-teardown
+     invariant for the awaiting swift teardown. The guard is checked twice: once after the profile-init /
+     send-lock awaits, and again after the `channelBuildPacket` await (a concurrent `packetTimeout`
+     teardown can land in that suspension), rolling the reservation back on the second hit. The remaining
+     window during the `channelTransmit` await is RNS-parity, not a new gap: RNS's `_shutdown` holds
+     `_lock` only (not `_send_lock`), so it can likewise clear the rings during RNS's own `outlet.send()`.
+
+---
+
+### `Buffer.swift` — RawChannelWriter blocking-on-window + close drain split
+
+**Port site:** `Sources/ReticulumSwift/Channel/Buffer.swift` (`RawChannelWriter.writeChunk`, `write`,
+`close`; `StreamDataMessage.unpack`).
+
+**Python reference:** `RNS/Buffer.py:231-279` (`RawChannelWriter.write`/`close`), `:87-97`
+(`StreamDataMessage.unpack`).
+
+**Reason:** Category (a) language/runtime (actor isolation + sync-vs-async send model). The chunking +
+COMPRESSION_TRIES=4 decision, the MAX_DATA_LEN(423) raw cap, and the MAX_CHUNK_LEN(16384) bz2
+decompression bound mirror `Buffer.py` exactly. Two structural adaptations, observably equivalent:
+  1. **Window admission.** RNS `write()` is non-blocking: on `ChannelException(ME_LINK_NOT_READY)` it
+     returns 0 and the caller retries. The swift writer's `writeChunk` instead awaits window admission
+     inside `Channel.streamSendMessage` (bounded, mirroring the `is_ready_to_send()` gate RNS polls in
+     `close()`), then performs the same non-blocking `performSend`. The reserved Channel sequence is
+     returned so the conformance bridge can build the per-message manifest (RNS reads it off the
+     `Envelope` the wrapped `channel.send` returns).
+  2. **close() drain.** RNS `close()` waits for the tx ring to drain (`while not is_ready_to_send:
+     sleep`) before flushing the empty EOF. The swift `close()` flushes the EOF (via `writeChunk`); the
+     drain-to-empty wait is performed by the bridge `wire_buffer_stream` loop, which polls
+     `Channel.windowSnapshot().txRing` until 0 — the same settle the python command performs around its
+     `RawChannelWriter.close()`.
+  3. **One-shot EOF flag + public `setEof()` (greploop hardening 2026-06-24).** RNS `write()` builds
+     `StreamDataMessage(..., self._eof, ...)` and never resets `_eof` (`Buffer.py:258`); it does not need
+     to, because `_eof` is set only inside the terminal `close()` (`Buffer.py:278`) which writes exactly
+     once and never writes again. The swift port additionally exposes `setEof(_:)` as a public per-message
+     control (used by the conformance bridge's `eof_with_data` path), so a sticky `eofFlag` would stamp
+     EOF onto every subsequent emitted message — e.g. a compressible final write that `writeChunk` splits
+     across sub-chunks. `writeChunk` therefore consumes the flag (`eofFlag = false`) — but only AFTER a
+     successful `streamSendMessage`, so a rejected send (e.g. `ME_LINK_NOT_READY` after the window wait,
+     which throws) leaves the flag set and a retry still carries EOF, exactly as RNS keeps `_eof` when
+     `write()` returns 0 on `ME_LINK_NOT_READY` (`Buffer.py:262-266`). This makes EOF a correct one-shot
+     marker, is a no-op for the `close()`-terminal path and for the bridge (which re-asserts `setEof` per
+     final sub-chunk), so observable behaviour for every RNS-faithful usage is unchanged.
+
+---
+
+### `Channel.swift` / `Link.swift` — receiver-side conformance observability hooks
+
+**Port sites:** `Sources/ReticulumSwift/Channel/Channel.swift` (`decompressionAborted` /
+`decompressionError`, `registerStreamReader`, `streamSendMessage`); `Sources/ReticulumSwift/Link/Link.swift`
+(`proofObserver` / `setProofObserver`).
+
+**Python reference:** `RNS/Channel.py:425-466` (`_receive`), `RNS/Buffer.py:115-129`
+(`RawChannelReader.__init__`); the receiver-side recorders mirror the conformance harness's own hooks at
+`reference/wire_tcp.py:1431-1441` (wrapping `link.prove_packet`) and `:1551-1559`
+(`_DetectingStreamDataMessage.unpack` recording the bz2-bound abort onto `buffer_state`).
+
+**Reason:** Category (b) added (test-only) observability — no production-path behavior change.
+`Channel._receive` already unpacks the inner message before the sequence advance (Channel.py:429); the
+port now does the same so a raising bz2 unpack (the MAX_CHUNK_LEN bound) aborts WITHOUT advancing
+`_next_rx_sequence`, faithfully. The new `decompressionAborted` flag only RECORDS that swallowed abort
+(RNS discards it in `_receive`'s except); `proofObserver` only records the context byte RNS already
+proves. `registerStreamReader` / `streamSendMessage` expose the existing `RawChannelReader` registration
+and `Channel.send`-returns-sequence behaviors to the listener-side recorder.

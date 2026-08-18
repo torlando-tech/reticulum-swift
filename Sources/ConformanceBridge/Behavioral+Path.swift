@@ -27,18 +27,10 @@ nonisolated(unsafe) private var behavioralDestinationDeliveries: [String: [Data]
 // reference makes the ownership explicit and survives any future Transport churn.
 nonisolated(unsafe) private var behavioralRegisteredDestinations: [String: [Destination]] = [:]
 
-// LIBRARY-GAP shadow reverse table — see behavioral_seed_reverse_table /
-// behavioral_read_reverse_table. ReticulumTransport.reverseTable is module-internal
-// (no public accessor), so we cannot seed or read the REAL RNS.Transport.reverse_table
-// (RNS Transport.py:3554-3556 IDX_RT_*). This shadow keeps seed→read self-consistent;
-// it does NOT integrate with the real cull (cullTransportTables) or with entries the
-// real Transport creates while forwarding DATA packets.
-private struct ShadowReverseEntry {
-    let receivedIfaceId: String
-    let outboundIfaceId: String
-    let timestamp: Double
-}
-nonisolated(unsafe) private var behavioralReverseShadow: [String: [String: ShadowReverseEntry]] = [:]
+// behavioral_seed_reverse_table / behavioral_read_reverse_table now operate on the
+// REAL ReticulumTransport.reverseTable via seedReverseTableEntry / reverseTableSnapshot
+// (RNS Transport.py:3554-3556 IDX_RT_*) — the same table the real DATA-forwarding path
+// populates and the REVERSE_TIMEOUT cull (cullTransportTables) evicts from. No shadow.
 
 private func deliveryStoreKey(_ handle: String, _ destHex: String) -> String { "\(handle):\(destHex)" }
 
@@ -325,12 +317,10 @@ func handleBehavioralPathCommand(_ command: String, _ p: [String: JSONValue]) th
     // deterministically. The interfaces must be real attached mock interfaces (so the
     // interface-membership cull arms don't fire); timestamp_age_s backdates the entry.
     //
-    // LIBRARY-GAP: ReticulumTransport.reverseTable is module-internal with no public
-    // seed/read accessor, so this writes to a per-handle SHADOW table rather than the
-    // real RNS.Transport.reverse_table. The seed→read roundtrip and iface validation
-    // are faithful, but the entry does NOT participate in the real cull
-    // (cullTransportTables, Transport.py:670-677): a force_cull-driven REVERSE_TIMEOUT
-    // eviction will not be observed here.
+    // Seeds the REAL ReticulumTransport.reverseTable via seedReverseTableEntry, so a
+    // force_cull-driven REVERSE_TIMEOUT eviction (cullTransportTables, Transport.py:670-677)
+    // IS observed by read_reverse_table. The interfaces are real attached MockInterfaces,
+    // so the interface-membership cull arms do not fire — isolating the timeout arm.
     case "behavioral_seed_reverse_table":
         let handle = try getString(p, "handle")
         let key = try getHex(p, "key")
@@ -344,24 +334,25 @@ func handleBehavioralPathCommand(_ command: String, _ p: [String: JSONValue]) th
             throw BridgeError.invalidData("rcvd_iface_id / outb_iface_id must reference attached interfaces")
         }
 
-        let keyHex = bytesToHex(key)
-        let ts = Date().timeIntervalSince1970 - ageS
-        behavioralPathLock.lock()
-        behavioralReverseShadow[handle, default: [:]][keyHex] = ShadowReverseEntry(
-            receivedIfaceId: rcvdIfaceId, outboundIfaceId: outbIfaceId, timestamp: ts
+        let entry = ReverseTableEntry(
+            receivingInterfaceId: rcvdIfaceId,
+            outboundInterfaceId: outbIfaceId,
+            timestamp: Date().addingTimeInterval(-ageS)
         )
-        behavioralPathLock.unlock()
-        return ["seeded": boolean(true), "key": str(keyHex)]
+        try blockingAsync { await inst.transport.seedReverseTableEntry(key: key, entry: entry) }
+        return ["seeded": boolean(true), "key": str(bytesToHex(key))]
 
-    // Read reverse_table entries (RNS Transport.py:3554-3556). With `dest` (a
-    // reverse-table key) return that single decomposed entry; without it return all
-    // entries. See the seed_reverse_table LIBRARY-GAP: this reads the per-handle shadow
-    // table, so entries the REAL Transport created while forwarding DATA packets will
-    // NOT appear here.
+    // Read the REAL reverse_table entries via reverseTableSnapshot() (RNS
+    // Transport.py:3554-3556). With `dest` (a reverse-table key = the forwarded
+    // packet's truncated hash) return that single decomposed entry; without it return
+    // all entries. Reads the same table the real DATA-forwarding path populates and the
+    // PROOF return-routing consumes, so a relayed entry is observed faithfully.
     case "behavioral_read_reverse_table":
         let handle = try getString(p, "handle")
         let inst = try requireBehavioralInstance(handle)
         let destOpt = getHexOptional(p, "dest")
+
+        let table = try blockingAsync { await inst.transport.reverseTableSnapshot() }
 
         func descriptor(_ ifaceId: String) -> (id: String, hash: JSONValue, name: JSONValue) {
             let h = behavioralInterfaceHash(forId: ifaceId)
@@ -370,9 +361,9 @@ func handleBehavioralPathCommand(_ command: String, _ p: [String: JSONValue]) th
                     h.map { hex($0) } ?? .null,
                     iface.map { str($0.config.name) } ?? .null)
         }
-        func decompose(keyHex: String, _ e: ShadowReverseEntry) -> Result {
-            let rcvd = descriptor(e.receivedIfaceId)
-            let outb = descriptor(e.outboundIfaceId)
+        func decompose(keyHex: String, _ e: ReverseTableEntry) -> Result {
+            let rcvd = descriptor(e.receivingInterfaceId)
+            let outb = descriptor(e.outboundInterfaceId)
             return [
                 "key": str(keyHex),
                 "received_if": str(rcvd.id),
@@ -381,23 +372,18 @@ func handleBehavioralPathCommand(_ command: String, _ p: [String: JSONValue]) th
                 "outbound_if_hash": outb.hash,
                 "received_if_name": rcvd.name,
                 "outbound_if_name": outb.name,
-                "timestamp": num(e.timestamp),
+                "timestamp": num(e.timestamp.timeIntervalSince1970),
             ]
         }
 
-        behavioralPathLock.lock()
-        let table = behavioralReverseShadow[handle] ?? [:]
-        behavioralPathLock.unlock()
-
         if let dest = destOpt {
-            let keyHex = bytesToHex(dest)
-            guard let e = table[keyHex] else { return ["found": boolean(false)] }
-            var d = decompose(keyHex: keyHex, e)
+            guard let e = table[dest] else { return ["found": boolean(false)] }
+            var d = decompose(keyHex: bytesToHex(dest), e)
             d["found"] = boolean(true)
             return d
         }
 
-        let entries = table.map { decompose(keyHex: $0.key, $0.value) }
+        let entries = table.map { decompose(keyHex: bytesToHex($0.key), $0.value) }
         return ["entries": .array(entries.map { .dict($0) })]
 
     default:

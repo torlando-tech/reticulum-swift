@@ -37,7 +37,11 @@ final class BehavioralMockInterface: NetworkInterface, @unchecked Sendable {
     private let lock = NSLock()
 
     init(id: String, name: String, mode: InterfaceMode, mtu: Int,
-         ifacKey: Data? = nil, ifacSize: Int = 0) {
+         bitrate: Int? = nil, announceCap: Double? = nil,
+         ifacKey: Data? = nil, ifacSize: Int = 0,
+         announceRateTarget: TimeInterval? = nil,
+         announceRateGrace: Int = 0,
+         announceRatePenalty: TimeInterval = 0) {
         self.id = id
         self.config = InterfaceConfig(
             id: id,
@@ -47,7 +51,20 @@ final class BehavioralMockInterface: NetworkInterface, @unchecked Sendable {
             mode: mode,
             host: "mock",
             port: 0,
-            bitrate: max(mtu * 8, 0),
+            // Per-interface announce-rate knobs (RNS Interface.announce_rate_*)
+            // so the production inbound rate limiter (isRateBlocked) runs and the
+            // announce_rate_table becomes observable via read_announce_rate.
+            announceRateTarget: announceRateTarget,
+            announceRateGrace: announceRateGrace,
+            announceRatePenalty: announceRatePenalty,
+            // Mirror the reference mock (behavioral_transport.py:173 `self.bitrate =
+            // 10_000_000 if bitrate is None else int(bitrate)`): a default 10 Mbit/s
+            // link so the announce_cap egress spacing `(len*8/bitrate)/announce_cap`
+            // is negligible unless a test deliberately lowers bitrate / announce_cap.
+            // (The previous mtu*8 default made the cap ~15s and silently swallowed
+            // every forwarded announce after the first within a test's drain window.)
+            bitrate: bitrate ?? 10_000_000,
+            announceCap: announceCap ?? TransportConstants.ANNOUNCE_CAP,
             // IFAC (Interface Access Codes): when ifac_netname/ifac_netkey were
             // supplied to behavioral_attach_mock_interface the 64-byte HKDF key
             // and access-code size ride on the config so transport.addInterface
@@ -222,6 +239,18 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
     switch command {
 
     case "behavioral_start":
+        // reticulum-swift is a leaf endpoint with no LocalClientInterface, so it
+        // cannot be a CLIENT of a shared instance. Reject that request rather than
+        // silently starting a standalone node (which would then fail the
+        // filter-bypass assertions), so the conformance harness's capability-skip
+        // recognises the shared-instance gap — consistent with the wire
+        // start_tcp_server(share_instance=...) path (WireTcp.swift:462).
+        if getBoolOptional(p, "connected_to_shared_instance") ?? false {
+            throw BridgeError.invalidData(
+                "share_instance unsupported: reticulum-swift has no LocalServerInterface/LocalClientInterface (cannot connect to a shared instance)"
+            )
+        }
+
         // enable_transport defaults to true per the reference impl.
         let enableTransport = getBoolOptional(p, "enable_transport") ?? true
         let seedHex = getHexOptional(p, "identity_seed")
@@ -251,6 +280,22 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         try blockingAsync {
             await transport.setTransportEnabled(enableTransport, identity: identity)
             await transport.startRetransmissionLoop()
+            // Register the RNS `rnstransport.path.request` callback so this
+            // behavioral peer answers injected path-request packets with cached
+            // announces (and forwards unknown-destination PRs). Without this the
+            // PLAIN `rnstransport/path/request` destination is never registered,
+            // so `deliverToLocalDestination` drops every injected PR packet and
+            // tests asserting on PR behaviour (test_path_request_tag_dedup,
+            // test_path_request_answer_grace_delays, ...) see {'found': False}.
+            // Mirrors wire_start_tcp_server (WireTcp.swift:471) and PipePeer.
+            await transport.registerPathRequestHandler()
+            // Register the RNS `rnstransport.tunnel.synthesize` control destination
+            // so injected tunnel-synthesize packets reach the validate/establish
+            // handler (Transport.py:247-250 -> tunnel_synthesize_handler ->
+            // handle_tunnel). Without this the PLAIN control destination is never
+            // recognized and behavioral_read_tunnels stays empty after a valid
+            // synthesize packet is injected (test_tunnels / exact-length-gate).
+            await transport.registerTunnelSynthesizeHandler()
         }
 
         let handle = Data((0..<8).map { _ in UInt8.random(in: 0...255) }).map { String(format: "%02x", $0) }.joined()
@@ -318,6 +363,20 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         // 16-byte truncated-SHA256 interface hash. Hashing the raw bytes
         // keeps the hash stable across hex-decoding boundaries and avoids
         // the earlier bug where Data(ifaceId.utf8) hashed the ASCII form.
+        // Per-interface announce-rate knobs (RNS Interface.announce_rate_target /
+        // _grace / _penalty). When announce_rate_target is supplied, the
+        // production inbound rate limiter runs and populates the announce_rate_table
+        // that behavioral_read_announce_rate observes.
+        let announceRateTarget = p["announce_rate_target"]?.doubleValue
+        let announceRateGrace = getIntOptional(p, "announce_rate_grace") ?? 0
+        let announceRatePenalty = p["announce_rate_penalty"]?.doubleValue ?? 0
+        // Per-interface announce-egress knobs (RNS Interface.bitrate / announce_cap).
+        // When absent the constructor falls back to the reference mock defaults
+        // (bitrate 10 Mbit/s, announce_cap = ANNOUNCE_CAP). A test lowers these to
+        // widen the announce_cap egress spacing (behavioral_transport.py:163,211-212).
+        let bitrate = getIntOptional(p, "bitrate")
+        let announceCap = p["announce_cap"]?.doubleValue
+
         let idBytes = Data((0..<6).map { _ in UInt8.random(in: 0...255) })
         let ifaceId = idBytes.map { String(format: "%02x", $0) }.joined()
         let iface = BehavioralMockInterface(
@@ -325,15 +384,29 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
             name: name,
             mode: parseInterfaceMode(modeRaw),
             mtu: mtu,
+            bitrate: bitrate,
+            announceCap: announceCap,
             ifacKey: ifacKey,
-            ifacSize: ifacSize
+            ifacSize: ifacSize,
+            announceRateTarget: announceRateTarget,
+            announceRateGrace: announceRateGrace,
+            announceRatePenalty: announceRatePenalty
         )
+
+        // local_client marks this as a shared-instance client interface
+        // (Python Transport.local_client_interfaces). A path request arriving
+        // on it is answered immediately (no PATH_REQUEST_GRACE). Mirrors
+        // behavioral_transport.py attach_mock_interface(local_client=...).
+        let isLocalClient = getBoolOptional(p, "local_client") ?? false
 
         try blockingAsync {
             // addInterface caches the IFAC signing seed (ifacKey[32..64]) when the
             // config carries a 64-byte ifacKey + non-zero ifacSize, arming the
             // inbound IFAC gate and applyIFAC for this interface.
             try await inst.transport.addInterface(iface)
+            if isLocalClient {
+                await inst.transport.markLocalClientInterface(id: ifaceId)
+            }
         }
         inst.setInterface(iface, forId: ifaceId)
 
